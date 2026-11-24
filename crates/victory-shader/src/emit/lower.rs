@@ -5743,15 +5743,16 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" | "image_sample_o" => (60, true),
+            "image_sample" | "image_sample_o" | "image_sample_cl" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
-            "image_sample_b" => (61, true),
+            "image_sample_b" | "image_sample_b_cl" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
+            | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -5890,6 +5891,12 @@ impl<'a> Lower<'a> {
             }
             let mut args = vec![h, sh];
             args.extend(&cs);
+            let clamp = if name.contains("_cl") {
+                let x = addr_val(self, first + grads + coords)?;
+                to_float(self, x)
+            } else {
+                fu
+            };
             match op {
                 60 => {
                     if offset_word {
@@ -5912,7 +5919,7 @@ impl<'a> Lower<'a> {
                         }
                     }
                     args.extend(&os);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
@@ -5920,7 +5927,7 @@ impl<'a> Lower<'a> {
                     let bias = addr_val(self, 0)?;
                     let bias = to_float(self, bias);
                     args.extend(&os);
-                    args.extend([bias, fu]);
+                    args.extend([bias, clamp]);
                     self.s.op(
                         c,
                         "sampleBias.f32",
@@ -5940,7 +5947,7 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -7259,5 +7266,109 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn image_sample_d_cl_and_gather4_l_translate() {
+        use crate::native::{RootParam, RootType};
+        let param = |root: RootType, user_data: u8, sgprs: u32| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot: 0,
+        };
+        let layout = [param(RootType::Table, 8, 1), param(RootType::Table, 9, 1)];
+
+        // 1. image_sample_d_cl v[0:3], v[2:8], s[0:7], s[8:11]
+        let sample_d_cl_words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0204,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[8:9], null
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            0xF08C_0F08,
+            0x0040_0002, // image_sample_d_cl v[0:3], v[2:8], s[0:7], s[8:11]
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: layout.to_vec(),
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: sample_d_cl_words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect(),
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+
+        // 2. image_gather4_l v[0:3], v[2:4], s[0:7], s[8:11]
+        let gather4_l_words = [
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0204,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[8:9], null
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            0xF110_0108,
+            0x0040_0002, // image_gather4_l v[0:3], v[2:4], s[0:7], s[8:11]
+            S_ENDPGM,
+        ];
+        let native_cs = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: layout.to_vec(),
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: gather4_l_words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect(),
+        };
+        let p = ir::build(&native_cs.code, false, 256).unwrap();
+        let res = resource::track(&p, &native_cs.layout, native_cs.stage).unwrap();
+        let io = io::raise(&p, &native_cs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native_cs,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
     }
 }
