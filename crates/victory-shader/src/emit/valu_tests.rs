@@ -311,6 +311,87 @@ fn packed_add_selects_halves_of_inline_constants() {
 }
 
 #[test]
+fn half_int_ops_decode_inline_float_constants_as_f32_bits() {
+    // Non-packed 16-bit integer ops read the f32 bits of inline float constants
+    // (240..=248), while 16-bit float ops read their f16 bits (matching RDNA2
+    // and the packed test above).
+    let vop3_opsel = |op: u16, dst: u8, s0: u16, s1: u16, opsel: u8| -> [u32; 2] {
+        let [w0, w1] = vop3(op, dst, s0, s1, 0);
+        [w0 | (u32::from(opsel) << 11), w1]
+    };
+    let with_zero_v0 = |inst: &[u32]| -> Vec<u32> {
+        let mut body = vec![vop1(0x001, 0, 0x80)]; // v_mov_b32 v0, 0
+        body.extend_from_slice(inst);
+        body
+    };
+
+    // Inline 248 = 1/(2*pi): f32 0x3e22_f983, f16 0x3118.
+    // Inline 242 = 1.0:      f32 0x3f80_0000, f16 0x3c00.
+    let cases: &[(&str, Vec<u32>, [u32; 4], u32)] = &[
+        (
+            "v_add_nc_u16 low half of inline 248",
+            with_zero_v0(&vop3_opsel(0x303, 0, 248, vgpr(1), 0)),
+            [0, 0, 0, 0],
+            0x0000_F983,
+        ),
+        (
+            "v_add_nc_u16 high half of inline 248",
+            with_zero_v0(&vop3_opsel(0x303, 0, 248, vgpr(1), 0b0001)),
+            [0, 0, 0, 0],
+            0x0000_3E22,
+        ),
+        (
+            "v_add_nc_u16 low half of inline 1.0",
+            with_zero_v0(&vop3_opsel(0x303, 0, 242, vgpr(1), 0)),
+            [5, 0, 0, 0],
+            0x0000_0005,
+        ),
+        (
+            "v_add_nc_u16 high half of inline 1.0",
+            with_zero_v0(&vop3_opsel(0x303, 0, 242, vgpr(1), 0b0001)),
+            [5, 0, 0, 0],
+            0x0000_3F85,
+        ),
+        (
+            "v_cvt_f16_u16 low half of inline 1.0",
+            with_zero_v0(&[vop1(0x050, 0, 242)]),
+            [0, 0, 0, 0],
+            0x0000_0000,
+        ),
+        (
+            "v_add_f16 control keeps f16 bits of inline 248",
+            with_zero_v0(&vop3_opsel(0x132, 0, 248, vgpr(1), 0)),
+            [0, 0, 0, 0],
+            0x0000_3118,
+        ),
+    ];
+
+    for (label, body, input, expected) in cases {
+        let shader = build_valu_cs(body);
+        run_cases(&shader, &[*input], |backend, _, _, got| {
+            assert_eq!(
+                got, *expected,
+                "{backend}: {label}: got {got:#010x}, want {expected:#010x}"
+            );
+        });
+    }
+
+    // v_cmp_eq_u16_e64 s6, 0x3e22f983 (inline 248), v1 -> select 1 if equal.
+    let mut cmp_body = vop3(0x0aa, 6, 248, vgpr(1), 0).to_vec();
+    cmp_body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(6)));
+    let cmp_shader = build_valu_cs(&cmp_body);
+    let cmp_cases = [([0xF983, 0, 0, 0], 1u32), ([0x3118, 0, 0, 0], 0u32)];
+    let cmp_inputs: Vec<[u32; 4]> = cmp_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_shader, &cmp_inputs, |backend, i, inp, got| {
+        assert_eq!(
+            got, cmp_cases[i].1,
+            "{backend}: v_cmp_eq_u16(inline 248, {:#06x}) = {got}, want {}",
+            inp[0], cmp_cases[i].1
+        );
+    });
+}
+
+#[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
     let shader = build_valu_cs(&vop3(0x157, 0, vgpr(1), vgpr(2), vgpr(3)));
