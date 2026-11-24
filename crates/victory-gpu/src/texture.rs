@@ -787,7 +787,11 @@ mod tests {
         };
         let (copy, _) = make_rgba_texture(&host, 4, 4);
         let fake_resource = 0x1234_5678usize as This;
-        host_written(fake_resource);
+        {
+            let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            map.get_or_insert_with(HashMap::new)
+                .insert(fake_resource as usize, HostWrite::Fixed);
+        }
         let list = host.new_list().expect("new list");
         upload(&list, fake_resource, &copy.texture);
         assert!(
