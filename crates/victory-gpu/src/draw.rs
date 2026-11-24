@@ -92,6 +92,7 @@ pub(crate) struct State {
 
 struct FreshTable {
     key: (u64, u64),
+}
 
 impl Drop for State {
     fn drop(&mut self) {
