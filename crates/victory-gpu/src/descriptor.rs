@@ -138,6 +138,20 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
     Some((heap, heap.index(handle)?))
 }
 
+/// The host shader-visible slot for a clear, which must describe the same
+/// UAV as the CPU handle.
+#[cfg(windows)]
+pub(crate) fn clear_uav_slot(handle: u64, view: &View) -> Option<(&host::HostHeap, u32)> {
+    let (heap, index) = shader_slot(handle)?;
+    if heap.desc.kind != VIEWS_KIND
+        || !(handle - heap.start).is_multiple_of(u64::from(increment(VIEWS_KIND)?))
+    {
+        return None;
+    }
+    let host = heap.host()?;
+    (host.mirror(index, handle, false).as_ref() == Some(view)).then_some((host, index))
+}
+
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap.
 #[cfg(windows)]

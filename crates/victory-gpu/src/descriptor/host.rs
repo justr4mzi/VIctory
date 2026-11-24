@@ -598,6 +598,14 @@ impl HostHeap {
         }
     }
 
+    pub(crate) fn gpu(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        // SAFETY: this heap is shader-visible and the caller found a mirrored slot.
+        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
+        D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: start.ptr + u64::from(index) * u64::from(self.step),
+        }
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -1615,6 +1623,18 @@ fn texture_srv_desc(
         _ => {}
     }
     view
+}
+
+/// The same host UAV description for the shader-visible mirror and the
+/// CPU-only descriptor used by a clear.
+pub(crate) fn texture_uav_desc(
+    texture: &ID3D12Resource,
+    words: Option<&[u32; 10]>,
+) -> Option<Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>> {
+    let mut desc = words.map(uav_desc);
+    // SAFETY: a live host texture.
+    let info = unsafe { texture.GetDesc() };
+    fits(&info, desc.as_mut().map(|d| &mut d.Format), true).then_some(desc)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it

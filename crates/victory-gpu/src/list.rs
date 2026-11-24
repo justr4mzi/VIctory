@@ -806,11 +806,482 @@ extern "system" fn resolve(
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct Rect {
     left: i32,
     top: i32,
     right: i32,
     bottom: i32,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy)]
+enum UavClear {
+    Uint([u32; 4]),
+    Float([f32; 4]),
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy)]
+struct BufferClear {
+    pattern: [u8; 16],
+    pattern_len: usize,
+    stride: u64,
+    first: u64,
+    count: u64,
+}
+
+#[cfg(any(windows, test))]
+impl BufferClear {
+    fn new(desc: Option<&[u32; 10]>, values: UavClear) -> Option<Self> {
+        let (format, first, count, stride, raw) = match desc {
+            Some(d) if d[1] == 1 => (
+                d[0],
+                u64::from(d[2]) | u64::from(d[3]) << 32,
+                u64::from(d[4]),
+                u64::from(d[5]),
+                d[8] & 1 != 0,
+            ),
+            Some(_) => return None,
+            None => (39, 0, u64::MAX, 0, true),
+        };
+        let mut pattern = [0; 16];
+        if raw || stride != 0 {
+            // The guest's raw flag takes precedence over typed encoding.
+            if raw && stride != 0 {
+                return None;
+            }
+            let bits = match values {
+                UavClear::Uint(v) => v[0],
+                UavClear::Float(v) if raw => v[0].to_bits(),
+                UavClear::Float(_) => return None,
+            };
+            pattern[..4].copy_from_slice(&bits.to_le_bytes());
+            if !raw && (format != 0 || stride % 4 != 0) {
+                return None;
+            }
+            return Some(Self {
+                pattern,
+                pattern_len: 4,
+                stride: if raw { 4 } else { stride },
+                first,
+                count,
+            });
+        }
+
+        use Channel::{Float, Integer, Snorm, Unorm};
+        // DXGI formats ordered by component width, count and encoding.
+        let (width, channels, encoding) = match format {
+            2 => (4, 4, Float),
+            3 | 4 => (4, 4, Integer),
+            6 => (4, 3, Float),
+            7 | 8 => (4, 3, Integer),
+            16 => (4, 2, Float),
+            17 | 18 => (4, 2, Integer),
+            41 => (4, 1, Float),
+            42 | 43 => (4, 1, Integer),
+            10 => (2, 4, Float),
+            11 => (2, 4, Unorm),
+            12 | 14 => (2, 4, Integer),
+            13 => (2, 4, Snorm),
+            34 => (2, 2, Float),
+            35 => (2, 2, Unorm),
+            36 | 38 => (2, 2, Integer),
+            37 => (2, 2, Snorm),
+            54 => (2, 1, Float),
+            56 => (2, 1, Unorm),
+            57 | 59 => (2, 1, Integer),
+            58 => (2, 1, Snorm),
+            28 | 87 => (1, 4, Unorm),
+            30 | 32 => (1, 4, Integer),
+            31 => (1, 4, Snorm),
+            49 => (1, 2, Unorm),
+            50 | 52 => (1, 2, Integer),
+            51 => (1, 2, Snorm),
+            61 => (1, 1, Unorm),
+            62 | 64 => (1, 1, Integer),
+            63 => (1, 1, Snorm),
+            _ => return None,
+        };
+        let pattern_len = width * channels;
+        for (i, component) in pattern[..pattern_len].chunks_exact_mut(width).enumerate() {
+            let channel = if format == 87 && i < 3 { 2 - i } else { i };
+            let bits = match values {
+                UavClear::Uint(v) => v[channel],
+                UavClear::Float(v) => encoding.encode(v[channel], width)?,
+            };
+            component.copy_from_slice(&bits.to_le_bytes()[..width]);
+        }
+        Some(Self {
+            pattern,
+            pattern_len,
+            stride: pattern_len as u64,
+            first,
+            count,
+        })
+    }
+
+    fn ranges(self, bytes: u64, rects: &[Rect]) -> Vec<std::ops::Range<usize>> {
+        let elements = bytes.min(isize::MAX as u64) / self.stride;
+        let count = self.count.min(elements.saturating_sub(self.first));
+        if count == 0 {
+            return Vec::new();
+        }
+        // Clamping in elements guarantees both endpoints fit before
+        // converting to byte offsets.
+        let range = |left, right| {
+            ((self.first + left) * self.stride) as usize
+                ..((self.first + right) * self.stride) as usize
+        };
+        if rects.is_empty() {
+            return std::iter::once(range(0, count)).collect();
+        }
+        rects
+            .iter()
+            .filter_map(|rect| {
+                let left = (rect.left.max(0) as u64).min(count);
+                let right = (rect.right.max(0) as u64).min(count);
+                (left < right).then(|| range(left, right))
+            })
+            .collect()
+    }
+}
+
+#[cfg(any(windows, test))]
+enum Channel {
+    Float,
+    Integer,
+    Snorm,
+    Unorm,
+}
+
+#[cfg(any(windows, test))]
+impl Channel {
+    fn encode(&self, value: f32, width: usize) -> Option<u32> {
+        let value = if value.is_subnormal() {
+            0.0_f32.copysign(value)
+        } else {
+            value
+        };
+        let bits = width * 8;
+        Some(match self {
+            Self::Float if width == 2 => u32::from(half_bits(value)),
+            Self::Float => value.to_bits(),
+            Self::Integer => return None,
+            Self::Unorm => {
+                (f64::from(value.clamp(0.0, 1.0)) * f64::from((1u32 << bits) - 1)).round() as u32
+            }
+            Self::Snorm => {
+                (f64::from(value.clamp(-1.0, 1.0)) * f64::from((1u32 << (bits - 1)) - 1)).round()
+                    as i32 as u32
+            }
+        })
+    }
+}
+
+/// D3D's conversion to a narrower float rounds towards zero.
+#[cfg(any(windows, test))]
+fn half_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127;
+    let fraction = bits & 0x7f_ffff;
+    let magnitude = match exponent {
+        128 if fraction == 0 => 0x7c00,
+        128 => 0x7e00 | (fraction >> 13) as u16,
+        16.. => 0x7bff,
+        -14..=15 => (((exponent + 15) as u16) << 10) | (fraction >> 13) as u16,
+        -24..=-15 => ((0x80_0000 | fraction) >> (-exponent - 1)) as u16,
+        _ => 0,
+    };
+    sign | magnitude
+}
+
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    // SAFETY: the title passes four values or a null pointer.
+    if let Some(&values) = unsafe { values.as_ref() } {
+        clear_uav(
+            this,
+            gpu,
+            cpu,
+            resource,
+            UavClear::Uint(values),
+            count,
+            rects,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu, cpu, resource, values, count, rects);
+}
+
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    // SAFETY: the title passes four values or a null pointer.
+    if let Some(&values) = unsafe { values.as_ref() } {
+        clear_uav(
+            this,
+            gpu,
+            cpu,
+            resource,
+            UavClear::Float(values),
+            count,
+            rects,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu, cpu, resource, values, count, rects);
+}
+
+#[cfg(windows)]
+fn clear_uav(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: UavClear,
+    count: u32,
+    rects: *const Rect,
+) {
+    use crate::descriptor::{self, View};
+    if (count != 0 && rects.is_null()) || count as usize > isize::MAX as usize / size_of::<Rect>() {
+        return;
+    }
+    let is_uav = |view: &View| matches!(view, View::Unordered(..) | View::Placed(true, ..));
+    let (Some(list), Some(view)) = (
+        host_list(this),
+        descriptor::view(cpu)
+            .filter(is_uav)
+            .or_else(|| descriptor::view(gpu).filter(is_uav)),
+    ) else {
+        return;
+    };
+    let rects = if count == 0 {
+        &[]
+    } else {
+        // SAFETY: the title passes count rectangles at a non-null address.
+        unsafe { std::slice::from_raw_parts(rects, count as usize) }
+    };
+    match &view {
+        View::Unordered(res, _, desc) if !resource.is_null() && resource as usize == *res => {
+            if let Some((data, len)) = crate::resource::buffer_bytes(resource) {
+                clear_buffer_uav(list, data as usize, len, desc.as_ref(), values, rects);
+            } else {
+                clear_texture_uav(list, gpu, resource, &view, desc.as_ref(), values, rects);
+            }
+        }
+        View::Placed(true, res, desc) if res[0] == 1 => {
+            let data = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let len = u64::from(res[4]) | u64::from(res[5]) << 32;
+            let words = desc
+                .first_chunk::<10>()
+                .expect("placed UAV starts with the standard description");
+            clear_buffer_uav(list, data as usize, len, Some(words), values, rects);
+        }
+        _ => (),
+    }
+}
+
+#[cfg(windows)]
+fn clear_buffer_uav(
+    list: &crate::host::HostList,
+    data: usize,
+    len: u64,
+    desc: Option<&[u32; 10]>,
+    values: UavClear,
+    rects: &[Rect],
+) {
+    let Some(clear) = BufferClear::new(desc, values) else {
+        return;
+    };
+    let ranges = clear.ranges(len, rects);
+    if data == 0
+        || ranges.is_empty()
+        || ranges
+            .iter()
+            .any(|range| data.checked_add(range.end).is_none())
+    {
+        return;
+    }
+    let mut shadows = Vec::new();
+    let pattern = &clear.pattern[..clear.pattern_len];
+    for range in &ranges {
+        let at = (data + range.start) as u64;
+        crate::shadow::overlapping(at, (data + range.end) as u64, |shadow, start, end| {
+            shadows.push((
+                shadow.clone(),
+                start..end,
+                (start - at) as usize % pattern.len(),
+            ));
+        });
+    }
+    let largest = ranges
+        .iter()
+        .map(std::ops::Range::len)
+        .max()
+        .unwrap_or_default();
+    let block = pattern.repeat(largest.min(1 << 20).div_ceil(pattern.len()));
+    let ordered = clear_shadow_uavs(list, pattern, &block, &shadows);
+    list.defer(move || {
+        for range in &ranges {
+            let at = data + range.start;
+            if crate::texture::committed(at as *const u8, range.len()) {
+                crate::watch::writing(at, range.len());
+                for pos in (0..range.len()).step_by(block.len()) {
+                    let n = block.len().min(range.len() - pos);
+                    crate::host::write_mapped((at + pos) as *mut u8, block.as_ptr(), n);
+                }
+            }
+        }
+    });
+    if !ordered {
+        for (shadow, range, _) in shadows {
+            shadow.refresh(list, range.start, range.end - range.start);
+        }
+    }
+}
+
+/// The title uses its memory for deferred CPU copies. Existing host
+/// shadows also need a GPU-ordered copy so earlier shaders see the old
+/// bytes and later ones see the clear.
+#[cfg(windows)]
+fn clear_shadow_uavs(
+    list: &crate::host::HostList,
+    pattern: &[u8],
+    block: &[u8],
+    shadows: &[(
+        std::sync::Arc<crate::shadow::Shadow>,
+        std::ops::Range<u64>,
+        usize,
+    )],
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    if shadows.is_empty() {
+        return true;
+    }
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let Some(barriers) = list.buffer_barriers(host) else {
+        return false;
+    };
+    let Some((upload, data)) = list.upload(host, (block.len() + pattern.len()) as u64) else {
+        return false;
+    };
+    // SAFETY: the list owns the upload mapping. The extra pattern lets
+    // aliases that start partway through an element copy at that phase.
+    unsafe {
+        std::ptr::copy_nonoverlapping(block.as_ptr(), data, block.len());
+        std::ptr::copy_nonoverlapping(pattern.as_ptr(), data.add(block.len()), pattern.len());
+    }
+    for (shadow, range, phase) in shadows {
+        let len = range.end - range.start;
+        shadow.refresh(list, range.start, len);
+        let mut expected = pattern.to_vec();
+        expected.rotate_left(*phase);
+        list.defer_gpu_clear(
+            shadow,
+            range.start as usize,
+            len as usize,
+            expected.into_boxed_slice(),
+        );
+
+        let mut barrier = D3D12_BUFFER_BARRIER {
+            SyncBefore: D3D12_BARRIER_SYNC_ALL,
+            SyncAfter: D3D12_BARRIER_SYNC_COPY,
+            AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            AccessAfter: D3D12_BARRIER_ACCESS_COPY_DEST,
+            pResource: std::mem::ManuallyDrop::new(Some(shadow.buffer.clone())),
+            Offset: 0,
+            Size: u64::MAX,
+        };
+        let group = D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_BUFFER,
+            NumBarriers: 1,
+            Anonymous: D3D12_BARRIER_GROUP_0 {
+                pBufferBarriers: &raw const barrier,
+            },
+        };
+        // SAFETY: the source and destination ranges fit their live buffers.
+        // The barriers order this copy against all previous and later uses.
+        unsafe {
+            barriers.Barrier(&[group]);
+            for pos in (0..len).step_by(block.len()) {
+                list.list.CopyBufferRegion(
+                    &shadow.buffer,
+                    shadow.offset(range.start) + pos,
+                    &upload,
+                    *phase as u64,
+                    (len - pos).min(block.len() as u64),
+                );
+            }
+            barrier.SyncBefore = D3D12_BARRIER_SYNC_COPY;
+            barrier.SyncAfter = D3D12_BARRIER_SYNC_ALL;
+            barrier.AccessBefore = D3D12_BARRIER_ACCESS_COPY_DEST;
+            barrier.AccessAfter = D3D12_BARRIER_ACCESS_COMMON;
+            barriers.Barrier(&[group]);
+            std::mem::ManuallyDrop::drop(&mut barrier.pResource);
+        }
+    }
+    true
+}
+
+#[cfg(windows)]
+fn clear_texture_uav(
+    list: &crate::host::HostList,
+    gpu: u64,
+    resource: This,
+    view: &crate::descriptor::View,
+    words: Option<&[u32; 10]>,
+    values: UavClear,
+    rects: &[Rect],
+) {
+    let (Some(texture), Some(host), Some((heap, index))) = (
+        crate::resource::host_resource(resource),
+        crate::host::host(),
+        crate::descriptor::clear_uav_slot(gpu, view),
+    ) else {
+        return;
+    };
+    let Some(desc) = crate::descriptor::host::texture_uav_desc(texture, words) else {
+        return;
+    };
+    const UNORDERED_ACCESS: u32 = 0x8;
+    ensure_state(list, resource, UNORDERED_ACCESS);
+    // SAFETY: Rect and the host's RECT are four i32 fields in C order.
+    let rects = unsafe { std::slice::from_raw_parts(rects.as_ptr().cast(), rects.len()) };
+    host.with_clear_uav(list, &heap.heap, texture, desc.as_ref(), |cpu| {
+        let gpu = heap.gpu(index);
+        // SAFETY: a live texture in UAV state and matching UAV descriptors,
+        // with the shader-visible heap bound for this call.
+        unsafe {
+            match values {
+                UavClear::Uint(v) => list
+                    .list
+                    .ClearUnorderedAccessViewUint(gpu, cpu, texture, &v, rects),
+                UavClear::Float(v) => list
+                    .list
+                    .ClearUnorderedAccessViewFloat(gpu, cpu, texture, &v, rects),
+            }
+        }
+    });
+    crate::texture::host_written(resource);
 }
 
 extern "system" fn clear_rtv(
@@ -1466,7 +1937,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 54] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -1507,6 +1978,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, ignored_state as *const ()),             // 0x220 depth bounds
@@ -1623,6 +2096,526 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    fn buffer_uav_desc(format: u32, first: u64, count: u32, stride: u32, flags: u32) -> [u32; 10] {
+        [
+            format,
+            1,
+            first as u32,
+            (first >> 32) as u32,
+            count,
+            stride,
+            0,
+            0,
+            flags,
+            0,
+        ]
+    }
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
+        Rect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn uav_slots_are_stable() {
+        for table in [&LIST_FUNCTIONS, &NEWER_LIST_FUNCTIONS] {
+            assert_eq!(table.0[53], clear_uav_uint as *const ());
+            assert_eq!(table.0[54], clear_uav_float as *const ());
+        }
+    }
+
+    #[test]
+    fn uav_buffer_ranges_clamp_to_the_resource_and_view() {
+        let raw = buffer_uav_desc(39, 2, 5, 0, 1);
+        let clear = BufferClear::new(Some(&raw), UavClear::Uint([0x12345678, 1, 2, 3])).unwrap();
+        assert_eq!(
+            &clear.pattern[..clear.pattern_len],
+            &[0x78, 0x56, 0x34, 0x12]
+        );
+        assert_eq!(clear.ranges(29, &[]), vec![8..28]);
+        assert_eq!(
+            clear.ranges(
+                24,
+                &[
+                    rect(-5, 50, 1, 50),
+                    rect(2, 0, i32::MAX, 1),
+                    rect(4, 0, 3, 1)
+                ]
+            ),
+            vec![8..12, 16..24],
+        );
+        let beyond = buffer_uav_desc(3, u64::MAX, u32::MAX, 0, 0);
+        assert!(
+            BufferClear::new(Some(&beyond), UavClear::Uint([0; 4]))
+                .unwrap()
+                .ranges(u64::MAX, &[])
+                .is_empty()
+        );
+        let default = BufferClear::new(None, UavClear::Uint([4, 3, 2, 1])).unwrap();
+        assert_eq!(default.ranges(18, &[]), vec![0..16]);
+    }
+
+    #[test]
+    fn uav_buffer_component_encodings() {
+        let check = |format, values, expected: &[u8]| {
+            let desc = buffer_uav_desc(format, 1, 4, 0, 0);
+            let clear = BufferClear::new(Some(&desc), values).unwrap();
+            assert_eq!(&clear.pattern[..clear.pattern_len], expected);
+            assert_eq!(
+                clear.ranges(128, &[rect(1, 0, 3, 1)]),
+                vec![2 * expected.len()..4 * expected.len()],
+            );
+        };
+        check(42, UavClear::Uint([0x3412, 7, 8, 9]), &[0x12, 0x34, 0, 0]);
+        check(
+            3,
+            UavClear::Uint([1, 2, 3, 4]),
+            &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0],
+        );
+        check(
+            41,
+            UavClear::Float([-2.0, 0.0, 0.0, 0.0]),
+            &(-2.0_f32).to_le_bytes(),
+        );
+        check(
+            41,
+            UavClear::Uint([0x7fc00042, 0, 0, 0]),
+            &[0x42, 0, 0xc0, 0x7f],
+        );
+        check(
+            28,
+            UavClear::Float([-1.0, 0.5, 2.0, f32::NAN]),
+            &[0, 128, 255, 0],
+        );
+        check(
+            28,
+            UavClear::Uint([0x100, 0x180, 0x1ff, 0x142]),
+            &[0, 128, 255, 66],
+        );
+        check(87, UavClear::Float([0.0, 0.5, 1.0, 0.0]), &[255, 128, 0, 0]);
+        check(58, UavClear::Float([-1.0, 0.0, 0.0, 0.0]), &[1, 128]);
+        check(54, UavClear::Float([1.5, 0.0, 0.0, 0.0]), &[0, 62]);
+        let structured = buffer_uav_desc(0, 1, 2, 20, 0);
+        let clear = BufferClear::new(Some(&structured), UavClear::Uint([3, 7, 8, 9])).unwrap();
+        assert_eq!(&clear.pattern[..clear.pattern_len], &[3, 0, 0, 0]);
+        assert_eq!(clear.ranges(80, &[]), vec![20..60]);
+        assert!(BufferClear::new(Some(&structured), UavClear::Float([0.0; 4])).is_none());
+        assert!(
+            BufferClear::new(
+                Some(&buffer_uav_desc(42, 0, 1, 0, 0)),
+                UavClear::Float([0.0; 4])
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(windows)]
+    mod uav_live {
+        use super::*;
+        use crate::descriptor;
+        use crate::resource;
+        use std::ptr::null;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+        use windows::core::Interface;
+
+        struct Guest(This);
+
+        impl Drop for Guest {
+            fn drop(&mut self) {
+                slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+            }
+        }
+
+        fn guest_list() -> (Guest, Guest, Guest) {
+            let (mut list, mut queue, mut allocator) = (null(), null(), null());
+            let queue_desc = [0u32; 4];
+            assert_eq!(
+                crate::queue::create(
+                    null(),
+                    queue_desc.as_ptr().cast(),
+                    &PAGEABLE_IIDS[0],
+                    &mut queue
+                ),
+                S_OK
+            );
+            assert_eq!(
+                create_allocator(null(), 0, &ALLOCATOR_IIDS[0], &mut allocator),
+                S_OK
+            );
+            assert_eq!(
+                create_list(null(), 0, 0, allocator, null(), &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            (Guest(list), Guest(queue), Guest(allocator))
+        }
+
+        fn submit(list: This, queue: This) {
+            assert_eq!(close(list), S_OK);
+            slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        }
+
+        fn resource(dimension: u32, width: u64, height: u32, format: u32) -> Guest {
+            let properties = [1u32, 0, 0, 1, 1];
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION(dimension as i32),
+                Width: width,
+                Height: height,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT(format as i32),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: if dimension == 1 {
+                    D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                } else {
+                    D3D12_TEXTURE_LAYOUT_UNKNOWN
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut out = null();
+            assert_eq!(
+                resource::create_committed(
+                    null(),
+                    properties.as_ptr().cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    0,
+                    null(),
+                    &PAGEABLE_IIDS[0],
+                    &mut out
+                ),
+                S_OK
+            );
+            Guest(out)
+        }
+
+        type Clear<T> = extern "system" fn(This, u64, u64, This, *const [T; 4], u32, *const Rect);
+
+        fn readback(host: &crate::host::Host, width: u64) -> ID3D12Resource {
+            let mut buffer = None;
+            // SAFETY: a readback resource description and a live device.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_READBACK,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: width,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut buffer,
+                    )
+                    .unwrap();
+            }
+            buffer.unwrap()
+        }
+
+        #[test]
+        fn uav_raw_and_placed_buffers_clear_at_submission() {
+            if crate::host::host().is_none() {
+                eprintln!("skipping buffer UAV submission test without a host GPU");
+                return;
+            }
+            let buffer = resource(1, 32, 1, 0);
+            let copied = resource(1, 32, 1, 0);
+            let (data, _) = resource::buffer_bytes(buffer.0).unwrap();
+            let shadow = crate::shadow::find(data as u64, 32).unwrap();
+            let (list, queue, _allocator) = guest_list();
+            let raw = buffer_uav_desc(39, 1, 6, 0, 1);
+            let mut cpu = [0u32; 8];
+            let cpu = cpu.as_mut_ptr() as u64;
+            descriptor::create_uav(null(), buffer.0, null(), &raw, cpu);
+            let clear = slot::<Clear<u32>>(list.0, 0x1a8);
+            clear(list.0, 0, cpu, buffer.0, &[10, 11, 12, 13], 0, null());
+            copy_buffer_region(list.0, copied.0, 0, buffer.0, 0, 32);
+            clear(list.0, 0, cpu, buffer.0, &[20; 4], 1, &rect(1, 0, 3, 1));
+
+            let mut placed = [99u32; 6];
+            let at = placed.as_mut_ptr() as u64;
+            let mut res = [0u32; 14];
+            res[0] = 1;
+            res[4] = 24;
+            let mut desc = [0; 16];
+            desc[..10].copy_from_slice(&raw);
+            desc[10] = at as u32;
+            desc[11] = (at >> 32) as u32;
+            let mut gpu = [0u32; 8];
+            let gpu = gpu.as_mut_ptr() as u64;
+            descriptor::create_placed_uav(null(), &res, &desc, gpu);
+            clear(list.0, gpu, 0, null(), &[7; 4], 1, &rect(2, 0, 100, 1));
+            let read = |resource| {
+                let (data, _) = resource::buffer_bytes(resource).unwrap();
+                // SAFETY: the fixture has eight initialized dwords.
+                unsafe { data.cast::<[u32; 8]>().read_unaligned() }
+            };
+            assert_eq!(read(buffer.0), [0; 8]);
+            assert_eq!(placed, [99; 6]);
+            submit(list.0, queue.0);
+            assert_eq!(read(copied.0), [0, 10, 10, 10, 10, 10, 10, 0]);
+            let expected = [0, 10, 20, 20, 10, 10, 10, 0];
+            assert_eq!(read(buffer.0), expected);
+            assert_eq!(placed, [99, 99, 99, 7, 7, 7]);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the list has finished and the shadow holds this buffer.
+            unsafe {
+                shadow.buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                assert_eq!(mapped.cast::<[u32; 8]>().read_unaligned(), expected);
+                shadow.buffer.Unmap(0, Some(&D3D12_RANGE::default()));
+            }
+        }
+
+        #[test]
+        fn uav_buffer_shadow_clears_in_gpu_order() {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            let (list, queue, _allocator) = guest_list();
+            let native = host_list(list.0).unwrap();
+            if native.buffer_barriers(host).is_none() {
+                eprintln!("skipping GPU-ordered UAV test without enhanced barriers");
+                return;
+            }
+            let buffer = resource(1, 16, 1, 0);
+            let (data, _) = resource::buffer_bytes(buffer.0).unwrap();
+            let shadow = crate::shadow::find(data as u64, 16).unwrap();
+            let back = readback(host, 32);
+            let raw = buffer_uav_desc(39, 0, 4, 0, 1);
+            let mut descriptor = [0u32; 8];
+            let cpu = descriptor.as_mut_ptr() as u64;
+            descriptor::create_uav(null(), buffer.0, null(), &raw, cpu);
+            let clear = slot::<Clear<u32>>(list.0, 0x1a8);
+            clear(list.0, 0, cpu, buffer.0, &[12; 4], 0, null());
+            // SAFETY: the live, 16-byte shadow has been cleared by this list.
+            unsafe {
+                native
+                    .list
+                    .CopyBufferRegion(&back, 0, &shadow.buffer, 0, 16)
+            };
+            clear(list.0, 0, cpu, buffer.0, &[23; 4], 0, null());
+            // SAFETY: the other half of the same 32-byte readback buffer.
+            unsafe {
+                native
+                    .list
+                    .CopyBufferRegion(&back, 16, &shadow.buffer, 0, 16)
+            };
+            submit(list.0, queue.0);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: both copies finished and the buffer contains eight dwords.
+            unsafe {
+                back.Map(0, None, Some(&mut mapped)).unwrap();
+                assert_eq!(
+                    mapped.cast::<[u32; 8]>().read_unaligned(),
+                    [12, 12, 12, 12, 23, 23, 23, 23]
+                );
+                back.Unmap(0, Some(&D3D12_RANGE::default()));
+            }
+        }
+
+        #[test]
+        fn uav_typed_buffers_keep_bytes_outside_the_rect() {
+            if crate::host::host().is_none() {
+                eprintln!("skipping typed UAV submission test without a host GPU");
+                return;
+            }
+            let (list, queue, _allocator) = guest_list();
+            let cases = [
+                (
+                    42,
+                    UavClear::Uint([0x2211, 0, 0, 0]),
+                    &[0x11, 0x22, 0, 0][..],
+                ),
+                (
+                    3,
+                    UavClear::Uint([1, 2, 3, 4]),
+                    &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0],
+                ),
+                (41, UavClear::Float([1.0; 4]), &[0, 0, 128, 63]),
+                (
+                    28,
+                    UavClear::Float([0.0, 0.5, 1.0, 0.25]),
+                    &[0, 128, 255, 64],
+                ),
+            ];
+            let mut buffers = Vec::new();
+            for (format, values, expected) in cases {
+                let size = 4 * expected.len();
+                let buffer = resource(1, size as u64, 1, 0);
+                let (data, _) = resource::buffer_bytes(buffer.0).unwrap();
+                // SAFETY: the committed fixture owns size bytes.
+                unsafe { data.write_bytes(0xcd, size) };
+                let desc = buffer_uav_desc(format, 1, 2, 0, 0);
+                let mut cpu = [0u32; 8];
+                let cpu = cpu.as_mut_ptr() as u64;
+                descriptor::create_uav(null(), buffer.0, null(), &desc, cpu);
+                let region = rect(1, 0, 2, 1);
+                match values {
+                    UavClear::Uint(v) => {
+                        slot::<Clear<u32>>(list.0, 0x1a8)(list.0, 0, cpu, buffer.0, &v, 1, &region)
+                    }
+                    UavClear::Float(v) => {
+                        slot::<Clear<f32>>(list.0, 0x1b0)(list.0, 0, cpu, buffer.0, &v, 1, &region)
+                    }
+                }
+                buffers.push((buffer, data, expected));
+            }
+            submit(list.0, queue.0);
+            for (_buffer, data, expected) in buffers {
+                let len = expected.len();
+                // SAFETY: the fixture still owns the four elements.
+                let bytes = unsafe { std::slice::from_raw_parts(data, 4 * len) };
+                assert_eq!(&bytes[2 * len..3 * len], expected);
+                assert!(
+                    bytes[..2 * len]
+                        .iter()
+                        .chain(&bytes[3 * len..])
+                        .all(|&b| b == 0xcd)
+                );
+            }
+        }
+
+        #[test]
+        fn uav_texture_uint_and_float_readback() {
+            let Some(host) = crate::host::host() else {
+                eprintln!("skipping texture UAV readback without a host GPU");
+                return;
+            };
+            host.log_messages();
+            let before = host.debug_issues.load(std::sync::atomic::Ordering::Relaxed);
+            let (list, queue, _allocator) = guest_list();
+            let images = [resource(3, 4, 4, 42), resource(3, 4, 4, 41)];
+            let heap_desc = [0u32, 2, 1, 0, 0, 0, 0, 0];
+            let mut heap = null();
+            assert_eq!(
+                descriptor::create_heap(
+                    null(),
+                    heap_desc.as_ptr().cast(),
+                    &PAGEABLE_IIDS[0],
+                    &mut heap
+                ),
+                S_OK
+            );
+            let heap = Guest(heap);
+            let mut cpu = [[0u32; 8]; 2];
+            let center = rect(1, 1, 3, 3);
+            for (i, image) in images.iter().enumerate() {
+                let format = [42, 41][i];
+                let words = [format, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+                let cpu = cpu[i].as_mut_ptr() as u64;
+                let gpu = descriptor::heap(heap.0).start + i as u64 * 32;
+                descriptor::create_uav(null(), image.0, null(), &words, cpu);
+                descriptor::copy_simple(null(), 1, gpu, cpu, 0);
+                if i == 0 {
+                    let clear = slot::<Clear<u32>>(list.0, 0x1a8);
+                    clear(list.0, gpu, cpu, image.0, &[3; 4], 0, null());
+                    barrier(list.0, 1, &UAV_BARRIER);
+                    clear(list.0, gpu, cpu, image.0, &[9; 4], 1, &center);
+                } else {
+                    let clear = slot::<Clear<f32>>(list.0, 0x1b0);
+                    clear(list.0, gpu, 0, image.0, &[-1.25; 4], 0, null());
+                    barrier(list.0, 1, &UAV_BARRIER);
+                    clear(list.0, gpu, cpu, image.0, &[6.5; 4], 1, &center);
+                }
+            }
+
+            let back = readback(host, 2048);
+            let host_list = host_list(list.0).unwrap();
+            // D3D12_TEXTURE_COPY_LOCATION's two union variants share this layout.
+            #[repr(C)]
+            struct Location {
+                resource: *mut std::ffi::c_void,
+                kind: D3D12_TEXTURE_COPY_TYPE,
+                footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+            }
+            for (i, image) in images.iter().enumerate() {
+                let texture = resource::host_resource(image.0).unwrap();
+                ensure_state(host_list, image.0, COPY_SOURCE);
+                let src = Location {
+                    resource: texture.as_raw(),
+                    kind: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    footprint: Default::default(),
+                };
+                let dst = Location {
+                    resource: back.as_raw(),
+                    kind: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 1024 * i as u64,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT([42, 41][i]),
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                };
+                // SAFETY: valid copy locations and an open list.
+                unsafe {
+                    host_list.list.CopyTextureRegion(
+                        (&raw const dst).cast(),
+                        0,
+                        0,
+                        0,
+                        (&raw const src).cast(),
+                        None,
+                    );
+                }
+            }
+            submit(list.0, queue.0);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the guest submission waited for both copies. Each row is 256 bytes.
+            unsafe {
+                back.Map(0, None, Some(&mut mapped)).unwrap();
+                let words = std::slice::from_raw_parts(mapped.cast::<u32>(), 512);
+                for (i, (outer, inner)) in [(3, 9), ((-1.25_f32).to_bits(), 6.5_f32.to_bits())]
+                    .into_iter()
+                    .enumerate()
+                {
+                    for y in 0..4 {
+                        for x in 0..4 {
+                            let expected = if (1..3).contains(&x) && (1..3).contains(&y) {
+                                inner
+                            } else {
+                                outer
+                            };
+                            assert_eq!(
+                                words[i * 256 + y * 64 + x],
+                                expected,
+                                "texture {i}, pixel ({x}, {y})"
+                            );
+                        }
+                    }
+                }
+                back.Unmap(0, Some(&D3D12_RANGE::default()));
+            }
+            assert_eq!(
+                host.debug_issues.load(std::sync::atomic::Ordering::Relaxed),
+                before
+            );
+        }
     }
 
     #[test]

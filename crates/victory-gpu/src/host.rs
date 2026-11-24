@@ -51,9 +51,14 @@ pub(crate) struct Host {
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
     next_dsv: AtomicU32,
+    /// A CPU-only slot. A clear consumes its descriptor during recording.
+    clear_uav: Mutex<ID3D12DescriptorHeap>,
+    enhanced_barriers: bool,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
+    #[cfg(test)]
+    pub(crate) debug_issues: AtomicU32,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
 }
@@ -142,8 +147,8 @@ fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
-        let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+        let debug = cfg!(any(test, feature = "diagnostics"))
+            && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -183,7 +188,10 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if (cfg!(any(test, feature = "diagnostics"))
+            && std::env::var_os("VICTORY_D3D12_WARP").is_some())
+            || (cfg!(test) && std::env::var_os("VICTORY_WARP").is_some())
+        {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -207,6 +215,15 @@ impl Host {
     ) -> windows::core::Result<Host> {
         // SAFETY: plain D3D12 queue, fence, event and descriptor heap creation.
         unsafe {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+            let enhanced_barriers = device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS12,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+                && options.EnhancedBarriersSupported.as_bool();
             let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
                 ..Default::default()
@@ -227,6 +244,11 @@ impl Host {
                     ..Default::default()
                 })?;
             let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            let clear_uav = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            })?;
             Ok(Host {
                 device,
                 queue,
@@ -238,7 +260,11 @@ impl Host {
                 dsvs,
                 dsv_size,
                 next_dsv: AtomicU32::new(0),
+                clear_uav: Mutex::new(clear_uav),
+                enhanced_barriers,
                 messages,
+                #[cfg(test)]
+                debug_issues: AtomicU32::new(0),
                 next_rtv: AtomicU32::new(0),
                 presenter: Mutex::new(None),
             })
@@ -334,7 +360,7 @@ mod tests {
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
-    pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) list: CommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -369,6 +395,79 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+/// Tracks host bindings so a UAV clear can borrow a different view heap
+/// and restore what the draw state expects.
+pub(crate) struct CommandList {
+    raw: ID3D12GraphicsCommandList,
+    bindings: Mutex<Bindings>,
+}
+
+#[derive(Default)]
+struct Bindings {
+    heaps: Vec<Option<ID3D12DescriptorHeap>>,
+    compute: Option<ID3D12RootSignature>,
+    graphics: Option<ID3D12RootSignature>,
+}
+
+impl std::ops::Deref for CommandList {
+    type Target = ID3D12GraphicsCommandList;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+#[allow(non_snake_case)] // these methods also record the matching D3D12 bindings
+impl CommandList {
+    pub(crate) unsafe fn SetDescriptorHeaps(&self, heaps: &[Option<ID3D12DescriptorHeap>]) {
+        // SAFETY: the caller supplies an open list and shader-visible heaps.
+        unsafe { self.raw.SetDescriptorHeaps(heaps) };
+        self.bindings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .heaps = heaps.to_vec();
+    }
+
+    pub(crate) unsafe fn SetComputeRootSignature(&self, root: &ID3D12RootSignature) {
+        // SAFETY: the caller supplies an open list and a live root signature.
+        unsafe { self.raw.SetComputeRootSignature(root) };
+        self.bindings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .compute = Some(root.clone());
+    }
+
+    pub(crate) unsafe fn SetGraphicsRootSignature(&self, root: &ID3D12RootSignature) {
+        // SAFETY: the caller supplies an open list and a live root signature.
+        unsafe { self.raw.SetGraphicsRootSignature(root) };
+        self.bindings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .graphics = Some(root.clone());
+    }
+
+    fn with_view_heap(&self, heap: &ID3D12DescriptorHeap, record: impl FnOnce()) {
+        let bindings = self.bindings.lock().unwrap_or_else(|e| e.into_inner());
+        if bindings.heaps.iter().flatten().any(|h| h == heap) {
+            record();
+            return;
+        }
+        // SAFETY: the list is open and all bound objects are live. Reissue
+        // signatures after switching heaps for directly indexed shaders.
+        unsafe {
+            self.raw.SetDescriptorHeaps(&[Some(heap.clone())]);
+            record();
+            self.raw.SetDescriptorHeaps(&bindings.heaps);
+            if let Some(root) = &bindings.compute {
+                self.raw.SetComputeRootSignature(root);
+            }
+            if let Some(root) = &bindings.graphics {
+                self.raw.SetGraphicsRootSignature(root);
+            }
+        }
+    }
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -467,7 +566,12 @@ enum Step {
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    GpuWrite(
+        std::sync::Arc<crate::shadow::Shadow>,
+        usize,
+        usize,
+        Option<Box<[u8]>>,
+    ),
     /// Brings a texture's staging buffer up to date and, when dirty, copies
     /// it into the host texture on the list's prelude: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
@@ -606,7 +710,10 @@ impl Host {
             prelude.Close()?;
             Ok(HostList {
                 allocator,
-                list,
+                list: CommandList {
+                    raw: list,
+                    bindings: Mutex::default(),
+                },
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -740,12 +847,15 @@ impl Host {
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back.iter().any(|(s, a, l)| {
+                if let Step::GpuWrite(shadow, address, len, clear) = step {
+                    if let Some(pattern) = clear {
+                        shadow.expect_cleared(*address, *len, pattern);
+                    }
+                    if !back.iter().any(|(s, a, l)| {
                         std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
-                    })
-                {
-                    back.push((shadow.clone(), *address, *len));
+                    }) {
+                        back.push((shadow.clone(), *address, *len));
+                    }
                 }
             }
         }
@@ -925,6 +1035,10 @@ impl Host {
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
+                    #[cfg(test)]
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                        self.debug_issues.fetch_add(1, Ordering::Relaxed);
+                    }
                     if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
                         first_error = Some(text.to_owned());
                     }
@@ -967,6 +1081,30 @@ impl Host {
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle
         }
+    }
+
+    pub(crate) fn with_clear_uav(
+        &self,
+        list: &HostList,
+        heap: &ID3D12DescriptorHeap,
+        texture: &ID3D12Resource,
+        desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+        record: impl FnOnce(D3D12_CPU_DESCRIPTOR_HANDLE),
+    ) {
+        list.keep(heap);
+        let cpu_heap = self.clear_uav.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a live texture and a CPU-only slot held through recording.
+        let handle = unsafe {
+            let handle = cpu_heap.GetCPUDescriptorHandleForHeapStart();
+            self.device.CreateUnorderedAccessView(
+                texture,
+                None::<&ID3D12Resource>,
+                desc.map(std::ptr::from_ref),
+                handle,
+            );
+            handle
+        };
+        list.list.with_view_heap(heap, || record(handle));
     }
 }
 
@@ -1094,7 +1232,11 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.list.bindings.lock().unwrap_or_else(|e| e.into_inner()) = Bindings::default();
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines
             .lock()
@@ -1401,7 +1543,25 @@ impl HostList {
     ) {
         self.deferred()
             .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+            .push(Step::GpuWrite(shadow.clone(), address, len, None));
+    }
+
+    pub(crate) fn defer_gpu_clear(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+        pattern: Box<[u8]>,
+    ) {
+        self.deferred()
+            .copies
+            .push(Step::GpuWrite(shadow.clone(), address, len, Some(pattern)));
+    }
+
+    pub(crate) fn buffer_barriers(&self, host: &Host) -> Option<ID3D12GraphicsCommandList7> {
+        host.enhanced_barriers
+            .then(|| self.list.cast().ok())
+            .flatten()
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -1665,7 +1825,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, _) => {
                     // The shaders start from the title's data.
                     batch.flush();
                     shadow.writing(*address, *len);

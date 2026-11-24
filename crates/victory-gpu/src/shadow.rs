@@ -240,6 +240,19 @@ impl Shadow {
         *before = Some((start, grown));
     }
 
+    /// The title-side clear has already supplied these bytes. Compare
+    /// final GPU data to the latest clear where one ran, so a shader can
+    /// restore the original value and still have its write copied back.
+    pub(crate) fn expect_cleared(&self, address: usize, len: usize, pattern: &[u8]) {
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let (from, to) = self.inside(address, len);
+        if let Some((start, bytes)) = &mut *before {
+            for chunk in bytes[from - *start..to - *start].chunks_mut(pattern.len()) {
+                chunk.copy_from_slice(&pattern[..chunk.len()]);
+            }
+        }
+    }
+
     /// After the submission ran: copies the bytes its shaders wrote back
     /// into title memory (unmapped pages left alone), and only those: the
     /// title's threads write the same buffers while the GPU runs (its
@@ -451,6 +464,29 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
+}
+
+/// Existing copies of any of this range, including loose address views.
+pub(crate) fn overlapping(from: u64, to: u64, mut visit: impl FnMut(&Arc<Shadow>, u64, u64)) {
+    let mut intersect = |shadow: &Arc<Shadow>| {
+        let start = from.max(shadow.start);
+        let end = to.min(shadow.start + shadow.len);
+        if start < end {
+            visit(shadow, start, end);
+        }
+    };
+    for (_, entry) in buffers().range(..(to, 0)).filter(|(_, e)| e.end > from) {
+        if let Some(shadow) = &entry.shadow {
+            intersect(shadow);
+        }
+    }
+    for (_, shadow) in LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..(to, 0))
+    {
+        intersect(shadow);
+    }
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
