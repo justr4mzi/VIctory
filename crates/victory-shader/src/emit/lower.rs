@@ -18,7 +18,7 @@ use crate::io::{Barycentric, Copied, Export, Input, Interp, Io, Ring, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, RelOffset, Resources, Role, Site, Source};
-use crate::structure::{Atom, Bool, LaneExit, Structured};
+use crate::structure::{Atom, Bool, BoolSet, LaneExit, Structured};
 
 type Why = &'static str;
 
@@ -80,28 +80,40 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
 }
 
-enum Stop {
-    /// A phi whose incoming value has no DXIL form was read: redo with it missing.
-    Retry(Value, Why),
-    Fail(ShaderError),
+pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    Lower::new(parts).run()
 }
 
-pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    let mut bad = HashMap::new();
-    loop {
-        match Lower::new(parts, &bad).run() {
-            Ok(l) => return Ok(l),
-            Err(Stop::Retry(v, why)) => {
-                if bad.insert(v, why).is_some() {
-                    return Err(ShaderError::Unsupported {
-                        offset: 0,
-                        what: "a phi that does not settle",
-                    });
-                }
-            }
-            Err(Stop::Fail(e)) => return Err(e),
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadDep {
+    Value(Value),
+    Edge {
+        from: usize,
+        to: usize,
+        value: Value,
+    },
+}
+
+struct ValueDeps {
+    block: usize,
+    guard: Option<Bool>,
+    invert_guard: bool,
+    ignore_why: Option<Why>,
+    deps: Vec<ReadDep>,
+}
+
+struct OldDep {
+    value: Option<Value>,
+    direct_why: Option<Why>,
+    invert_guard: bool,
+    ignore_why: Option<Why>,
+}
+
+struct SinkRead {
+    block: usize,
+    guard: Option<Bool>,
+    offset: usize,
+    deps: Vec<ReadDep>,
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
@@ -184,7 +196,6 @@ fn sampler_words(words: &[u32]) -> Result<[u32; 4], Why> {
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
-    bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
@@ -192,13 +203,21 @@ struct Lower<'a> {
     block: Vec<Option<usize>>,
     cur: usize,
     bools: HashMap<(usize, Bool), V>,
+    bool_deps: HashMap<(usize, Bool), Vec<ReadDep>>,
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
-    read_phis: HashSet<Value>,
+    taint_candidates: HashSet<Value>,
+    cur_reads: Vec<ReadDep>,
+    cur_old_deps: Vec<OldDep>,
+    cur_edge: Option<(usize, usize)>,
+    deps: HashMap<Value, Vec<ValueDeps>>,
+    deps_order: Vec<Value>,
+    direct_missing: Vec<(Value, Why, usize, Option<Bool>, bool)>,
+    sinks: Vec<SinkRead>,
     /// Relative-offset DXIL phis for address phis, keyed by `(phi_value, base_value)`.
     addr_phis: HashMap<(Value, Value), V>,
     /// Address phis waiting for incoming values in `fill_phis`: `(phi, ir_block, phi_idx, base)`.
@@ -215,6 +234,7 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<HandleKey, V>,
+    handle_deps: HashMap<HandleKey, Vec<ReadDep>>,
     /// Runtime stride table entries read in a block, by the descriptor's
     /// load: the raw slot, the stride and the bias.
     entries: HashMap<(usize, Site, u8), [V; 3]>,
@@ -246,6 +266,7 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
+    ballot_deps: HashMap<Value, Vec<ReadDep>>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -425,8 +446,8 @@ fn half_input_partners(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, u8> {
     partners
 }
 
-fn unsupported(offset: usize, what: Why) -> Stop {
-    Stop::Fail(ShaderError::Unsupported { offset, what })
+fn unsupported(offset: usize, what: Why) -> ShaderError {
+    ShaderError::Unsupported { offset, what }
 }
 
 /// Deterministic preference when the same table slot is annotated with
@@ -437,7 +458,7 @@ fn prefer_props(cur: (u32, u32), new: (u32, u32)) -> (u32, u32) {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -576,19 +597,26 @@ impl<'a> Lower<'a> {
         Lower {
             s,
             x,
-            bad,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
             block: vec![None; p.blocks.len()],
             cur: 0,
             bools: HashMap::new(),
+            bool_deps: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
-            read_phis: HashSet::new(),
+            taint_candidates: HashSet::new(),
+            cur_reads: Vec::new(),
+            cur_old_deps: Vec::new(),
+            cur_edge: None,
+            deps: HashMap::new(),
+            deps_order: Vec::new(),
+            direct_missing: Vec::new(),
+            sinks: Vec::new(),
             addr_phis: HashMap::new(),
             pending_addr_phis: Vec::new(),
             def_site: p
@@ -618,6 +646,7 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            handle_deps: HashMap::new(),
             entries: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -636,6 +665,7 @@ impl<'a> Lower<'a> {
             },
             mask_ok: false,
             ballots: HashMap::new(),
+            ballot_deps: HashMap::new(),
             balloting: HashSet::new(),
             def_block: p
                 .blocks
@@ -850,10 +880,18 @@ impl<'a> Lower<'a> {
         const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
         let inst = &self.x.p.blocks[b].insts[i];
         for &(_, w) in &inst.writes {
+            self.cur_reads.clear();
+            self.cur_edge = None;
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
                 match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)) {
-                    Ok(x) => Val::I32(x),
+                    Ok(x) => {
+                        let reads = std::mem::take(&mut self.cur_reads);
+                        if !reads.is_empty() {
+                            self.record_write_deps(w, b, None, false, None, reads);
+                        }
+                        Val::I32(x)
+                    }
                     Err(why) => Val::Missing(why),
                 }
             } else {
@@ -960,7 +998,7 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
-    fn run(mut self) -> Result<Lowered, Stop> {
+    fn run(mut self) -> Result<Lowered, ShaderError> {
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1005,15 +1043,16 @@ impl<'a> Lower<'a> {
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
                 let val = match phi.reg {
                     Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
-                    _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
                     Reg::Scc => {
                         let v = self.s.m.phi(self.cur, self.s.t.i1);
                         self.data_phis.push((v, b, i));
+                        self.taint_candidates.insert(phi.value);
                         Val::Bit(v)
                     }
                     _ => {
                         let v = self.s.m.phi(self.cur, self.s.t.i32);
                         self.data_phis.push((v, b, i));
+                        self.taint_candidates.insert(phi.value);
                         Val::I32(v)
                     }
                 };
@@ -1075,7 +1114,7 @@ impl<'a> Lower<'a> {
     }
 
     /// Values of the program's input registers.
-    fn inputs(&mut self) -> Result<(), Stop> {
+    fn inputs(&mut self) -> Result<(), ShaderError> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
@@ -1264,18 +1303,60 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn record_read(&mut self, v: Value) {
+        if !self.taint_candidates.contains(&v) {
+            return;
+        }
+        let dep = match self.cur_edge {
+            Some((from, to)) => ReadDep::Edge { from, to, value: v },
+            None => ReadDep::Value(v),
+        };
+        if !self.cur_reads.contains(&dep) {
+            self.cur_reads.push(dep);
+        }
+    }
+
+    fn record_write_deps(
+        &mut self,
+        w: Value,
+        block: usize,
+        guard: Option<Bool>,
+        invert_guard: bool,
+        ignore_why: Option<Why>,
+        deps: Vec<ReadDep>,
+    ) {
+        self.taint_candidates.insert(w);
+        let list = self.deps.entry(w).or_insert_with(|| {
+            self.deps_order.push(w);
+            Vec::new()
+        });
+        list.push(ValueDeps {
+            block,
+            guard,
+            invert_guard,
+            ignore_why,
+            deps,
+        });
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
-        if self.phi_at.contains_key(&v) {
-            self.read_phis.insert(v);
-        }
+        self.get_inner(v, true)
+    }
+
+    fn get_inner(&mut self, v: Value, track: bool) -> Result<Val, Why> {
         let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
         match self.vals.get(&v) {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
             Some(&Val::Missing(w)) => return Err(w),
-            Some(&val) => return Ok(val),
+            Some(&val) => {
+                if track {
+                    self.record_read(v);
+                }
+                return Ok(val);
+            }
             None => {}
         }
         if let Some(&(param, dword)) = self.params.get(&v) {
@@ -1379,6 +1460,50 @@ impl<'a> Lower<'a> {
         self.load_any_input(id, index + 1)
     }
 
+    /// Reads an overwritten register's previous value, recording its lane
+    /// dependency (`invert_guard` for `!guard`, active lanes otherwise) so
+    /// direct missing values and tainted phis still propagate where kept.
+    fn old_i32_of(&mut self, v: Option<Value>, invert_guard: bool, ignore_why: Option<Why>) -> V {
+        let Some(v) = v else {
+            return self.s.m.i32(0);
+        };
+        match self.get_inner(v, false) {
+            Ok(Val::I32(x)) => {
+                if self.taint_candidates.contains(&v) {
+                    self.cur_old_deps.push(OldDep {
+                        value: Some(v),
+                        direct_why: None,
+                        invert_guard,
+                        ignore_why,
+                    });
+                }
+                x
+            }
+            Ok(Val::Bit(x)) => {
+                if self.taint_candidates.contains(&v) {
+                    self.cur_old_deps.push(OldDep {
+                        value: Some(v),
+                        direct_why: None,
+                        invert_guard,
+                        ignore_why,
+                    });
+                }
+                self.s.m.cast(self.cur, Cast::ZExt, x, self.s.t.i32)
+            }
+            Ok(Val::Missing(why)) | Err(why) => {
+                if ignore_why != Some(why) {
+                    self.cur_old_deps.push(OldDep {
+                        value: None,
+                        direct_why: Some(why),
+                        invert_guard,
+                        ignore_why,
+                    });
+                }
+                self.s.m.i32(0)
+            }
+        }
+    }
+
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
         match self.get(v)? {
             Val::I32(x) => Ok(x),
@@ -1427,6 +1552,14 @@ impl<'a> Lower<'a> {
         Val::I32(self.s.m.extract(entry, r, index % 4))
     }
 
+    fn extend_cur_reads(&mut self, extra: &[ReadDep]) {
+        for &dep in extra {
+            if !self.cur_reads.contains(&dep) {
+                self.cur_reads.push(dep);
+            }
+        }
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -1439,7 +1572,13 @@ impl<'a> Lower<'a> {
             return Err("a lane mask holding lanes elsewhere read as data");
         }
         let (x, y) = match self.ballots.get(&lo) {
-            Some(&xy) => xy,
+            Some(&xy) => {
+                if let Some(deps) = self.ballot_deps.get(&lo) {
+                    let deps = deps.clone();
+                    self.extend_cur_reads(&deps);
+                }
+                xy
+            }
             None => {
                 let at = match self.def_block.get(&lo) {
                     // Program inputs (EXEC on entry).
@@ -1450,9 +1589,15 @@ impl<'a> Lower<'a> {
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
+                let saved = std::mem::take(&mut self.cur_reads);
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
+                let sub = std::mem::replace(&mut self.cur_reads, saved);
                 let bit = bit?;
+                self.extend_cur_reads(&sub);
+                if !sub.is_empty() {
+                    self.ballot_deps.insert(lo, sub);
+                }
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -1563,13 +1708,7 @@ impl<'a> Lower<'a> {
                     Reg::S(reg)
                 };
                 let val = inst.read(r).ok_or("an unread operand")?;
-                match self.floats.get(&val) {
-                    Some(&f) => f,
-                    None => {
-                        let x = self.i32_of(val)?;
-                        self.as_float(x)
-                    }
-                }
+                self.float_of(val)?
             }
             _ => {
                 let x = self.operand(inst, &op)?;
@@ -1802,8 +1941,25 @@ impl<'a> Lower<'a> {
             return Ok(self.s.m.bool(b == Bool::TRUE));
         }
         if let Some(&v) = self.bools.get(&(at, b)) {
+            if let Some(deps) = self.bool_deps.get(&(at, b)) {
+                let deps = deps.clone();
+                self.extend_cur_reads(&deps);
+            }
             return Ok(v);
         }
+        let saved = std::mem::take(&mut self.cur_reads);
+        let r = self.boolean_uncached(b, at);
+        let sub = std::mem::replace(&mut self.cur_reads, saved);
+        let v = r?;
+        self.extend_cur_reads(&sub);
+        if !sub.is_empty() {
+            self.bool_deps.insert((at, b), sub);
+        }
+        self.bools.insert((at, b), v);
+        Ok(v)
+    }
+
+    fn boolean_uncached(&mut self, b: Bool, at: usize) -> Result<V, Why> {
         let (atom, lo, hi) = self.x.st.bools.node(b).expect("not a constant");
         let a = self.atom(atom, at)?;
         let m = &mut self.s.m;
@@ -1827,18 +1983,21 @@ impl<'a> Lower<'a> {
                 self.s.m.select(at, a, h, l)
             }
         };
-        self.bools.insert((at, b), v);
         Ok(v)
     }
 
     fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
         match atom {
-            Atom::Lane(v) => self.lane_bits.get(&v).copied().ok_or_else(|| {
-                self.lane_fail
-                    .get(&v)
-                    .copied()
-                    .unwrap_or("a lane mask from a carry")
-            }),
+            Atom::Lane(v) => {
+                let r = self.lane_bits.get(&v).copied().ok_or_else(|| {
+                    self.lane_fail
+                        .get(&v)
+                        .copied()
+                        .unwrap_or("a lane mask from a carry")
+                })?;
+                self.record_read(v);
+                Ok(r)
+            }
             Atom::Uniform(v) => match self.get(v)? {
                 Val::Bit(x) => Ok(x),
                 Val::I32(x) => {
@@ -2022,11 +2181,7 @@ impl<'a> Lower<'a> {
         let Some(new) = inst.write(reg) else { return };
         let x = match (guard, reg) {
             (Some(g), Reg::V(_)) => {
-                let old = match inst.read(reg).map(|o| self.i32_of(o)) {
-                    Some(Ok(o)) => o,
-                    // The validator refuses reads of undef.
-                    _ => self.s.m.i32(0),
-                };
+                let old = self.old_i32_of(inst.read(reg), true, None);
                 self.s.m.select(self.cur, g, x, old)
             }
             _ => x,
@@ -2102,10 +2257,7 @@ impl<'a> Lower<'a> {
         if unused != 2 {
             return field;
         }
-        let old = match inst.read(reg).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) => o,
-            _ => self.s.m.i32(0),
-        };
+        let old = self.old_i32_of(inst.read(reg), false, None);
         let keep = self.s.m.i32(!((((1u64 << width) - 1) as u32) << at));
         let old = self.s.m.bin(c, Bin::And, old, keep);
         self.s.m.bin(c, Bin::Or, old, field)
@@ -2393,6 +2545,7 @@ impl<'a> Lower<'a> {
     /// The float value of a register value.
     fn float_of(&mut self, v: Value) -> Result<V, Why> {
         if let Some(&f) = self.floats.get(&v) {
+            self.record_read(v);
             return Ok(f);
         }
         let x = self.i32_of(v)?;
@@ -2721,10 +2874,9 @@ impl<'a> Lower<'a> {
             Some(d) => Some(self.vgprs(inst, d, 1)?[0]),
             None => None,
         };
-        let old_reg = dst_reg.and_then(|r| inst.read(Reg::V(r)).map(|v| (r, v)));
-        let outside = match old_reg {
-            Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
-            None => self.s.m.i32(0),
+        let outside = match (guard, dst_reg.and_then(|r| inst.read(Reg::V(r)))) {
+            (Some(_), Some(v)) => self.old_i32_of(Some(v), true, None),
+            _ => self.s.m.i32(0),
         };
         let p = dword(self, offset);
         if let Some(max) = match op.as_str() {
@@ -2841,10 +2993,13 @@ impl<'a> Lower<'a> {
     // ---- instructions ----
     // ---- instructions ----
 
-    fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
+    fn inst(&mut self, b: usize, i: usize) -> Result<(), ShaderError> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
+        self.cur_reads.clear();
+        self.cur_old_deps.clear();
+        self.cur_edge = None;
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
             MaskData::Host => {
@@ -2899,8 +3054,66 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        let reads = std::mem::take(&mut self.cur_reads);
+        let old_deps = std::mem::take(&mut self.cur_old_deps);
         match r {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                let guard = self.x.st.guards[b][i];
+                if !reads.is_empty() {
+                    if effect {
+                        self.sinks.push(SinkRead {
+                            block: b,
+                            guard,
+                            offset,
+                            deps: reads,
+                        });
+                    } else {
+                        let use_guard = matches!(
+                            &inst.fields,
+                            Fields::Valu(v)
+                                if v.dpp.is_none()
+                                    && !matches!(
+                                        name,
+                                        "v_readfirstlane_b32"
+                                            | "v_readlane_b32"
+                                            | "v_writelane_b32"
+                                    )
+                        )
+                        .then_some(guard)
+                        .flatten();
+                        for &(_, w) in &inst.writes {
+                            if matches!(self.vals.get(&w), Some(Val::I32(_) | Val::Bit(_)))
+                                || self.lane_bits.contains_key(&w)
+                            {
+                                self.record_write_deps(w, b, use_guard, false, None, reads.clone());
+                            }
+                        }
+                    }
+                }
+                for old in old_deps {
+                    for &(_, w) in &inst.writes {
+                        if !matches!(self.vals.get(&w), Some(Val::I32(_) | Val::Bit(_))) {
+                            continue;
+                        }
+                        if let Some(why) = old.direct_why {
+                            self.taint_candidates.insert(w);
+                            self.direct_missing
+                                .push((w, why, b, guard, old.invert_guard));
+                        }
+                        if let Some(u) = old.value {
+                            self.record_write_deps(
+                                w,
+                                b,
+                                guard,
+                                old.invert_guard,
+                                old.ignore_why,
+                                vec![ReadDep::Value(u)],
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
                 for &(_, v) in &inst.writes {
@@ -4680,9 +4893,20 @@ impl<'a> Lower<'a> {
                 // as f32 x4 (a size query) and as u32 (an atomic).
                 let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
+                    if let Some(deps) = self.handle_deps.get(&key) {
+                        let deps = deps.clone();
+                        self.extend_cur_reads(&deps);
+                    }
                     return Ok(h);
                 }
-                let index = self.heap_index(*load, *first, sampler)?;
+                let saved = std::mem::take(&mut self.cur_reads);
+                let index = self.heap_index(*load, *first, sampler);
+                let sub = std::mem::replace(&mut self.cur_reads, saved);
+                let index = index?;
+                self.extend_cur_reads(&sub);
+                if !sub.is_empty() {
+                    self.handle_deps.insert(key, sub);
+                }
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
@@ -4790,7 +5014,9 @@ impl<'a> Lower<'a> {
                     let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
                     let here = std::mem::replace(&mut self.cur, at);
+                    let prev_edge = self.cur_edge.replace((q, *block));
                     let index = self.uniform_heap_index(arg, sampler, record_props);
+                    self.cur_edge = prev_edge;
                     self.cur = here;
                     incoming.push((index?, at));
                 }
@@ -5036,7 +5262,9 @@ impl<'a> Lower<'a> {
                     let index = match arg {
                         Some(arg) => {
                             let here = std::mem::replace(&mut self.cur, at);
+                            let prev_edge = self.cur_edge.replace((q, *block));
                             let index = self.lane_heap_index(arg, sampler);
+                            self.cur_edge = prev_edge;
                             self.cur = here;
                             index?
                         }
@@ -5530,13 +5758,7 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
-                let acc = match self.floats.get(&acc) {
-                    Some(&x) => x,
-                    None => {
-                        let x = self.i32_of(acc)?;
-                        self.as_float(x)
-                    }
-                };
+                let acc = self.float_of(acc)?;
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
@@ -6152,9 +6374,10 @@ impl<'a> Lower<'a> {
             }
         }
         let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) if keep => o,
-            _ => self.s.m.i32(0),
+        let old = if keep {
+            self.old_i32_of(inst.read(Reg::V(reg)), false, None)
+        } else {
+            self.s.m.i32(0)
         };
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
         let x = self.s.m.bin(c, Bin::And, x, low);
@@ -7505,10 +7728,11 @@ impl<'a> Lower<'a> {
     /// results keep the register's high half (GFX10).
     fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
         let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) => o,
-            _ => self.s.m.i32(0),
-        };
+        let old = self.old_i32_of(
+            inst.read(Reg::V(reg)),
+            false,
+            Some("the first half of an interpolation"),
+        );
         let (high, low) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF));
         let old = self.s.m.bin(c, Bin::And, old, high);
         let x = self.s.m.bin(c, Bin::And, x, low);
@@ -9142,11 +9366,14 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn exit(&mut self, b: usize) -> Result<(), Stop> {
+    fn exit(&mut self, b: usize) -> Result<(), ShaderError> {
         let offset = self.x.p.blocks[b]
             .insts
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
+        self.cur_reads.clear();
+        self.cur_old_deps.clear();
+        self.cur_edge = None;
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
@@ -9177,6 +9404,15 @@ impl<'a> Lower<'a> {
                         (c, taken, not_taken)
                     }
                 };
+                let reads = std::mem::take(&mut self.cur_reads);
+                if !reads.is_empty() {
+                    self.sinks.push(SinkRead {
+                        block: b,
+                        guard: None,
+                        offset,
+                        deps: reads,
+                    });
+                }
                 // A back edge is taken only below the iteration limit.
                 let back =
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
@@ -9297,23 +9533,8 @@ impl<'a> Lower<'a> {
         e
     }
 
-    fn fill_phis(&mut self) -> Result<(), Stop> {
+    fn fill_phis(&mut self) -> Result<(), ShaderError> {
         let p = self.x.p;
-        // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
-        // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
-        // lowering accepts what it refuses when the same value is read directly.
-        let direct_reads = self.read_phis.clone();
-        let mut work: Vec<Value> = self.read_phis.iter().copied().collect();
-        while let Some(v) = work.pop() {
-            let Some(&(b, i)) = self.phi_at.get(&v) else {
-                continue;
-            };
-            for &arg in &p.blocks[b].phis[i].args {
-                if self.phi_at.contains_key(&arg) && self.read_phis.insert(arg) {
-                    work.push(arg);
-                }
-            }
-        }
         while let Some((phi, b, i, base)) = self.pending_addr_phis.pop() {
             let ir_phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
@@ -9334,7 +9555,43 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(phi, incoming);
         }
-        for (v, b, i) in std::mem::take(&mut self.data_phis) {
+        // Phis directly or transitively read by any sink or dependent instruction
+        // (for lazy barycentric inputs and pixel/vertex lane-mask ballots).
+        let mut live_vals: HashSet<Value> = self
+            .sinks
+            .iter()
+            .flat_map(|s| s.deps.iter())
+            .chain(self.handle_deps.values().flatten())
+            .map(|dep| match *dep {
+                ReadDep::Value(u) | ReadDep::Edge { value: u, .. } => u,
+            })
+            .collect();
+        let mut work: Vec<Value> = live_vals.iter().copied().collect();
+        while let Some(v) = work.pop() {
+            if let Some(&(b, i)) = self.phi_at.get(&v) {
+                for &arg in &p.blocks[b].phis[i].args {
+                    if live_vals.insert(arg) {
+                        work.push(arg);
+                    }
+                }
+            }
+            if let Some(infos) = self.deps.get(&v) {
+                for info in infos {
+                    for &dep in &info.deps {
+                        let u = match dep {
+                            ReadDep::Value(u) | ReadDep::Edge { value: u, .. } => u,
+                        };
+                        if live_vals.insert(u) {
+                            work.push(u);
+                        }
+                    }
+                }
+            }
+        }
+        let data_phis = std::mem::take(&mut self.data_phis);
+        let mut ballot_edges: HashSet<(usize, usize, usize)> = HashSet::new();
+        let mut has_missing = false;
+        for &(v, b, i) in &data_phis {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
             let mut incoming = Vec::new();
@@ -9342,32 +9599,34 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
+                if live_vals.contains(&phi.value) && !self.vals.contains_key(&arg) {
                     let _ = self.lazy_barycentric(arg);
                 }
                 let lo = self.x.st.highs.get(&arg).copied().unwrap_or(arg);
                 let ballot_ok = self.mask_data == MaskData::Host
                     && !bit
-                    && self.read_phis.contains(&phi.value)
+                    && live_vals.contains(&phi.value)
                     && self.x.st.masks.contains_key(&lo)
                     && self.def_block.get(&lo).is_some_and(|&d| d != self.cur_ir);
                 let ballot = if ballot_ok {
-                    self.mask_dword(arg).ok()
+                    self.cur_reads.clear();
+                    let r = self.mask_dword(arg).ok();
+                    self.cur_reads.clear();
+                    r
                 } else {
                     None
                 };
-                let ballot_ok = ballot.is_some();
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
-                    }
                     // A mask dword the other path left in the register: its ballot
                     // (a pixel or vertex program reads such a join only through a
                     // zero test or a count). shortcut: the ballot is the host
                     // wave's, so a join read some other way would differ from the
                     // console, which `mask_ok` does not see; upgrade if one shows up.
-                    (None | Some(Val::Missing(_)), false) if ballot_ok => ballot.unwrap(),
+                    (None | Some(Val::Missing(_)), false) if ballot.is_some() => {
+                        ballot_edges.insert((b, i, n));
+                        ballot.unwrap()
+                    }
                     // A lane mask's dword reaching a join that also takes
                     // data: the registers are reused once the mask is dead.
                     // shortcut: undefined on that edge, assuming the program
@@ -9378,26 +9637,14 @@ impl<'a> Lower<'a> {
                     {
                         self.s.m.undef(self.s.t.i32)
                     }
-                    // A descriptor's address or format dword reaching a join
-                    // that also takes data: the console reuses the registers
-                    // once the descriptor is dead.
-                    // shortcut: undefined on that edge, assuming the program
-                    // reads the joined value only on paths from a data edge.
-                    (Some(Val::Missing(why)), false) if why == DESCRIPTOR_OTHER => {
-                        self.s.m.undef(self.s.t.i32)
+                    _ => {
+                        has_missing = true;
+                        if bit {
+                            self.s.m.bool(false)
+                        } else {
+                            self.s.m.i32(0)
+                        }
                     }
-                    (Some(Val::Missing(why)), _)
-                        if direct_reads.contains(&phi.value)
-                            || (self.read_phis.contains(&phi.value)
-                                && (why.contains("s_memtime") || why.contains("scalar memory"))) =>
-                    {
-                        return Err(Stop::Retry(phi.value, why));
-                    }
-                    _ if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
-                    }
-                    _ if bit => self.s.m.bool(false),
-                    _ => self.s.m.i32(0),
                 };
                 incoming.push((x, qb));
             }
@@ -9417,10 +9664,228 @@ impl<'a> Lower<'a> {
                     *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
                         unsupported(offset, "a lane-mask join of an untracked mask")
                     })?;
+                self.cur_reads.clear();
+                self.cur_edge = None;
                 let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                let reads = std::mem::take(&mut self.cur_reads);
+                if !reads.is_empty() {
+                    let deps = reads
+                        .into_iter()
+                        .map(|dep| match dep {
+                            ReadDep::Value(value) => ReadDep::Edge {
+                                from: q,
+                                to: b,
+                                value,
+                            },
+                            other => other,
+                        })
+                        .collect();
+                    self.sinks.push(SinkRead {
+                        block: q,
+                        guard: None,
+                        offset,
+                        deps,
+                    });
+                }
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
+        }
+        if (!has_missing && self.direct_missing.is_empty()) || self.sinks.is_empty() {
+            return Ok(());
+        }
+        self.check_missing_reach(&data_phis, &ballot_edges)
+    }
+
+    /// Rejects the program if any missing or mismatched phi incoming edge (or
+    /// direct missing value surviving via a partial/guarded overwrite) can
+    /// reach an observable sink along a feasible path in [`Structured`].
+    fn check_missing_reach(
+        &self,
+        data_phis: &[(V, usize, usize)],
+        ballot_edges: &HashSet<(usize, usize, usize)>,
+    ) -> Result<(), ShaderError> {
+        const MAX_TAINT_ROUNDS: usize = 256;
+        let p = self.x.p;
+        let st = self.x.st;
+        let mut bools = BoolSet::new(&st.bools);
+        let mut taint: HashMap<Value, Vec<(Why, Bool)>> = HashMap::new();
+
+        let site_cond =
+            |bools: &mut BoolSet, block: usize, guard: Option<Bool>, invert: bool| -> Bool {
+                match guard {
+                    Some(g) => {
+                        let g = if invert { bools.not(g) } else { g };
+                        bools.and(st.reach[block], g)
+                    }
+                    None => st.reach[block],
+                }
+            };
+        let dep_cond = |bools: &mut BoolSet, base: Bool, dep: ReadDep| -> (Value, Bool) {
+            match dep {
+                ReadDep::Value(u) => (u, base),
+                ReadDep::Edge { from, to, value: u } => {
+                    let ec = bools.edge(st, from, to);
+                    (u, bools.and(base, ec))
+                }
+            }
+        };
+        let merge = |taint: &mut HashMap<Value, Vec<(Why, Bool)>>,
+                     dst: Value,
+                     why: Why,
+                     cond: Bool,
+                     bools: &mut BoolSet|
+         -> bool {
+            if cond == Bool::FALSE {
+                return false;
+            }
+            let list = taint.entry(dst).or_default();
+            if let Some((_, existing)) = list.iter_mut().find(|(w, _)| *w == why) {
+                let next = bools.or(*existing, cond);
+                if next != *existing {
+                    *existing = next;
+                    return true;
+                }
+                false
+            } else {
+                list.push((why, cond));
+                true
+            }
+        };
+
+        for &(dst, why, block, guard, invert) in &self.direct_missing {
+            let c = site_cond(&mut bools, block, guard, invert);
+            merge(&mut taint, dst, why, c, &mut bools);
+        }
+
+        for &(_, b, i) in data_phis {
+            let phi = &p.blocks[b].phis[i];
+            let bit = phi.reg == Reg::Scc;
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if self.tail[q].is_none() {
+                    continue;
+                }
+                let arg = phi.args[n];
+                let why = match (self.vals.get(&arg).copied(), bit) {
+                    (Some(Val::I32(_)), false) | (Some(Val::Bit(_)), true) => continue,
+                    (None | Some(Val::Missing(_)), false)
+                        if ballot_edges.contains(&(b, i, n)) =>
+                    {
+                        continue;
+                    }
+                    (Some(Val::Missing(_)), false)
+                        if st.masks.contains_key(&arg) || st.highs.contains_key(&arg) =>
+                    {
+                        continue;
+                    }
+                    (Some(Val::Bit(_)), false) => "an SCC joined with SGPR values",
+                    (Some(Val::Missing(why)), _) => why,
+                    _ => "a join of mismatched values",
+                };
+                let mut c = bools.edge(st, q, b);
+                if self.rpo[b] <= self.rpo[q] {
+                    c = bools.forget(c, self.rpo[b]);
+                }
+                merge(&mut taint, phi.value, why, c, &mut bools);
+            }
+        }
+
+        let propagate_step =
+            |taint: &mut HashMap<Value, Vec<(Why, Bool)>>, bools: &mut BoolSet, precise: bool| {
+                let mut changed = false;
+                for &(_, b, i) in data_phis {
+                    let phi = &p.blocks[b].phis[i];
+                    for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                        if self.tail[q].is_none() {
+                            continue;
+                        }
+                        let Some(list) = taint.get(&phi.args[n]).cloned() else {
+                            continue;
+                        };
+                        let ec = if precise {
+                            bools.edge(st, q, b)
+                        } else {
+                            Bool::TRUE
+                        };
+                        for (why, c) in list {
+                            let tc = if precise {
+                                let mut tc = bools.and(c, ec);
+                                if self.rpo[b] <= self.rpo[q] {
+                                    tc = bools.forget(tc, self.rpo[b]);
+                                }
+                                tc
+                            } else {
+                                Bool::TRUE
+                            };
+                            changed |= merge(taint, phi.value, why, tc, bools);
+                        }
+                    }
+                }
+                for &w in &self.deps_order {
+                    for info in &self.deps[&w] {
+                        let use_c = if precise {
+                            site_cond(bools, info.block, info.guard, info.invert_guard)
+                        } else {
+                            Bool::TRUE
+                        };
+                        for &dep in &info.deps {
+                            let (val, dc) = if precise {
+                                dep_cond(bools, use_c, dep)
+                            } else {
+                                let u = match dep {
+                                    ReadDep::Value(u) | ReadDep::Edge { value: u, .. } => u,
+                                };
+                                (u, Bool::TRUE)
+                            };
+                            let Some(list) = taint.get(&val).cloned() else {
+                                continue;
+                            };
+                            for (why, c) in list {
+                                if info.ignore_why == Some(why) {
+                                    continue;
+                                }
+                                let tc = if precise {
+                                    bools.and(c, dc)
+                                } else {
+                                    Bool::TRUE
+                                };
+                                changed |= merge(taint, w, why, tc, bools);
+                            }
+                        }
+                    }
+                }
+                changed
+            };
+
+        let mut settled = false;
+        for _ in 0..MAX_TAINT_ROUNDS {
+            if !propagate_step(&mut taint, &mut bools, true) {
+                settled = true;
+                break;
+            }
+        }
+        if !settled {
+            // Conservative widening when cyclic propagation exceeds the round cap.
+            for list in taint.values_mut() {
+                for (_, c) in list.iter_mut() {
+                    *c = Bool::TRUE;
+                }
+            }
+            while propagate_step(&mut taint, &mut bools, false) {}
+        }
+
+        for sink in &self.sinks {
+            let sink_c = site_cond(&mut bools, sink.block, sink.guard, false);
+            for &dep in &sink.deps {
+                let (val, dc) = dep_cond(&mut bools, sink_c, dep);
+                if let Some(list) = taint.get(&val) {
+                    for &(why, c) in list {
+                        if bools.sat(c, dc) {
+                            return Err(unsupported(sink.offset, why));
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -10095,6 +10560,511 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    #[cfg(windows)]
+    fn validate_dxil(dxil: &[u8]) {
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            let mut copy = dxil.to_vec();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy).expect("DXIL validation failed");
+            assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn validate_dxil(_dxil: &[u8]) {}
+
+    #[test]
+    fn a_live_descriptor_word_stays_missing_through_two_joins() {
+        let mut words = [
+            0xBE84_0300, // s_mov_b32 s4, s0 (table)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0 (root constant)
+            0xBF85_0002, // take the descriptor arm when SCC is set
+            0xBE89_0391, // s_mov_b32 s9, 17
+            0xBF82_0006, // skip the descriptor arm
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xBF85_0001, // if SCC is set, keep the descriptor word live
+            0xBE89_039D, // s_mov_b32 s9, 29
+            0x7E04_0209, // v_mov_b32 v2, s9
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        let run = |words: &[u32]| {
+            let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+            let used = vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }];
+            lower_wave(words, layout, used, false)
+        };
+        let reason = |words: &[u32]| match run(words) {
+            Ok(_) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let through_two_joins = reason(&words);
+        assert_eq!(
+            through_two_joins,
+            Some("a descriptor's address or format read as data")
+        );
+        words[13] = 0xBF82_0001; // skip the overwrite unconditionally: one join
+        assert_eq!(through_two_joins, reason(&words));
+
+        // Correlated overwrite: when SCC is set, always overwrite s9 = 29 before reading it.
+        words[13] = 0xBF84_0001; // s_cbranch_scc0 +1 (skip overwrite only when SCC is clear)
+        let lowered = run(&words).expect("overwritten descriptor word must lower");
+        validate_dxil(&lowered.dxil);
+    }
+
+    #[test]
+    fn unknown_stride_load_stays_missing_when_live_and_lowers_when_overwritten() {
+        let mut words = [
+            0xBE84_0300, // s_mov_b32 s4, s0 (table)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0 (root constant)
+            0xBF85_0002, // take the unknown-stride load arm when SCC is set
+            0x7E02_0291, // v_mov_b32 v1, 17
+            0xBF82_0004, // skip the load arm
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen (unknown stride -> Missing)
+            0xBF85_0001, // if SCC is set, keep the missing load live
+            0x7E02_029D, // v_mov_b32 v1, 29
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let run = |words: &[u32]| {
+            let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+            let used = vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 2, // unsupported stride -> Missing without stride table
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }];
+            lower_wave(words, layout, used, false)
+        };
+        let reason = |words: &[u32]| match run(words) {
+            Ok(_) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let two_joins = reason(&words);
+        assert_eq!(two_joins, Some("a structured buffer of unknown stride"));
+        words[11] = 0xBF82_0001; // s_branch +1: one join
+        assert_eq!(two_joins, reason(&words));
+
+        // Correlated overwrite: when SCC is set, always overwrite v1 = 29.
+        words[11] = 0xBF84_0001; // s_cbranch_scc0 +1
+        let lowered = run(&words).expect("overwritten unknown-stride load must lower");
+        validate_dxil(&lowered.dxil);
+    }
+
+    #[test]
+    fn first_half_of_interpolation_stays_missing_when_live_and_lowers_when_overwritten() {
+        let mut words = [
+            0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x (Missing)
+            0xBF06_8000,    // s_cmp_eq_u32 s0, 0
+            0xBF84_0001,    // s_cbranch_scc0 +1 (skip p2 when s0 != 0)
+            0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+            0xBF85_0001,    // s_cbranch_scc1 +1 (skip overwrite when s0 == 0)
+            0x7E04_0280,    // v_mov_b32 v2, 0
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            S_ENDPGM,
+        ];
+        let run = |words: &[u32]| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![root(RootType::Constants, 0, 0)],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![crate::native::PsInput {
+                        usage: crate::native::Usage::Generic,
+                        row: 0,
+                        mask: 0b1111,
+                        attr: 0,
+                        flat: false,
+                        fp16: false,
+                        pack2: false,
+                        row2: 0,
+                    }],
+                    rsrc2: 0,
+                    input_addr: 1 << 1, // PERSP_CENTER
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, 4).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let outputs = vec![super::SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            }];
+            let inputs = vec![super::SigElement {
+                name: "TEXCOORD".into(),
+                index: 0,
+                kind: 0,
+                comp: 9,
+                interp: 2,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            }];
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs,
+                outputs,
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        };
+        // Overwritten on the s0 != 0 branch: p1 never reaches exp.
+        let lowered = run(&words).expect("overwritten interp half must lower");
+        validate_dxil(&lowered.dxil);
+
+        // Flip word 4 to s_cbranch_scc0 +1: when s0 != 0, p1 reaches exp live.
+        words[4] = 0xBF84_0001;
+        let Err(crate::ShaderError::Unsupported { what, .. }) = run(&words) else {
+            panic!("live p1 must refuse");
+        };
+        assert_eq!(what, "the first half of an interpolation");
+
+        // Unconditional skip (1 join): also refuses identically.
+        words[4] = 0xBF82_0001;
+        let Err(crate::ShaderError::Unsupported { what, .. }) = run(&words) else {
+            panic!("1-join live p1 must refuse");
+        };
+        assert_eq!(what, "the first half of an interpolation");
+    }
+
+    #[test]
+    fn guarded_write_and_exec_mask_phi_lower_soundly() {
+        // 1. EXEC phi fed by a scalar SGPR in one branch, then read via s_bcnt1_i32_b32.
+        let exec_phi_words = [
+            0xBE84_03BF, // s_mov_b32 s4, 0x3F
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF84_0001, // s_cbranch_scc0 +1
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            0xBE82_0F7E, // s_bcnt1_i32_b32 s2, exec_lo
+            0x7E00_0202, // v_mov_b32 v0, s2
+            0xD834_0000,
+            0x0000_0000, // ds_write_b32 v0, v0
+            S_ENDPGM,
+        ];
+        let lowered = lower_wave(
+            &exec_phi_words,
+            vec![root(RootType::Constants, 0, 0)],
+            vec![],
+            false,
+        )
+        .expect("EXEC phi read via mask_ok must lower");
+        validate_dxil(&lowered.dxil);
+
+        // 2. Guarded write (`write_placed`) preserving `17` on `!guard` lanes where `guard`
+        //    lanes held an unknown-stride load (and overwriting `guard` lanes with `29`).
+        let guarded_words = [
+            0xBE84_0300, // s_mov_b32 s4, s0 (table)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0291, // v_mov_b32 v1, 17
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+            0xBF88_0004, // s_cbranch_execz +4
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen (unknown stride)
+            0xBEFE_0306, // s_mov_b32 exec_lo, s6
+            0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+            0x7E02_029D, // v_mov_b32 v1, 29 (guarded by v0 == 0, keeps v1 = 17 on v0 != 0)
+            0xBEFE_0306, // s_mov_b32 exec_lo, s6
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let lowered = lower_wave(
+            &guarded_words,
+            vec![root(RootType::Table, 0, 0)],
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            false,
+        )
+        .expect("guarded overwrite over unknown-stride arm must lower");
+        validate_dxil(&lowered.dxil);
+    }
+
+    #[test]
+    fn loop_missing_value_refuses_on_back_edge_and_lowers_when_infeasible() {
+        // Loop header (word 4): s2 starts at 17, v7 = 0. Inside loop: if s0 == 0, s_memtime -> s2.
+        // Latch uses VCC so loop-invariant scc (s0 == 0) survives across iterations.
+        // After loop: if s0 == 0, overwrite s2 = 29, else read P_s2.
+        let mut words = [
+            0x7E00_0280, // 0: v_mov_b32 v0, 0
+            0xBE82_0391, // 1: s_mov_b32 s2, 17
+            0x7E0E_0280, // 2: v_mov_b32 v7, 0
+            0xBF06_8000, // 3: s_cmp_eq_u32 s0, 0 (loop-invariant, preserved in SCC)
+            // loop header (word 4):
+            0xBF84_0003, // 4: s_cbranch_scc0 +3 (skip s_memtime when s0 != 0)
+            0xF490_0180,
+            0,           // 5-6: s_memtime s[6:7]
+            0xBE82_0306, // 7: s_mov_b32 s2, s6
+            // latch (word 8):
+            0x4A0E_0E81, // 8: v_add_nc_u32 v7, 1, v7
+            0x7D88_0E82, // 9: v_cmp_gt_u32 vcc_lo, 2, v7
+            0xBF87_FFF9, // 10: s_cbranch_vccnz -7 (back to word 4)
+            // after loop (word 11):
+            0xBF84_0001, // 11: s_cbranch_scc0 +1 (skip overwrite when s0 != 0)
+            0xBE82_039D, // 12: s_mov_b32 s2, 29
+            0x7E02_0202, // 13: v_mov_b32 v1, s2
+            0xD834_0000,
+            0x0000_0100, // 14-15: ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let run =
+            |words: &[u32]| lower_wave(words, vec![root(RootType::Constants, 0, 0)], vec![], false);
+        let lowered = run(&words).expect("loop-invariant infeasible missing edge must lower");
+        validate_dxil(&lowered.dxil);
+
+        // Flip word 11 to s_cbranch_scc1 +1: s_memtime from back-edge reaches ds_write when s0 == 0.
+        words[11] = 0xBF85_0001;
+        let Err(crate::ShaderError::Unsupported { what, .. }) = run(&words) else {
+            panic!("live loop back-edge missing value must refuse");
+        };
+        assert_eq!(what, "a scalar memory read as data");
+    }
+
+    #[test]
+    fn old_register_missing_values_and_cached_floats_stay_refused() {
+        let srv_used = || {
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 2,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        let expect_unsupported = |res: Result<Lowered, crate::ShaderError>, want: &str| match res {
+            Ok(_) => panic!("expected refusal `{want}`, but lowered"),
+            Err(crate::ShaderError::Unsupported { what, .. }) => assert_eq!(what, want),
+            Err(error) => panic!("{error}"),
+        };
+
+        // 1a. Direct Val::Missing on `old` surviving into `!guard` of `write_placed`.
+        let direct_old_guard = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen (unknown stride)
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0 (v0 < 16)
+            0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+            0x7E02_029D, // v_mov_b32 v1, 29 (v0 >= 16 keeps old unknown-stride v1)
+            0xBEFE_0306, // s_mov_b32 exec_lo, s6
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        expect_unsupported(
+            lower_wave(
+                &direct_old_guard,
+                vec![root(RootType::Table, 0, 0)],
+                srv_used(),
+                false,
+            ),
+            "a structured buffer of unknown stride",
+        );
+
+        // 1b. Phi Val::Missing on `old` surviving into `!guard` of `write_placed`.
+        let phi_old_guard = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0291, // v_mov_b32 v1, 17
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0 (v0 == 0)
+            0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+            0xBF88_0004, // s_cbranch_execz +4
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xBEFE_0306, // s_mov_b32 exec_lo, s6
+            0x7D8A_0080, // v_cmp_ne_u32 vcc_lo, 0, v0 (v0 != 0 -> !guard keeps v0 == 0!)
+            0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+            0x7E02_029D, // v_mov_b32 v1, 29
+            0xBEFE_0306, // s_mov_b32 exec_lo, s6
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        expect_unsupported(
+            lower_wave(
+                &phi_old_guard,
+                vec![root(RootType::Table, 0, 0)],
+                srv_used(),
+                false,
+            ),
+            "a structured buffer of unknown stride",
+        );
+
+        // 1c. Live Val::Missing on `old` kept by `write_16` (`keep == true`).
+        let write16_old = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0x6402_00F2, // v_add_f16 v1, 1.0, v0 (keeps high 16 bits of v1)
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        expect_unsupported(
+            lower_wave(
+                &write16_old,
+                vec![root(RootType::Table, 0, 0)],
+                srv_used(),
+                false,
+            ),
+            "a structured buffer of unknown stride",
+        );
+
+        // 1d. Live Val::Missing on `old` kept by `place_bits` (SDWA `dst_unused: UNUSED_PRESERVE`).
+        let sdwa_old = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0x7E02_02F9,
+            0x0006_1400, // v_mov_b32_sdwa v1, v0 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        expect_unsupported(
+            lower_wave(
+                &sdwa_old,
+                vec![root(RootType::Table, 0, 0)],
+                srv_used(),
+                false,
+            ),
+            "a structured buffer of unknown stride",
+        );
+
+        // 1e. Direct Val::Missing on `outside` surviving `!guard` of `ds_add_rtn_u32`.
+        let ds_rtn_outside = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0 (v0 < 16)
+            0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+            0xD880_0000,
+            0x0100_0000, // ds_add_rtn_u32 v1, v0, v0 (v0 >= 16 keeps outside = unknown-stride v1)
+            0xBEFE_0306, // s_mov_b32 exec_lo, s6
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        expect_unsupported(
+            lower_wave(
+                &ds_rtn_outside,
+                vec![root(RootType::Table, 0, 0)],
+                srv_used(),
+                false,
+            ),
+            "a structured buffer of unknown stride",
+        );
+
+        // 2. Live missing phi flowing through chained float ops (`self.floats` cache hit) to `ds_write`.
+        let chained_float_phi = [
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // take s_memtime arm when s0 == 0
+            0xBE82_0391, // s_mov_b32 s2, 17
+            0xBF82_0003, // skip s_memtime
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xBE82_0306, // s_mov_b32 s2, s6
+            0x0604_0002, // v_add_f32 v2, s2, v0 (inserts v2 into self.floats)
+            0x0A06_04F4, // v_mul_f32 v3, 2.0, v2 (hits self.floats[&v2], inserts v3 into self.floats)
+            0xD834_0000,
+            0x0000_0300, // ds_write_b32 v0, v3
+            S_ENDPGM,
+        ];
+        expect_unsupported(
+            lower_wave(
+                &chained_float_phi,
+                vec![root(RootType::Constants, 0, 0)],
+                vec![],
+                false,
+            ),
+            "a scalar memory read as data",
+        );
     }
 
     #[test]

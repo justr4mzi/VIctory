@@ -1895,3 +1895,74 @@ fn vs_rt_and_viewport_index_exports_validate_and_create_pso() {
     }
     assert!(ran > 0, "neither hardware nor WARP supports SM 6.6");
 }
+
+#[test]
+fn reachability_overwritten_missing_phis_match_on_host_and_warp() {
+    // 1. Correlated overwrite of a missing descriptor word (`s13`) across two joins:
+    //    when s0 == 0: load s[12:15], read UAV via raw buffer_load_dword, then overwrite s13 = 29;
+    //    when s0 != 0: set s13 = 17, skip overwrite. Result v0 = s13.
+    let desc_word_shader = build_valu_cs(&[
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 +2
+        0xBE8D_0391, // s_mov_b32 s13, 17
+        0xBF82_0004, // s_branch +4
+        s_load_dwordx4(12, 4)[0],
+        s_load_dwordx4(12, 4)[1],
+        0xE030_0000,
+        0x8003_0506, // buffer_load_dword v5, v6, s[12:15], 0
+        0xBF84_0001, // s_cbranch_scc0 +1 (skip overwrite only when s0 != 0)
+        0xBE8D_039D, // s_mov_b32 s13, 29
+        vop1(0x001, 0, sgpr(13)),
+    ]);
+    // 2. Correlated overwrite of a VGPR missing value (`s_memtime` -> `v5` -> Missing) across two joins:
+    //    when s0 == 0: sample `s_memtime` into v5, then overwrite v5 = 29;
+    //    when s0 != 0: v5 = 17, skip overwrite. Result v0 = v5.
+    let unknown_stride_shader = build_valu_cs(&[
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 +2
+        0x7E0A_0291, // v_mov_b32 v5, 17
+        0xBF82_0003, // s_branch +3
+        0xF490_0180,
+        0,           // s_memtime s[6:7]
+        vop1(0x001, 5, sgpr(6)),
+        0xBF84_0001, // s_cbranch_scc0 +1 (skip overwrite only when s0 != 0)
+        0x7E0A_029D, // v_mov_b32 v5, 29
+        vop1(0x001, 0, vgpr(5)),
+    ]);
+    // 3. Loop-invariant infeasible s_memtime phi (latch uses VCC to preserve SCC):
+    //    when s0 == 0: loop runs s_memtime -> s13, then overwrites s13 = 29 after loop;
+    //    when s0 != 0: loop keeps s13 = 17, skips overwrite after loop.
+    let loop_shader = build_valu_cs(&[
+        0xBE8D_0391, // s_mov_b32 s13, 17
+        0x7E0E_0280, // v_mov_b32 v7, 0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF84_0003, // s_cbranch_scc0 +3
+        0xF490_0180,
+        0,           // s_memtime s[6:7]
+        0xBE8D_0306, // s_mov_b32 s13, s6
+        0x4A0E_0E81, // v_add_nc_u32 v7, 1, v7
+        0x7D88_0E82, // v_cmp_gt_u32 vcc_lo, 2, v7
+        0xBF87_FFF9, // s_cbranch_vccnz -7
+        0xBF84_0001, // s_cbranch_scc0 +1
+        0xBE8D_039D, // s_mov_b32 s13, 29
+        vop1(0x001, 0, sgpr(13)),
+    ]);
+
+    let cases = [([0, 0, 0, 0], 29u32), ([1, 0, 0, 0], 17u32)];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    for (name, shader) in [
+        ("desc_word", &desc_word_shader),
+        ("unknown_stride", &unknown_stride_shader),
+        ("loop_memtime", &loop_shader),
+    ] {
+        run_cases(shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend} {name} s0={}: got {got}, want {want}",
+                inp[0]
+            );
+        });
+    }
+}
