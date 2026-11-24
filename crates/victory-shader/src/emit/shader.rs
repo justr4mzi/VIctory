@@ -920,6 +920,8 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            table_views: Vec::new(),
+            stride_table: false,
         };
         if let Ok(host) = Host::new(false) {
             host.compute_pipeline(&hs).unwrap();

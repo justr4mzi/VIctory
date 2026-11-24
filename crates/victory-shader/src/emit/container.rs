@@ -422,7 +422,44 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::shader::Mesh;
     use super::*;
+
+    fn words(bytes: &[u8]) -> Vec<u32> {
+        let (words, remainder) = bytes.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        words.iter().copied().map(u32::from_le_bytes).collect()
+    }
+
+    fn element(name: &str, row: Option<u32>, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row,
+            col,
+            cols,
+            usage: 1,
+            half: false,
+        }
+    }
+
+    fn empty_psv(stage: u8) -> Psv<'static> {
+        Psv {
+            stage,
+            flag: false,
+            inputs: &[],
+            outputs: &[],
+            prims: &[],
+            mesh: None,
+            gs: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        }
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {
@@ -441,7 +478,7 @@ mod tests {
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
     }
 
-    fn element(name: &str, row: u32, col: u8, interp: u8) -> SigElement {
+    fn interp_element(name: &str, row: u32, col: u8, interp: u8) -> SigElement {
         SigElement {
             name: name.into(),
             index: 0,
@@ -459,12 +496,12 @@ mod tests {
     #[test]
     fn rows_of_mixed_interpolation_are_separated() {
         let mut e = vec![
-            element("A", 0, 0, 2),
-            element("B", 0, 1, 1),
-            element("C", 1, 0, 2),
-            element("D", 0, 2, 1),
-            element("E", 0, 3, 2),
-            element("F", 1, 1, 0),
+            interp_element("A", 0, 0, 2),
+            interp_element("B", 0, 1, 1),
+            interp_element("C", 1, 0, 2),
+            interp_element("D", 0, 2, 1),
+            interp_element("E", 0, 3, 2),
+            interp_element("F", 1, 1, 0),
         ];
         separate_interpolation(&mut e);
         let rows: Vec<u32> = e.iter().map(|e| e.row.unwrap()).collect();
@@ -507,5 +544,278 @@ mod tests {
         // Register order, then name offset (element order here), as the
         // validator writes them: TEXCOORD3 before NORMAL0 in register 1.
         assert_eq!(rows, [(0, 0), (3, 1), (0, 1)]);
+    }
+
+    #[test]
+    fn hash_matches_synthetic_vectors_at_padding_boundaries() {
+        // Calculated independently by applying MD5 compression to the
+        // retail-format padded byte sequences 0, 1, ..., len - 1.
+        let vectors = [
+            (
+                0,
+                [
+                    0x14, 0x0d, 0x60, 0xf6, 0xb7, 0x75, 0xe2, 0xba, 0x4e, 0x4a, 0xbe, 0xd4, 0x01,
+                    0xb2, 0xe9, 0xa1,
+                ],
+            ),
+            (
+                55,
+                [
+                    0x84, 0x2e, 0x55, 0x53, 0x4b, 0xa9, 0x3d, 0xaa, 0x93, 0xe9, 0x4b, 0xd5, 0xaf,
+                    0x9b, 0x0c, 0x03,
+                ],
+            ),
+            (
+                56,
+                [
+                    0x00, 0xf9, 0xcc, 0x96, 0x4f, 0xf2, 0xec, 0x81, 0x95, 0x9d, 0x4a, 0x3f, 0x09,
+                    0x2c, 0xe6, 0x3f,
+                ],
+            ),
+            (
+                63,
+                [
+                    0x44, 0x00, 0xd4, 0x28, 0xa4, 0x1d, 0x0e, 0x75, 0xdc, 0x98, 0xb9, 0x36, 0x69,
+                    0x3f, 0x7b, 0xfb,
+                ],
+            ),
+            (
+                64,
+                [
+                    0xf4, 0x2e, 0xb0, 0x6c, 0xa9, 0x21, 0xc8, 0x78, 0xe4, 0x35, 0xe3, 0xb8, 0xd4,
+                    0xf9, 0x2b, 0x13,
+                ],
+            ),
+            (
+                119,
+                [
+                    0xba, 0x3a, 0x67, 0xec, 0xd4, 0x64, 0x1c, 0xe4, 0xed, 0x08, 0xf2, 0x91, 0x89,
+                    0x6e, 0x1b, 0xc6,
+                ],
+            ),
+            (
+                120,
+                [
+                    0x88, 0x2f, 0xce, 0x4f, 0x4c, 0x95, 0x19, 0x43, 0x92, 0xe7, 0xad, 0xef, 0xd5,
+                    0x3f, 0xe3, 0x43,
+                ],
+            ),
+        ];
+        let data: Vec<u8> = (0..120).collect();
+        for (len, expected) in vectors {
+            assert_eq!(hash(&data[..len]), expected, "length {len}");
+        }
+    }
+
+    #[test]
+    fn empty_container_has_only_the_signed_header() {
+        let bytes = build(&[]);
+        assert_eq!(&bytes[..4], b"DXBC");
+        assert_eq!(&bytes[20..], &[1, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            words(&bytes[4..20]),
+            [0x4c07_86fe, 0xe9c2_2f40, 0xa34f_0f0e, 0xc05b_06bf]
+        );
+    }
+
+    #[test]
+    fn container_offsets_are_contiguous_after_an_unpadded_signature() {
+        let bytes = build(&[
+            (b"ISG1", &[0x11, 0x22, 0x33]),
+            (b"OSG1", &[]),
+            (b"PRIV", &[]),
+        ]);
+        assert_eq!(&bytes[..4], b"DXBC");
+        assert_eq!(words(&bytes[20..44]), [1, 71, 3, 44, 55, 63]);
+        assert_eq!(&bytes[44..55], b"ISG1\x03\0\0\0\x11\x22\x33");
+        assert_eq!(&bytes[55..63], b"OSG1\0\0\0\0");
+        assert_eq!(&bytes[63..], b"PRIV\0\0\0\0");
+        assert_eq!(
+            words(&bytes[4..20]),
+            [0xe8e8_9b79, 0x8857_cd6c, 0xf7ec_2ab3, 0x137d_e43d]
+        );
+    }
+
+    #[test]
+    fn signature_sorts_rows_and_preserves_legacy_name_offsets_and_masks() {
+        assert_eq!(words(&signature(&[], true)), [0, 8]);
+        let elements = [
+            SigElement {
+                index: 7,
+                ..element("COLOR", Some(1), 2, 2)
+            },
+            SigElement {
+                index: 1,
+                kind: 16,
+                usage: 15,
+                ..element("SV_Target", Some(3), 0, 4)
+            },
+            SigElement {
+                index: 8,
+                comp: 4,
+                usage: 2,
+                ..element("COLOR", Some(1), 0, 2)
+            },
+            SigElement {
+                kind: 16,
+                usage: 15,
+                ..element("SV_Target", Some(2), 0, 4)
+            },
+            SigElement {
+                kind: 17,
+                ..element("SV_Depth", None, 0, 1)
+            },
+        ];
+        let input = signature(&elements, true);
+        let output = signature(&elements, false);
+        let rows = [
+            [0, 168, 7, 0, 3, 1, 0x040c, 0],
+            [0, 184, 8, 0, 2, 1, 0x0203, 0],
+            [0, 174, 0, 64, 3, 2, 0x0f0f, 0],
+            [0, 174, 1, 64, 3, 3, 0x0f0f, 0],
+            [0, 190, 0, 65, 3, u32::MAX, 0x0101, 0],
+        ];
+        assert_eq!(words(&input[..8]), [5, 8]);
+        assert_eq!(words(&output[..8]), [5, 8]);
+        assert_eq!(&input[168..], b"COLOR\0SV_Target\0COLOR\0SV_Depth\0");
+        assert_eq!(&output[168..], &input[168..]);
+        for (i, (row, output_mask)) in rows.into_iter().zip([0x0b, 0x0d, 0, 0, 0x0e]).enumerate() {
+            let start = 8 + 32 * i;
+            assert_eq!(words(&input[start..start + 32]), row);
+            let mut expected = row;
+            expected[6] = (row[6] & 0xff) | (output_mask << 8);
+            assert_eq!(words(&output[start..start + 32]), expected);
+        }
+    }
+
+    #[test]
+    fn compute_psv_contains_thread_and_wave_sizes_with_empty_tables() {
+        let bytes = psv(&Psv {
+            threads: [8, 4, 2],
+            wave_size: Some(32),
+            ..empty_psv(5)
+        });
+        assert_eq!(
+            words(&bytes),
+            [48, 0, 0, 0, 0, 32, 32, 5, 0, 0, 8, 4, 2, 0, 4, 0, 0]
+        );
+    }
+
+    #[test]
+    fn pixel_sample_frequency_depends_on_sample_interpolation_or_semantic() {
+        for (interp, kind, expected) in [(5, 0, 0), (6, 0, 1), (7, 0, 1), (0, 12, 1)] {
+            let inputs = [SigElement {
+                interp,
+                kind,
+                ..element("UV", Some(0), 0, 1)
+            }];
+            let bytes = psv(&Psv {
+                flag: true,
+                inputs: &inputs,
+                ..empty_psv(0)
+            });
+            assert_eq!(&bytes[4..8], &[1, expected, 0, 0]);
+            assert_eq!(words(&bytes[20..28]), [0, u32::MAX]);
+        }
+    }
+
+    #[test]
+    fn vertex_psv_encodes_bindings_tables_and_cross_word_dependencies() {
+        let inputs = [SigElement {
+            index: 3,
+            interp: 2,
+            ..element("COLOR", Some(0), 1, 2)
+        }];
+        let outputs = [SigElement {
+            index: 3,
+            ..element("OR", Some(8), 1, 1)
+        }];
+        let bytes = psv(&Psv {
+            inputs: &inputs,
+            outputs: &outputs,
+            bindings: &[
+                Binding {
+                    kind: 1,
+                    space: 6,
+                    register: 9,
+                    dxil_kind: 14,
+                },
+                Binding {
+                    kind: 2,
+                    space: 7,
+                    register: 2,
+                    dxil_kind: 13,
+                },
+            ],
+            ..empty_psv(1)
+        });
+        assert_eq!(&bytes[28..40], &[1, 0, 0, 0, 1, 1, 0, 1, 9, 0, 0, 0]);
+        assert_eq!(
+            words(&bytes[52..112]),
+            [2, 24, 1, 6, 9, 9, 14, 0, 2, 7, 2, 2, 13, 0, 8]
+        );
+        assert_eq!(&bytes[112..120], b"\0COLOR\0\0");
+        assert_eq!(words(&bytes[120..132]), [1, 3, 16]);
+        assert_eq!(
+            words(&bytes[132..164]),
+            [1, 0, 0x0052_0001, 0x0203, 4, 0, 0x0051_0801, 3]
+        );
+        assert_eq!(
+            words(&bytes[164..]),
+            [u32::MAX, 3, u32::MAX, 3, u32::MAX, 3, 0, 0]
+        );
+    }
+
+    #[test]
+    fn mesh_psv_encodes_shared_memory_and_primitive_outputs() {
+        let outputs = [SigElement {
+            kind: 3,
+            ..element("SV_Position", Some(0), 0, 4)
+        }];
+        let prims = [SigElement {
+            kind: 30,
+            comp: 1,
+            index: 2,
+            ..element("SV_CullPrimitive", Some(1), 3, 1)
+        }];
+        let bytes = psv(&Psv {
+            outputs: &outputs,
+            prims: &prims,
+            mesh: Some((
+                Mesh {
+                    max_vertices: 64,
+                    max_primitives: 127,
+                    topology: 2,
+                },
+                1024,
+            )),
+            threads: [32, 1, 1],
+            ..empty_psv(13)
+        });
+        assert_eq!(words(&bytes[..20]), [48, 1024, 0, 0, 0x007f_0040]);
+        assert_eq!(&bytes[28..40], &[13, 0, 2, 2, 0, 1, 1, 0, 1, 0, 0, 0]);
+        assert_eq!(
+            words(&bytes[40..]),
+            [
+                32,
+                1,
+                1,
+                0,
+                4,
+                0,
+                2,
+                0,
+                2,
+                16,
+                0,
+                0,
+                0x0344_0001,
+                3,
+                0,
+                1,
+                0x1e71_0101,
+                1
+            ]
+        );
     }
 }
