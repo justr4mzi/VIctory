@@ -2189,6 +2189,7 @@ mod tests {
         heap.make_at(
             0,
             &crate::descriptor::View::Unordered(depth as usize, 0, view),
+            None,
         );
         const FILL: &str = r#"
 #define RS "RootConstants(num32BitConstants=2, b0), DescriptorTable(UAV(u0))"
