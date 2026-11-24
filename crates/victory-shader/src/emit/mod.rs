@@ -102,6 +102,8 @@ pub mod validator;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
+#[cfg(all(test, windows))]
+mod root_view_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
