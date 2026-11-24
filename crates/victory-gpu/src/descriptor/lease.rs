@@ -48,6 +48,20 @@ impl Lease {
             .push((heap, first, n));
     }
 
+    /// Number of ranges currently held by this lease.
+    pub(crate) fn len(&self) -> usize {
+        self.ranges.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Pops and returns ranges appended at indices `start..`.
+    pub(crate) fn truncate_from(&self, start: usize) -> Vec<Range> {
+        self.ranges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(start..)
+            .collect()
+    }
+
     /// Everything the list still holds, to give back (the list is reset or
     /// released). Empty if the slots were taken back already.
     pub(crate) fn take(&self) -> Vec<Range> {

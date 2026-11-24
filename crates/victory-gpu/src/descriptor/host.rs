@@ -420,6 +420,12 @@ impl HostHeap {
         self.count
     }
 
+    /// The number of dynamic descriptor slots available in this heap.
+    #[cfg(test)]
+    pub(crate) fn dynamic_count(&self) -> u32 {
+        self.dynamic
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///

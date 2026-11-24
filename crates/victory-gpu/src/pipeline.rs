@@ -140,6 +140,20 @@ impl Program {
 
 #[cfg(windows)]
 impl Shader {
+    #[cfg(test)]
+    pub(crate) fn test_compute(translated: Translated) -> Arc<Self> {
+        Arc::new(Self {
+            stage: "compute",
+            hash: "test-compute".into(),
+            container: Vec::new(),
+            translated: [
+                OnceLock::from(Some(translated)),
+                OnceLock::new(),
+                OnceLock::new(),
+            ],
+        })
+    }
+
     /// The translation of `program`, made on first use; one that does not
     /// translate is logged once.
     pub(crate) fn translated_as(&self, program: Program) -> Option<&Translated> {
