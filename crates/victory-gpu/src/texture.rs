@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn warp_write_watched_texture_uploads_only_when_written() {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         };
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
@@ -644,7 +644,7 @@ mod tests {
         let (copy, tex) = make_rgba_texture(&host, width, height);
         let layout = tex.planes[0].layout.clone();
         let alloc_size = (layout.size as usize).max(crate::watch::PAGE);
-        // SAFETY: allocating a private write-watched page buffer freed before returning.
+        // SAFETY: allocating a private write-watched page buffer; kept for the rest of the test run.
         let raw = unsafe {
             VirtualAlloc(
                 std::ptr::null(),
@@ -703,8 +703,7 @@ mod tests {
         run_once();
         assert_eq!(staging.gpu_uploads(), 2);
 
-        // SAFETY: freeing our own allocation.
-        unsafe { VirtualFree(raw.cast(), 0, MEM_RELEASE) };
+        // Kept for the rest of the test run so watch::JOURNAL does not pollute a reused VA in a later test under --test-threads=1.
     }
 
     #[test]
