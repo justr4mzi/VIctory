@@ -6696,6 +6696,49 @@ impl<'a> Lower<'a> {
                 self.write(inst, Reg::V(reg), r, guard);
                 Ok(())
             }
+            "v_mad_u32_u16" | "v_mad_i32_i16" => {
+                if v.omod != 0 || v.abs != 0 || v.neg != 0 {
+                    return Err("integer output modifiers");
+                }
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a result without a register");
+                };
+                let (mut a, mut bb) = (self.half_int_src(inst, 0)?, self.half_int_src(inst, 1)?);
+                let acc = s(self, 2)?;
+                let signed = name == "v_mad_i32_i16";
+                if signed {
+                    let k16 = self.s.m.i32(16);
+                    let ta = self.s.m.bin(c, Bin::Shl, a, k16);
+                    a = self.s.m.bin(c, Bin::AShr, ta, k16);
+                    let tb = self.s.m.bin(c, Bin::Shl, bb, k16);
+                    bb = self.s.m.bin(c, Bin::AShr, tb, k16);
+                }
+                let prod = self.s.m.bin(c, Bin::Mul, a, bb);
+                let sum = self.s.m.bin(c, Bin::Add, prod, acc);
+                let r = if !v.clamp {
+                    sum
+                } else if signed {
+                    let k0 = self.s.m.i32(0);
+                    let pa_xor = self.s.m.bin(c, Bin::Xor, prod, acc);
+                    let same_sign = self.s.m.cmp(c, pred::SGE, pa_xor, k0);
+                    let ps_xor = self.s.m.bin(c, Bin::Xor, prod, sum);
+                    let flipped = self.s.m.cmp(c, pred::SLT, ps_xor, k0);
+                    let ov = self.s.m.bin(c, Bin::And, same_sign, flipped);
+                    let pos = self.s.m.cmp(c, pred::SGE, prod, k0);
+                    let (imin, imax) = (
+                        self.s.m.i32(i32::MIN as u32),
+                        self.s.m.i32(i32::MAX as u32),
+                    );
+                    let sat = self.s.m.select(c, pos, imax, imin);
+                    self.s.m.select(c, ov, sat, sum)
+                } else {
+                    let ov = self.s.m.cmp(c, pred::IULT, sum, acc);
+                    let umax = self.s.m.i32(u32::MAX);
+                    self.s.m.select(c, ov, umax, sum)
+                };
+                self.write(inst, Reg::V(reg), r, guard);
+                Ok(())
+            }
             "v_fmac_f32" | "v_mac_f32" | "v_mac_legacy_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
@@ -7495,6 +7538,12 @@ impl<'a> Lower<'a> {
             "v_max_i16",
             "v_min_u16",
             "v_min_i16",
+            "v_min3_i16",
+            "v_min3_u16",
+            "v_max3_i16",
+            "v_max3_u16",
+            "v_med3_i16",
+            "v_med3_u16",
             "v_cvt_u16_f16",
             "v_cvt_i16_f16",
             "v_cvt_norm_i16_f16",
@@ -7755,6 +7804,38 @@ impl<'a> Lower<'a> {
                             _ => Bin::AShr,
                         };
                         self.s.m.bin(c, op, x, sh)
+                    }
+                    "v_min3_i16" | "v_min3_u16" | "v_max3_i16" | "v_max3_u16" | "v_med3_i16"
+                    | "v_med3_u16" => {
+                        let mut d = self.half_int_src(inst, 2)?;
+                        if name.ends_with("_i16") {
+                            d = sext(self, d);
+                        }
+                        let (gt, lt) = if name.ends_with("_i16") {
+                            (pred::SGT, pred::SLT)
+                        } else {
+                            (pred::IUGT, pred::IULT)
+                        };
+                        let pick = |l: &mut Self, p: u8, x: V, y: V| {
+                            let t = l.s.m.cmp(c, p, x, y);
+                            l.s.m.select(c, t, x, y)
+                        };
+                        match name {
+                            "v_min3_i16" | "v_min3_u16" => {
+                                let t = pick(self, lt, a, b);
+                                pick(self, lt, t, d)
+                            }
+                            "v_max3_i16" | "v_max3_u16" => {
+                                let t = pick(self, gt, a, b);
+                                pick(self, gt, t, d)
+                            }
+                            _ => {
+                                let hi = pick(self, gt, a, b);
+                                let lo = pick(self, lt, a, b);
+                                let t = pick(self, lt, hi, d);
+                                pick(self, gt, t, lo)
+                            }
+                        }
                     }
                     _ => {
                         let p = match name {
