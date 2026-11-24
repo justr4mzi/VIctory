@@ -410,6 +410,7 @@ pub fn build_with(
             });
         }
     }
+    prune_unreachable(&mut blocks);
     link(&mut blocks);
     if !blocks[0].preds.is_empty() {
         return Err(ShaderError::Unsupported {
@@ -419,8 +420,72 @@ pub fn build_with(
     }
     split_irreducible(&mut blocks)?;
 
-    let order = reverse_postorder(&blocks);
-    let (live_in, live_out) = liveness(&blocks, &order);
+    let inputs = build_ssa(&mut blocks);
+    Ok(Program {
+        wave64,
+        vgprs,
+        blocks,
+        inputs,
+    })
+}
+
+/// Drops blocks not reachable from entry block `0` and remaps remaining
+/// [`Exit`] targets, keeping reachable blocks in their original order.
+fn prune_unreachable(blocks: &mut Vec<Block>) {
+    if blocks.is_empty() {
+        return;
+    }
+    let mut reachable = vec![false; blocks.len()];
+    let mut stack = vec![0];
+    reachable[0] = true;
+    while let Some(b) = stack.pop() {
+        for s in blocks[b].exit.successors() {
+            if !reachable[s] {
+                reachable[s] = true;
+                stack.push(s);
+            }
+        }
+    }
+    if reachable.iter().all(|&r| r) {
+        return;
+    }
+    let mut remap = vec![usize::MAX; blocks.len()];
+    let mut next = 0;
+    for (i, &keep) in reachable.iter().enumerate() {
+        if keep {
+            remap[i] = next;
+            next += 1;
+        }
+    }
+    let mut idx = 0;
+    blocks.retain(|_| {
+        let keep = reachable[idx];
+        idx += 1;
+        keep
+    });
+    for block in blocks.iter_mut() {
+        match &mut block.exit {
+            Exit::Jump(t) => *t = remap[*t],
+            Exit::Branch { taken, not_taken } => {
+                *taken = remap[*taken];
+                *not_taken = remap[*not_taken];
+            }
+            Exit::End | Exit::Indirect => {}
+        }
+    }
+}
+
+/// Computes liveness, inserts phis, renames registers to SSA values, and
+/// removes trivial phis, returning entry register inputs.
+fn build_ssa(blocks: &mut Vec<Block>) -> Vec<(Reg, Value)> {
+    let mut order = reverse_postorder(blocks);
+    if order.len() != blocks.len() {
+        prune_unreachable(blocks);
+        link(blocks);
+        order = reverse_postorder(blocks);
+    }
+    debug_assert_eq!(order.len(), blocks.len());
+    let (live_in, live_out) = liveness(blocks, &order);
     let mut values = 0u32;
     let mut new_value = || {
         values += 1;
@@ -466,7 +531,7 @@ pub fn build_with(
             .map(|reg| (reg, current[index(reg)]))
             .collect();
     }
-    for block in &mut blocks {
+    for block in blocks.iter_mut() {
         for phi in &mut block.phis {
             phi.args = block
                 .preds
@@ -476,13 +541,8 @@ pub fn build_with(
             debug_assert!(!phi.args.contains(&NONE), "{phi:?}");
         }
     }
-    remove_trivial_phis(&mut blocks, values);
-    Ok(Program {
-        wave64,
-        vgprs,
-        blocks,
-        inputs,
-    })
+    remove_trivial_phis(blocks, values);
+    inputs
 }
 
 /// Placeholder before renaming.
@@ -1597,5 +1657,112 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    fn synth_inst(offset: usize, reads: Vec<Reg>, writes: Vec<Reg>) -> Inst {
+        let mut machine = gfx10::decode(&S_ENDPGM.to_le_bytes())
+            .unwrap()
+            .pop()
+            .unwrap();
+        machine.offset = offset;
+        let fields = machine.fields(false);
+        Inst {
+            machine,
+            fields,
+            reads: reads.into_iter().map(|r| (r, NONE)).collect(),
+            writes: writes.into_iter().map(|r| (r, NONE)).collect(),
+        }
+    }
+
+    fn synth_block(offset: usize, insts: Vec<Inst>, exit: Exit) -> Block {
+        Block {
+            offset,
+            preds: Vec::new(),
+            phis: Vec::new(),
+            insts,
+            exit,
+        }
+    }
+
+    #[test]
+    fn prunes_unreachable_predecessor_before_ssa() {
+        let mut blocks = vec![
+            synth_block(
+                0,
+                vec![synth_inst(0, vec![], vec![Reg::S(0)])],
+                Exit::Jump(2),
+            ),
+            synth_block(4, vec![], Exit::Jump(2)),
+            synth_block(8, vec![synth_inst(8, vec![Reg::S(0)], vec![])], Exit::End),
+        ];
+
+        prune_unreachable(&mut blocks);
+        link(&mut blocks);
+        let inputs = build_ssa(&mut blocks);
+
+        assert!(inputs.is_empty());
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].exit, Exit::Jump(1));
+        assert_eq!(blocks[1].preds, [0]);
+        assert!(blocks[1].phis.is_empty());
+        assert_eq!(
+            blocks[1].insts[0].read(Reg::S(0)),
+            blocks[0].insts[0].write(Reg::S(0))
+        );
+    }
+
+    #[test]
+    fn prunes_unreachable_edge_into_entry_and_merge() {
+        let mut blocks = vec![
+            synth_block(
+                0,
+                vec![],
+                Exit::Branch {
+                    taken: 1,
+                    not_taken: 2,
+                },
+            ),
+            synth_block(
+                4,
+                vec![synth_inst(4, vec![], vec![Reg::S(0)])],
+                Exit::Jump(3),
+            ),
+            synth_block(
+                8,
+                vec![synth_inst(8, vec![], vec![Reg::S(0)])],
+                Exit::Jump(3),
+            ),
+            synth_block(12, vec![synth_inst(12, vec![Reg::S(0)], vec![])], Exit::End),
+            synth_block(
+                16,
+                vec![],
+                Exit::Branch {
+                    taken: 0,
+                    not_taken: 3,
+                },
+            ),
+        ];
+
+        prune_unreachable(&mut blocks);
+        link(&mut blocks);
+        assert!(blocks[0].preds.is_empty());
+        let inputs = build_ssa(&mut blocks);
+
+        assert!(inputs.is_empty());
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[3].preds, [1, 2]);
+        let [phi] = &blocks[3].phis[..] else {
+            panic!("expected 1 phi, got {:?}", blocks[3].phis);
+        };
+        assert_eq!(phi.reg, Reg::S(0));
+        assert_eq!(
+            phi.args,
+            [
+                blocks[1].insts[0].write(Reg::S(0)).unwrap(),
+                blocks[2].insts[0].write(Reg::S(0)).unwrap(),
+            ]
+        );
+        assert!(!phi.args.contains(&NONE));
+        assert_eq!(blocks[3].insts[0].read(Reg::S(0)), Some(phi.value));
     }
 }
