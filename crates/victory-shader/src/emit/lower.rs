@@ -5808,7 +5808,8 @@ impl<'a> Lower<'a> {
         let h = match src {
             Source::Loaded { load, first } => {
                 let index = self.heap_index(*load, *first, false)?;
-                self.s.heap_handle(self.cur, index, false, props)
+                let per_lane = self.x.res.waterfall.loads.contains(load);
+                self.s.heap_handle(self.cur, index, false, per_lane, props)
             }
             _ => self.handle(site, src, false, props)?,
         };
@@ -7790,9 +7791,9 @@ mod tests {
                 .collect(),
         };
         let p = ir::build(&native.code, false, 256).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
             native: &native,
             p: &p,
@@ -7835,9 +7836,9 @@ mod tests {
                 .collect(),
         };
         let p = ir::build(&native_cs.code, false, 256).unwrap();
-        let res = resource::track(&p, &native_cs.layout, native_cs.stage).unwrap();
-        let io = io::raise(&p, &native_cs).unwrap();
         let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native_cs.layout, native_cs.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native_cs).unwrap();
         lower(&Parts {
             native: &native_cs,
             p: &p,
