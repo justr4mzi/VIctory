@@ -50,6 +50,8 @@ pub(crate) enum Kind {
     F16,
     Unorm8,
     Unorm16,
+    Snorm8,
+    Snorm16,
 }
 
 /// Component count and kind of the vertex formats rectangles use.
@@ -65,6 +67,15 @@ pub(crate) fn components(format: u32) -> Option<(usize, Kind)> {
         11 => (4, Kind::Unorm16),
         35 => (2, Kind::Unorm16),
         28 | 29 | 87 | 91 => (4, Kind::Unorm8),
+        13 => (4, Kind::Snorm16),
+        37 => (2, Kind::Snorm16),
+        31 => (4, Kind::Snorm8),
+        51 => (2, Kind::Snorm8),
+        49 => (2, Kind::Unorm8),
+        56 => (1, Kind::Unorm16),
+        58 => (1, Kind::Snorm16),
+        61 => (1, Kind::Unorm8),
+        63 => (1, Kind::Snorm8),
         _ => return None,
     })
 }
@@ -73,8 +84,8 @@ impl Kind {
     pub(crate) fn bytes(self) -> usize {
         match self {
             Kind::F32 => 4,
-            Kind::F16 | Kind::Unorm16 => 2,
-            Kind::Unorm8 => 1,
+            Kind::F16 | Kind::Unorm16 | Kind::Snorm16 => 2,
+            Kind::Unorm8 | Kind::Snorm8 => 1,
         }
     }
 
@@ -95,6 +106,9 @@ impl Kind {
             Kind::F16 => half_to_f32(u16::from_le_bytes([b[0], b[1]])),
             Kind::Unorm16 => f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0,
             Kind::Unorm8 => f32::from(b[0]) / 255.0,
+            // The lowest integer is -1 too.
+            Kind::Snorm16 => (f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0).max(-1.0),
+            Kind::Snorm8 => (f32::from(b[0] as i8) / 127.0).max(-1.0),
         }
     }
 
@@ -108,6 +122,10 @@ impl Kind {
                 b.copy_from_slice(&((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_le_bytes())
             }
             Kind::Unorm8 => b[0] = (v.clamp(0.0, 1.0) * 255.0).round() as u8,
+            Kind::Snorm16 => {
+                b.copy_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes())
+            }
+            Kind::Snorm8 => b[0] = (v.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8,
         }
     }
 }
@@ -134,6 +152,9 @@ fn f32_to_half(v: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let man = bits & 0x7f_ffff;
+    if v.is_nan() {
+        return sign | 0x7e00;
+    }
     if exp >= 31 {
         return sign | 0x7c00; // too large: infinity
     }
@@ -250,5 +271,56 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+
+    /// A NaN stays a NaN; infinities stay infinite.
+    #[test]
+    fn halves_keep_nan() {
+        assert!(half_to_f32(f32_to_half(f32::NAN)).is_nan());
+        assert!(half_to_f32(f32_to_half(-f32::NAN)).is_nan());
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_half(f32::NEG_INFINITY), 0xfc00);
+    }
+
+    /// Signed normalized corners (x -1, -1, 1; y 1, -1, -1 as here) give a
+    /// fourth at (1, 1), in 16 and 8 bits.
+    #[test]
+    fn signed_normalized_corners_complete_the_rectangle() {
+        for (format, n) in [(13, 4), (37, 2)] {
+            let vertex = |x: i16, y: i16| -> Vec<u8> {
+                [x, y, 0, 0][..n]
+                    .iter()
+                    .flat_map(|c| c.to_le_bytes())
+                    .collect()
+            };
+            let m = i16::MAX;
+            let src = [vertex(-m, m), vertex(-m, -m), vertex(m, -m)].concat();
+            let mut dst = vec![0u8; 6 * 2 * n];
+            expand_rects(&src, &mut dst, 2 * n, &[(0, format)]);
+            assert_eq!(dst[5 * 2 * n..], vertex(m, m)[..], "format {format}");
+        }
+        for (format, n) in [(31, 4), (51, 2)] {
+            let vertex =
+                |x: i8, y: i8| -> Vec<u8> { [x, y, 0, 0][..n].iter().map(|&c| c as u8).collect() };
+            let m = i8::MAX;
+            let src = [vertex(-m, m), vertex(-m, -m), vertex(m, -m)].concat();
+            let mut dst = vec![0u8; 6 * n];
+            expand_rects(&src, &mut dst, n, &[(0, format)]);
+            assert_eq!(dst[5 * n..], vertex(m, m)[..], "format {format}");
+        }
+    }
+
+    /// The one- and two-component normalized formats: components 0, 64 and
+    /// 100 (of the smallest unit) give a fourth of 36.
+    #[test]
+    fn small_normalized_formats_get_their_fourth_corner() {
+        for (format, n, bytes) in [(49, 2, 1), (56, 1, 2), (58, 1, 2), (61, 1, 1), (63, 1, 1)] {
+            let vertex = |v: u16| v.to_le_bytes()[..bytes].repeat(n);
+            let stride = n * bytes;
+            let src = [vertex(0), vertex(64), vertex(100)].concat();
+            let mut dst = vec![0u8; 6 * stride];
+            expand_rects(&src, &mut dst, stride, &[(0, format)]);
+            assert_eq!(dst[5 * stride..], vertex(36)[..], "format {format}");
+        }
     }
 }
