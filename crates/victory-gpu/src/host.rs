@@ -1624,22 +1624,90 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
-                }
-            });
+    // Something is unmapped: the readable parts are copied, zeros for the
+    // rest, one `VirtualQuery` per memory region. Asking per 64 KiB piece in
+    // the kernel cost one call per piece - thousands per frame, and the cost
+    // grew with the size of the range rather than with what was unmapped.
+    if old_fallback() {
+        for_pieces(src as usize, len, 64 << 10, |at, n| {
+            let to = dst.wrapping_add(at - src as usize);
+            if !read(at as *const u8, to, n) {
+                for_pieces(at, n, 4 << 10, |at, n| {
+                    let to = dst.wrapping_add(at - src as usize);
+                    if !read(at as *const u8, to, n) {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                        // SAFETY: inside the destination, which is mapped.
+                        unsafe { to.write_bytes(0, n) };
+                    }
+                });
+            }
+        });
+        return;
+    }
+    read_regions(src as usize, dst, len);
+}
+
+/// Whether the fallback of [`copy_mapped`] walks 64 KiB pieces in the kernel
+/// (`VICTORY_COPY_FALLBACK=pieces`, diagnostics builds): the old path, kept
+/// to compare against the region scan.
+fn old_fallback() -> bool {
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        false
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OLD.get_or_init(|| std::env::var("VICTORY_COPY_FALLBACK").as_deref() == Ok("pieces"))
+    }
+}
+
+/// Copies the readable parts of `[src, src + len)` into `dst`, zeros for the
+/// parts that are not committed or not readable, one `VirtualQuery` per
+/// region (the regions of the title's big pools are megabytes long).
+fn read_regions(src: usize, dst: *mut u8, len: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let end = src + len;
+    let mut at = src;
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let queried = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if queried == 0 {
+            // Nothing known below: zeros, as the kernel retries would leave.
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, (end - at) as u64);
+            // SAFETY: inside the destination, which the caller sized.
+            unsafe { dst.wrapping_add(at - src).write_bytes(0, end - at) };
+            break;
         }
-    });
+        let base = info.BaseAddress as usize;
+        let hi = (base + info.RegionSize).min(end);
+        let lo = at.max(base);
+        if hi <= lo {
+            break;
+        }
+        let n = hi - lo;
+        let readable = info.State == MEM_COMMIT
+            && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
+            && info.Protect & 0xff != 0;
+        let to = dst.wrapping_add(lo - src);
+        if readable {
+            // SAFETY: committed and readable title memory of `n` bytes, into
+            // the caller's destination of `len`.
+            unsafe { std::ptr::copy_nonoverlapping(lo as *const u8, to, n) };
+        } else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: inside the destination, which the caller sized.
+            unsafe { to.write_bytes(0, n) };
+        }
+        at = hi;
+    }
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -1674,13 +1742,43 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     if len == 0 || write(dst as usize, len) {
         return;
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
-            });
+    // Something of the destination is not writable: the writable parts are
+    // written, the rest left alone, one `VirtualQuery` per region.
+    write_regions(dst as usize, src, len);
+}
+
+/// Writes the writable parts of `[dst, dst + len)` from `src`, leaving the
+/// rest alone, one `VirtualQuery` per region.
+fn write_regions(dst: usize, src: *const u8, len: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_GUARD, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    const WRITABLE: u32 = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    let end = dst + len;
+    let mut at = dst;
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+            break;
         }
-    });
+        let base = info.BaseAddress as usize;
+        let hi = (base + info.RegionSize).min(end);
+        let lo = at.max(base);
+        if hi <= lo {
+            break;
+        }
+        if info.State == MEM_COMMIT && info.Protect & PAGE_GUARD == 0 && info.Protect & WRITABLE != 0 {
+            // SAFETY: committed and writable title memory of `hi - lo` bytes,
+            // from the caller's host copy of `len`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.wrapping_add(lo - dst), lo as *mut u8, hi - lo)
+            };
+        }
+        at = hi;
+    }
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
