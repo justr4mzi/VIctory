@@ -2920,3 +2920,102 @@ fn v_pk_fmac_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_div_fixup_f32_matches_rdna2() {
+    // VOP3 v_div_fixup_f32 v0, v1 (quot), v2 (denom), v3 (num) — opcode 0x15f
+    let shader = build_valu_cs(&vop3(0x15f, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let p_zero = 0.0f32.to_bits();
+    let n_zero = (-0.0f32).to_bits();
+    let p_inf = f32::INFINITY.to_bits();
+    let n_inf = f32::NEG_INFINITY.to_bits();
+    let qnan = 0x7FC0_0000u32;
+    let snan1 = 0x7F80_0001u32;
+    let snan2 = 0x7F80_0002u32;
+    let f_pos = 3.5f32.to_bits();
+    let f_neg = (-3.5f32).to_bits();
+    let two = 2.0f32.to_bits();
+    let m_two = (-2.0f32).to_bits();
+    let seven = 7.0f32.to_bits();
+    let m_seven = (-7.0f32).to_bits();
+
+    // (quot, denom, num) -> expected exact bits (None = any NaN)
+    let cases: &[([u32; 4], Option<u32>)] = &[
+        // Normal quotients: sign = sign(denom) ^ sign(num).
+        ([f_pos, two, seven, 0], Some(f_pos)),
+        ([f_pos, m_two, seven, 0], Some(f_neg)),
+        ([f_neg, m_two, m_seven, 0], Some(f_pos)),
+        // NaN quotient with finite non-zero denom/num -> ±inf with sign_out.
+        ([qnan, two, seven, 0], Some(p_inf)),
+        ([qnan, m_two, seven, 0], Some(n_inf)),
+        // Division by ±0 -> ±inf with sign_out.
+        ([f_pos, p_zero, seven, 0], Some(p_inf)),
+        ([f_pos, n_zero, seven, 0], Some(n_inf)),
+        ([f_pos, n_zero, m_seven, 0], Some(p_inf)),
+        // ±inf / finite -> ±inf with sign_out.
+        ([f_pos, m_two, p_inf, 0], Some(n_inf)),
+        ([f_pos, m_two, n_inf, 0], Some(p_inf)),
+        // finite / ±inf and ±0 / finite -> ±0.0 with sign_out.
+        ([f_pos, n_inf, seven, 0], Some(n_zero)),
+        ([f_pos, n_inf, m_seven, 0], Some(p_zero)),
+        ([f_pos, m_two, p_zero, 0], Some(n_zero)),
+        ([f_pos, m_two, n_zero, 0], Some(p_zero)),
+        // Indeterminate forms: 0/0 and inf/inf -> qNaN.
+        ([f_pos, p_zero, p_zero, 0], None),
+        ([f_pos, n_zero, p_zero, 0], None),
+        ([f_pos, p_inf, n_inf, 0], None),
+        // NaN in denom or num propagates quieted NaN (denom takes priority).
+        ([f_pos, snan1, snan2, 0], Some(0x7FC0_0001)),
+        ([f_pos, two, snan2, 0], Some(0x7FC0_0002)),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        match cases[i].1 {
+            Some(want) => assert_eq!(
+                got, want,
+                "{backend}: v_div_fixup_f32({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1], inp[2],
+            ),
+            None => assert!(
+                f32::from_bits(got).is_nan(),
+                "{backend}: v_div_fixup_f32({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want NaN",
+                inp[0], inp[1], inp[2],
+            ),
+        }
+    });
+}
+
+#[test]
+fn v_div_fixup_f16_matches_rdna2() {
+    // VOP3 v_div_fixup_f16 v0, v1 (quot), v2 (denom), v3 (num) — opcode 0x35f
+    let shader = build_valu_cs(&vop3(0x35f, 0, vgpr(1), vgpr(2), vgpr(3)));
+    // f16 bit patterns: +0=0x0000, -0=0x8000, +1=0x3C00, -2=0xC000, +3.5=0x4300, -3.5=0xC300,
+    // +inf=0x7C00, -inf=0xFC00, qNaN=0x7E00
+    let cases: &[([u32; 4], Option<u16>)] = &[
+        ([0x4300, 0xC000, 0x3C00, 0], Some(0xC300)), // copysign(3.5, -2 ^ +1) = -3.5
+        ([0xC300, 0xC000, 0xBC00, 0], Some(0x4300)), // copysign(-3.5, -2 ^ -1) = +3.5
+        ([0x7E00, 0xC000, 0x3C00, 0], Some(0xFC00)), // NaN quot -> -inf
+        ([0x4300, 0x8000, 0x3C00, 0], Some(0xFC00)), // +1 / -0 -> -inf
+        ([0x4300, 0xFC00, 0x3C00, 0], Some(0x8000)), // +1 / -inf -> -0.0
+        ([0x4300, 0xC000, 0x0000, 0], Some(0x8000)), // +0 / -2 -> -0.0
+        ([0x4300, 0x0000, 0x0000, 0], None),         // 0 / 0 -> NaN
+        ([0x4300, 0x7C00, 0xFC00, 0], None),         // -inf / +inf -> NaN
+        ([0x4300, 0x7E00, 0x3C00, 0], None),         // NaN denom -> NaN
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let got_h = got as u16;
+        match cases[i].1 {
+            Some(want) => assert_eq!(
+                got_h, want,
+                "{backend}: v_div_fixup_f16({:#06x}, {:#06x}, {:#06x}) = {got_h:#06x}, want {want:#06x}",
+                inp[0], inp[1], inp[2],
+            ),
+            None => assert!(
+                is_f16_nan(got_h),
+                "{backend}: v_div_fixup_f16({:#06x}, {:#06x}, {:#06x}) = {got_h:#06x}, want NaN",
+                inp[0], inp[1], inp[2],
+            ),
+        }
+    });
+}

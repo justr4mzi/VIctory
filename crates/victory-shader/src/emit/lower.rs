@@ -2351,6 +2351,69 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, nan, least, median)
     }
 
+    /// `v_div_fixup_f32` / `v_div_fixup_f16`: finalizes a division sequence's
+    /// quotient `quot` (`src0`) for `num / denom` (`src2 / src1`), resolving
+    /// IEEE-754 special cases (`NaN`, `0/0`, `inf/inf`, `x/0`, `x/inf`,
+    /// `0/x`, `inf/x`, and `quot == NaN` overflow) and applying `sign(denom)
+    /// ^ sign(num)` in pure integer bit operations.
+    fn div_fixup(&mut self, quot: V, denom: V, num: V) -> V {
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let q = self.as_int(quot);
+        let d = self.as_int(denom);
+        let n = self.as_int(num);
+
+        let sign_mask = k(self, 0x8000_0000);
+        let abs_mask = k(self, 0x7FFF_FFFF);
+        let inf_bits = k(self, 0x7F80_0000);
+        let qnan_bits = k(self, 0x7FC0_0000);
+        let quiet_bit = k(self, 0x0040_0000);
+        let zero = k(self, 0);
+
+        let sign_xor = self.s.m.bin(c, Bin::Xor, d, n);
+        let sign_out = self.s.m.bin(c, Bin::And, sign_xor, sign_mask);
+
+        let q_mag = self.s.m.bin(c, Bin::And, q, abs_mask);
+        let d_mag = self.s.m.bin(c, Bin::And, d, abs_mask);
+        let n_mag = self.s.m.bin(c, Bin::And, n, abs_mask);
+
+        let q_nan = self.s.m.cmp(c, pred::IUGT, q_mag, inf_bits);
+        let d_nan = self.s.m.cmp(c, pred::IUGT, d_mag, inf_bits);
+        let n_nan = self.s.m.cmp(c, pred::IUGT, n_mag, inf_bits);
+
+        let d_inf = self.s.m.cmp(c, pred::EQ, d_mag, inf_bits);
+        let n_inf = self.s.m.cmp(c, pred::EQ, n_mag, inf_bits);
+        let d_zero = self.s.m.cmp(c, pred::EQ, d_mag, zero);
+        let n_zero = self.s.m.cmp(c, pred::EQ, n_mag, zero);
+
+        let signed_inf = self.s.m.bin(c, Bin::Or, inf_bits, sign_out);
+        let signed_zero = sign_out;
+        let signed_q = self.s.m.bin(c, Bin::Or, q_mag, sign_out);
+
+        // Priority (lowest to highest, built bottom-up via select):
+        // 6. Normal/inf quotient: copysign(quot, sign_out); NaN quotient -> ±inf.
+        let r = self.s.m.select(c, q_nan, signed_inf, signed_q);
+        // 5. denom == ±inf or num == ±0 -> ±0.0 with sign_out.
+        let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
+        let r = self.s.m.select(c, make_zero, signed_zero, r);
+        // 4. num == ±inf or denom == ±0 -> ±inf with sign_out.
+        let make_inf = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
+        let r = self.s.m.select(c, make_inf, signed_inf, r);
+        // 3. (0 / 0) or (inf / inf) -> canonical qNaN.
+        let zero_over_zero = self.s.m.bin(c, Bin::And, d_zero, n_zero);
+        let inf_over_inf = self.s.m.bin(c, Bin::And, d_inf, n_inf);
+        let indet = self.s.m.bin(c, Bin::Or, zero_over_zero, inf_over_inf);
+        let r = self.s.m.select(c, indet, qnan_bits, r);
+        // 2. num is NaN -> quiet(num).
+        let n_quiet = self.s.m.bin(c, Bin::Or, n, quiet_bit);
+        let r = self.s.m.select(c, n_nan, n_quiet, r);
+        // 1. denom is NaN -> quiet(denom).
+        let d_quiet = self.s.m.bin(c, Bin::Or, d, quiet_bit);
+        let r = self.s.m.select(c, d_nan, d_quiet, r);
+
+        self.as_float(r)
+    }
+
     /// `a - floor(a)`, which on the hardware never reaches 1.0: where it
     /// would round to it (a tiny negative `a`), the result is `below_one`,
     /// the largest value under 1.0 in the operation's width. Hosts differ
@@ -6388,7 +6451,7 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)
             }
-            "v_max3_f32" | "v_min3_f32" | "v_med3_f32" => {
+            "v_max3_f32" | "v_min3_f32" | "v_med3_f32" | "v_div_fixup_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let r = match name {
                     "v_max3_f32" => {
@@ -6399,6 +6462,7 @@ impl<'a> Lower<'a> {
                         let t = self.max_min(false, a, bb);
                         self.max_min(false, t, cc)
                     }
+                    "v_div_fixup_f32" => self.div_fixup(a, bb, cc),
                     _ => self.med3(a, bb, cc),
                 };
                 float(self, r)
@@ -7020,6 +7084,7 @@ impl<'a> Lower<'a> {
             "v_max3_f16",
             "v_min3_f16",
             "v_med3_f16",
+            "v_div_fixup_f16",
         ];
         const FLOAT1: &[&str] = &[
             "v_rcp_f16",
@@ -7186,6 +7251,7 @@ impl<'a> Lower<'a> {
                     let t = self.max_min(false, a, b);
                     self.max_min(false, t, acc)
                 }
+                "v_div_fixup_f16" => self.div_fixup(a, b, acc),
                 _ => self.med3(a, b, acc),
             };
             return float_result(self, r);
