@@ -78,6 +78,13 @@ impl Host {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             }
             let device = device.ok_or("no device")?;
+            Self::check_sm66(device)
+        }
+    }
+
+    fn check_sm66(device: ID3D12Device) -> Result<Self, String> {
+        // SAFETY: `sm` is a valid feature-query struct for `device`.
+        unsafe {
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
@@ -96,6 +103,58 @@ impl Host {
             }
             Ok(Host { device })
         }
+    }
+
+    /// Every SM 6.6 hardware adapter and WARP, with its name.
+    #[cfg(test)]
+    pub fn adapters() -> Vec<(String, Self)> {
+        let mut out = Vec::new();
+        if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+            if let Ok(h) = Self::new(true) {
+                out.push(("WARP".into(), h));
+            }
+            return out;
+        }
+        // SAFETY: plain DXGI/D3D12 enumeration with valid out pointers.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return out;
+            };
+            let mut i = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(i) {
+                i += 1;
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    continue;
+                }
+                let len = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                let name = String::from_utf16_lossy(&desc.Description[..len]);
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                    && let Some(dev) = device
+                    && let Ok(host) = Self::check_sm66(dev)
+                {
+                    out.push((name, host));
+                }
+            }
+            if let Ok(warp_adapter) = factory.EnumWarpAdapter::<IDXGIAdapter>() {
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&warp_adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                    && let Some(dev) = device
+                    && let Ok(host) = Self::check_sm66(dev)
+                {
+                    out.push(("WARP".into(), host));
+                }
+            }
+        }
+        out
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -980,6 +1039,8 @@ pub enum View<'a> {
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F cube-array SRV (face size, cubes, texels per cube as `Cube`).
+    CubeArray(u32, u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1163,10 +1224,46 @@ impl Host {
                 at.ptr += i * view_size;
                 buffers.push(None);
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
-                        let (w, h, texels, faces) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1),
-                            View::Cube(n, t) => (n, n, t, 6),
+                    View::Texture(..) | View::Cube(..) | View::CubeArray(..) => {
+                        let (w, h, texels, faces, srv) = match *v {
+                            View::Texture(w, h, t) => (w, h, t, 1, None),
+                            View::Cube(n, t) => (
+                                n,
+                                n,
+                                t,
+                                6,
+                                Some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+                                    Shader4ComponentMapping:
+                                        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                        TextureCube: D3D12_TEXCUBE_SRV {
+                                            MipLevels: 1,
+                                            ..Default::default()
+                                        },
+                                    },
+                                }),
+                            ),
+                            View::CubeArray(n, cubes, t) => (
+                                n,
+                                n,
+                                t,
+                                6 * cubes,
+                                Some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+                                    Shader4ComponentMapping:
+                                        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                        TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV {
+                                            MipLevels: 1,
+                                            NumCubes: cubes,
+                                            ..Default::default()
+                                        },
+                                    },
+                                }),
+                            ),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
@@ -1212,20 +1309,9 @@ impl Host {
                             D3D12_RESOURCE_STATE_COPY_DEST,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         )]);
-                        let cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
-                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                                TextureCube: D3D12_TEXCUBE_SRV {
-                                    MipLevels: 1,
-                                    ..Default::default()
-                                },
-                            },
-                        };
                         dev.CreateShaderResourceView(
                             &tex,
-                            (faces == 6).then_some(&cube as *const _),
+                            srv.as_ref().map(std::ptr::from_ref),
                             at,
                         );
                         keep.push(tex);
