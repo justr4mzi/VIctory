@@ -993,7 +993,7 @@ impl State {
                 let at = table + u64::from(k) * 32;
                 let props = table_view_props(p, slot, k * 8);
                 match heap.index(at).and_then(|_| crate::descriptor::view(at)) {
-                    Some(View::Constant(address, size)) => {
+                    Some(View::Constant(address, size)) if address != 0 => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             make_null(host, index, props);
                             continue;
