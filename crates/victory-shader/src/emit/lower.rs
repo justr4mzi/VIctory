@@ -231,6 +231,10 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    /// Tracked descriptor addresses stored to or modified atomically.
+    written_uavs: HashSet<(usize, u32, Option<Value>)>,
+    /// Tracked descriptor addresses accessed with `glc` and never sampled.
+    glc_uavs: HashSet<(usize, u32, Option<Value>)>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<HandleKey, V>,
@@ -848,6 +852,19 @@ fn cube_arrays(p: &Program, res: &Resources) -> HashSet<Site> {
     out
 }
 
+const UAV_PROP: u32 = 0x1000;
+const GLOBALLY_COHERENT_PROP: u32 = 0x4000;
+
+fn uav_bits(uav: bool, glc: bool) -> u32 {
+    if !uav {
+        0
+    } else if glc {
+        UAV_PROP | GLOBALLY_COHERENT_PROP
+    } else {
+        UAV_PROP
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>) -> Self {
         let p = x.p;
@@ -860,11 +877,70 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        let scalar: HashMap<Site, Address> = x.res.scalar.iter().copied().collect();
+        let desc_addr = |load: Site, first: u8| {
+            let a = scalar.get(&load)?;
+            Some((
+                a.param,
+                a.offset.wrapping_add(4 * u32::from(first)),
+                a.dynamic,
+            ))
+        };
+        let mut written_uavs = HashSet::new();
+        let mut glc_uavs = HashSet::new();
+        let mut sampled = HashSet::new();
+        for d in x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Resource)
+        {
+            let inst = &p.blocks[d.site.0].insts[d.site.1];
+            let name = inst.name();
+            let is_sample = matches!(
+                &inst.fields,
+                Fields::Image {
+                    sampler: Some(_),
+                    ..
+                }
+            );
+            let is_write = name.contains("store") || name.contains("atomic");
+            let is_glc = match &inst.fields {
+                Fields::Buffer {
+                    cache,
+                    format: None,
+                    ..
+                } => cache.glc,
+                Fields::Image {
+                    cache,
+                    sampler: None,
+                    ..
+                } => cache.glc && (is_write || name == "image_load"),
+                Fields::Smem { cache, .. } => cache.glc && name.starts_with("s_buffer_load_"),
+                _ => false,
+            };
+            for leaf in d.source.leaves() {
+                if let &(Source::Loaded { load, first } | Source::Fetched { load, first }) = leaf
+                    && let Some(addr) = desc_addr(load, first)
+                {
+                    if is_sample {
+                        sampled.insert(addr);
+                    }
+                    if is_write {
+                        written_uavs.insert(addr);
+                    } else if is_glc {
+                        glc_uavs.insert(addr);
+                    }
+                }
+            }
+        }
+        glc_uavs.retain(|a| !sampled.contains(a));
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
-        });
+        }) || (x.native.stage == HwStage::Cs
+            && (!written_uavs.is_empty() || !glc_uavs.is_empty()));
         let mut console_lanes = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -1033,7 +1109,9 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
-            scalar: x.res.scalar.iter().copied().collect(),
+            scalar,
+            written_uavs,
+            glc_uavs,
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -4015,6 +4093,7 @@ impl<'a> Lower<'a> {
             data,
             offset,
             soffset,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -4076,8 +4155,9 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        let uav = self.is_uav(src);
+        if uav || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+            let h = self.handle(site, src, false, (11 | uav_bits(uav, cache.glc), 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -4213,10 +4293,8 @@ impl<'a> Lower<'a> {
             let used = self.used_kind(&src);
             let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
             let un = ui.name();
-            let uav = un.contains("store")
-                || un.contains("atomic")
-                || used.is_some_and(|u| u.kind == ResourceType::Uav);
-            let u = if uav { 0x1000 } else { 0 };
+            let uav = un.contains("store") || un.contains("atomic") || self.is_uav(&src);
+            let u = uav_bits(uav, false);
             let (props, image) = match &ui.fields {
                 Fields::Image { dim, .. } => {
                     let kind = match dim {
@@ -4247,10 +4325,12 @@ impl<'a> Lower<'a> {
                     (props, None)
                 }
                 Fields::Smem { .. } if un.starts_with("s_buffer_load_dword") => {
-                    if !matches!(
-                        used.map(|u| u.kind),
-                        Some(ResourceType::Srv | ResourceType::Uav)
-                    ) {
+                    if !uav
+                        && !matches!(
+                            used.map(|u| u.kind),
+                            Some(ResourceType::Srv | ResourceType::Uav)
+                        )
+                    {
                         return Err("a constant buffer's descriptor read as data");
                     }
                     ((11 | u, 0), None)
@@ -5217,6 +5297,34 @@ impl<'a> Lower<'a> {
         };
         local.insert(v, x);
         Ok(x)
+    }
+
+    fn desc_addr(&self, load: Site, first: u8) -> Option<(usize, u32, Option<Value>)> {
+        let a = self.scalar.get(&load)?;
+        Some((
+            a.param,
+            a.offset.wrapping_add(4 * u32::from(first)),
+            a.dynamic,
+        ))
+    }
+
+    fn is_uav(&self, src: &Source) -> bool {
+        let leaves = src.leaves();
+        let in_set = |set: &HashSet<(usize, u32, Option<Value>)>| {
+            leaves.iter().any(|l| match **l {
+                Source::Loaded { load, first } | Source::Fetched { load, first } => self
+                    .desc_addr(load, first)
+                    .is_some_and(|a| set.contains(&a)),
+                _ => false,
+            })
+        };
+        if in_set(&self.written_uavs) {
+            return true;
+        }
+        match self.used_kind(src) {
+            Some(u) => u.kind == ResourceType::Uav,
+            None => in_set(&self.glc_uavs),
+        }
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -8240,6 +8348,7 @@ impl<'a> Lower<'a> {
             d16,
             tfe,
             lwe,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -8306,11 +8415,8 @@ impl<'a> Lower<'a> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked image")?;
-        let uav = store
-            || self
-                .used_kind(src)
-                .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let uav = store || self.is_uav(src);
+        let props = (kind | uav_bits(uav, cache.glc), 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // DXIL's atomic operations on a 32-bit integer texture UAV; the
             // old value returns with glc. Sub is the add of the negation.
@@ -8326,9 +8432,6 @@ impl<'a> Lower<'a> {
                 "swap" => 8,
                 "cmpswap" => u32::MAX,
                 _ => return Err(name),
-            };
-            let Fields::Image { cache, .. } = &inst.fields else {
-                unreachable!()
             };
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
@@ -8361,7 +8464,7 @@ impl<'a> Lower<'a> {
                 Some(v) if cache.glc => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            let h = self.handle(site, src, false, (kind | uav_bits(true, cache.glc), 0x105))?;
             let at = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
             let mut args = vec![h];
@@ -8888,6 +8991,7 @@ impl<'a> Lower<'a> {
             format,
             lds,
             tfe,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -8997,8 +9101,8 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let uav = store || atomic.is_some() || self.is_uav(src);
+        let u = uav_bits(uav, cache.glc);
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
@@ -9024,7 +9128,7 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
             };
-            let returns = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
+            let returns = cache.glc;
             let old = match inst.read(Reg::V(reg)) {
                 Some(v) if returns => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
@@ -10658,9 +10762,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -10677,9 +10779,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -10696,13 +10801,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }
@@ -12157,5 +12261,193 @@ mod tests {
             v.validate(&mut dxil).expect("PS DXIL validation failed");
         }
         let _ = ps_l;
+    }
+
+    #[test]
+    fn heap_uav_inference_and_glc_coherence_set_handle_properties() {
+        // #724: one heap descriptor loaded and stored gets UAV handles for both,
+        // including across a separate reload of the same heap address and
+        // scalar `s_buffer_load_dword` (with and without `glc`), while distinct
+        // read-only heap addresses remain SRV and CBV.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0 (resource heap base)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0   (UAV @ 0)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (SRV @ 1)
+            0xF408_0402,
+            0xFA00_0040, // s_load_dwordx4 s[16:19], s[4:5], 0x40 (CBV @ 2)
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xE030_1000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 offen
+            0xE030_5004,
+            0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 offen offset:4 glc
+            0xE030_1000,
+            0x8003_0300, // buffer_load_dword v3, v0, s[12:15], 0 offen
+            0xF420_0188,
+            0xFA00_0000, // s_buffer_load_dword s6, s[16:19], 0x0
+            // Reload UAV @ 0 into s[20:23] and read it with scalar `glc` and plain load.
+            0xF408_0502,
+            0xFA00_0000, // s_load_dwordx4 s[20:23], s[4:5], 0x0
+            0xF421_01CA,
+            0xFA00_0008, // s_buffer_load_dword s7, s[20:23], 0x8 glc
+            0xF420_060A,
+            0xFA00_000C, // s_buffer_load_dword s24, s[20:23], 0xC
+            0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+            0x4A02_0701, // v_add_nc_u32 v1, v1, v3
+            0x4A02_0206, // v_add_nc_u32 v1, s6, v1
+            0x4A02_0207, // v_add_nc_u32 v1, s7, v1
+            0x4A02_0218, // v_add_nc_u32 v1, s24, v1
+            0xE070_1010,
+            0x8002_0100, // buffer_store_dword v1, v0, s[8:11], 0 offen offset:16
+            S_ENDPGM,
+        ];
+        let l = lower_with(&words, vec![root(RootType::ResourceHeap, 0, 0)], vec![]).unwrap();
+        validate_dxil(&l.dxil);
+        assert_eq!(
+            l.heap_props,
+            vec![
+                (0x100B, 0),    // UAV @ 0 handle (descriptor_data + load + store)
+                (0x000B, 0),    // read-only SRV @ 1 handle (descriptor_data + load)
+                (0x500B, 0),    // buffer_load_dword glc on UAV @ 0
+                (13, 0x1_0000), // s_buffer_load_dword on read-only CBV @ 2
+                (0x100B, 0),    // descriptor_data + plain s_buffer_load_dword on reloaded UAV @ 0
+                (0x500B, 0),    // s_buffer_load_dword glc on reloaded UAV @ 0
+            ]
+        );
+    }
+
+    #[test]
+    fn glc_only_heap_spin_wait_and_table_uavs_are_globally_coherent() {
+        // #725: a heap descriptor read only by a `glc` load in a spin loop is
+        // inferred as a UAV in `descriptor_data` (0x100B) and globally coherent
+        // on the `glc` load itself (0x500B).
+        let spin = [
+            0xBE84_0300, // s_mov_b32 s4, s0 (resource heap base)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0x7E00_0280, // v_mov_b32 v0, 0
+            // loop:
+            0xE030_5000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 offen glc
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0xBF87_FFFC, // s_cbranch_vccnz -> loop
+            0xBF8A_0000, // s_barrier
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let l = lower_with(&spin, vec![root(RootType::ResourceHeap, 0, 0)], vec![]).unwrap();
+        validate_dxil(&l.dxil);
+        assert_eq!(l.heap_props, vec![(0x100B, 0), (0x500B, 0)]);
+
+        // Table resources: structured buffer UAV (`idxen glc`), typed buffer
+        // UAV (`glc`), 2D image UAV (`image_load glc`, `image_store glc`,
+        // `image_atomic_add glc`), and a read-only table SRV whose `glc` load
+        // must stay an SRV (0xB).
+        let table = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0    (structured UAV)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20  (typed UAV)
+            0xF40C_0402,
+            0xFA00_0040, // s_load_dwordx8 s[16:23], s[4:5], 0x40  (image UAV)
+            0xF40C_0602,
+            0xFA00_0060, // s_load_dwordx8 s[24:31], s[4:5], 0x60  (uint image UAV)
+            0xF408_0802,
+            0xFA00_0080, // s_load_dwordx4 s[32:35], s[4:5], 0x80  (raw SRV)
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xE030_6000,
+            0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen glc
+            0xE00C_4000,
+            0x8003_0400, // buffer_load_format_xyzw v[4:7], v0, s[12:15], 0 glc
+            0xE01C_4000,
+            0x8003_0400, // buffer_store_format_xyzw v[4:7], v0, s[12:15], 0 glc
+            0xF000_2F08,
+            0x0004_0800, // image_load v[8:11], v[0:1], s[16:23] dmask:0xf 2d glc
+            0xF020_2F08,
+            0x0004_0800, // image_store v[8:11], v[0:1], s[16:23] dmask:0xf 2d glc
+            0xF044_2108,
+            0x0006_0200, // image_atomic_add v2, v[0:1], s[24:31] dmask:0x1 2d glc
+            0xE030_5000,
+            0x8008_0300, // buffer_load_dword v3, v0, s[32:35], 0 offen glc
+            0x4A04_0702, // v_add_nc_u32 v2, v2, v3
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 16,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 24,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 32,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ];
+        let lt = lower_with(&table, vec![root(RootType::Table, 0, 0)], used).unwrap();
+        validate_dxil(&lt.dxil);
+        assert_eq!(
+            lt.heap_props,
+            vec![
+                (0x100C, 4),     // descriptor_data for structured UAV
+                (0x100A, 0x409), // descriptor_data for typed UAV
+                (0x1002, 0x409), // descriptor_data for 2D image UAV
+                (0x1002, 0x409), // descriptor_data for 2D uint image UAV
+                (0x000B, 0),     // descriptor_data + glc load for table SRV
+                (0x500C, 4),     // structured UAV glc
+                (0x500A, 0x409), // typed UAV glc (shared by load and store)
+                (0x5002, 0x409), // 2D image UAV glc (shared by load and store)
+                (0x5002, 0x105), // 2D uint image atomic glc
+            ]
+        );
     }
 }
