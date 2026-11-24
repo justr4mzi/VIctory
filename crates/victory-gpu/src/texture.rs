@@ -413,6 +413,7 @@ mod tests {
         let copy = Arc::new(HostTexture {
             texture: resource.unwrap(),
             state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
+            twin: None,
         });
         (copy, layout_tex)
     }
