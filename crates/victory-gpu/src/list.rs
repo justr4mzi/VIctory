@@ -1116,6 +1116,35 @@ mod state {
             }
         });
     }
+    /// Maximum simultaneous render targets in D3D12
+    /// (`D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT`).
+    const MAX_RENDER_TARGETS: u32 = 8;
+    /// Render target view descriptor stride in bytes.
+    const RTV_STRIDE: u64 = 128;
+
+    /// Resolves `OMSetRenderTargets`'s handle arguments: ignores `handles`
+    /// when `count == 0`, caps `count` at the D3D12 limit, keeps a null
+    /// single-range start (`0`) null instead of stepping to `0x80`, and
+    /// checks single-range address arithmetic against overflow.
+    pub(super) fn target_handles(count: u32, handles: *const u64, one_range: i32) -> Vec<u64> {
+        let count = count.min(MAX_RENDER_TARGETS);
+        if count == 0 || handles.is_null() {
+            return Vec::new();
+        }
+        if one_range != 0 {
+            // SAFETY: `count > 0` and `handles` is non-null; the title passes
+            // the first handle of the contiguous range.
+            let first = unsafe { *handles };
+            if first == 0 {
+                return vec![0; count as usize];
+            }
+            return (0..u64::from(count))
+                .map(|i| first.checked_add(RTV_STRIDE * i).unwrap_or(0))
+                .collect();
+        }
+        items(handles, count).to_vec()
+    }
+
     /// `(count, handles, one range, depth)`: with one range, the handles
     /// follow the first at the render target view size (128 bytes).
     pub(super) extern "system" fn targets(
@@ -1125,13 +1154,7 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
-            // SAFETY: the title passes the first handle.
-            let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
-        } else {
-            items(handles, count).to_vec()
-        };
+        let handles = target_handles(count, handles, one_range);
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
         with_state(this, |list, s| s.set_targets(list, &handles, depth));
@@ -1597,6 +1620,81 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// `OMSetRenderTargets` with `RTsSingleHandleToDescriptorRange = TRUE`:
+    /// `count == 0` must not dereference `handles`, a null first handle must
+    /// not step to `0x80`, single-range stepping must check overflow and cap
+    /// at eight render targets, and the host D3D12 runtime follows the same
+    /// rule.
+    #[cfg(windows)]
+    #[test]
+    fn om_set_render_targets_guards_empty_and_null_single_ranges() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE;
+
+        let dangling = 0x10usize as *const u64;
+        let stride = u64::from(crate::descriptor::increment_size(std::ptr::null(), 2));
+        assert_eq!(stride, 128);
+
+        assert!(state::target_handles(0, dangling, 1).is_empty());
+        assert!(state::target_handles(0, dangling, 0).is_empty());
+        assert!(state::target_handles(4, std::ptr::null(), 1).is_empty());
+        assert_eq!(state::target_handles(2, &0u64, 1), vec![0, 0]);
+        assert_eq!(
+            state::target_handles(3, &0x1000_0000u64, 1),
+            vec![0x1000_0000, 0x1000_0000 + stride, 0x1000_0000 + 2 * stride]
+        );
+        let overflow_base = u64::MAX - 64;
+        assert_eq!(
+            state::target_handles(2, &overflow_base, 1),
+            vec![overflow_base, 0]
+        );
+        assert_eq!(state::target_handles(12, &0x1000_0000u64, 1).len(), 8);
+        let explicit = [1u64, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        assert_eq!(
+            state::target_handles(10, explicit.as_ptr(), 0),
+            explicit[..8]
+        );
+
+        if let Some(host) = crate::host::host() {
+            let host_list = host.new_list().expect("host command list");
+            // Verify the real host D3D12 contract: `NumRenderTargetDescriptors = 0`
+            // ignores `pRenderTargetDescriptors` even with `one_range = true`.
+            // SAFETY: open host command list; count is 0 so the pointer is unread.
+            unsafe {
+                host_list.list.OMSetRenderTargets(
+                    0,
+                    Some(dangling.cast::<D3D12_CPU_DESCRIPTOR_HANDLE>()),
+                    true,
+                    None,
+                );
+            }
+            host_list.close();
+        }
+
+        type SetTargets = extern "system" fn(This, u32, *const u64, i32, *const u64);
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[0], &mut list),
+            S_OK
+        );
+        let set_targets = slot::<SetTargets>(list, 0x190);
+        // Empty single-range call with a non-null dangling pointer (e.g. depth-only pass).
+        set_targets(list, 0, dangling, 1, std::ptr::null());
+        // Single-range call whose first handle is null (0): must not step to 0x80.
+        let null_handle = 0u64;
+        set_targets(list, 2, &null_handle, 1, std::ptr::null());
+        assert_eq!(close(list), S_OK);
+
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
