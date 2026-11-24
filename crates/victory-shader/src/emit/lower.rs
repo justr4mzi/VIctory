@@ -7043,20 +7043,28 @@ impl<'a> Lower<'a> {
         Ok((handle, byte))
     }
 
-    /// The handle of the immediate sampler `words` (a static sampler).
+    /// The handle of the immediate sampler `words` (a static sampler),
+    /// keyed by comparison mode too because plain and comparison samples
+    /// require distinct DXIL/D3D12 sampler bindings even when they share
+    /// console sampler words.
     fn immediate_sampler(&mut self, words: [u32; 4], props: (u32, u32)) -> Result<V, Why> {
-        let n = match self.samplers.iter().position(|w| *w == words) {
+        let cmp = props.0 & 0x8000 != 0;
+        let n = match self.samplers.iter().enumerate().position(|(i, w)| {
+            *w == words && (i < 64 && self.s.cmp_samplers >> i & 1 != 0) == cmp
+        }) {
             Some(n) => n,
             None => {
+                let n = self.samplers.len();
+                if cmp {
+                    if n >= 64 {
+                        return Err("too many immediate samplers");
+                    }
+                    self.s.cmp_samplers |= 1 << n;
+                }
                 self.samplers.push(words);
-                self.samplers.len() - 1
+                n
             }
         };
-        if props.0 & 0x8000 != 0 {
-            // shortcut: one sampler used with and without comparison
-            // would need two static samplers; it becomes a comparison one.
-            self.s.cmp_samplers |= 1 << n;
-        }
         Ok(self.s.sampler_handle(self.cur, n as u32))
     }
 
