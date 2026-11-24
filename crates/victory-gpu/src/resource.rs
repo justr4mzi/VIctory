@@ -369,32 +369,6 @@ impl PlacedFootprint {
         let last = u64::from(self.width).div_ceil(block) * element;
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
-
-    /// The byte span enclosing the rows and slices read by a source box.
-    pub(crate) fn box_bytes(
-        &self,
-        [left, top, front, right, bottom, back]: [u32; 6],
-    ) -> Option<std::ops::Range<u64>> {
-        if left >= right
-            || top >= bottom
-            || front >= back
-            || right > self.width
-            || bottom > self.height
-            || back > self.depth
-        {
-            return None;
-        }
-        let (element, block) = element(self.format)?;
-        let pitch = u64::from(self.row_pitch);
-        let slice = pitch * u64::from(self.height).div_ceil(block);
-        let start = u64::from(front) * slice
-            + u64::from(top) / block * pitch
-            + u64::from(left) / block * element;
-        let end = u64::from(back - 1) * slice
-            + (u64::from(bottom).div_ceil(block) - 1) * pitch
-            + u64::from(right).div_ceil(block) * element;
-        Some(start..end)
-    }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
 
@@ -2003,29 +1977,6 @@ mod tests {
                 size: u64::MAX,
             }
         );
-    }
-
-    #[test]
-    fn boxed_footprints_cover_block_rows_and_volume_slices() {
-        let compressed = PlacedFootprint {
-            offset: 512,
-            format: 71,
-            width: 10,
-            height: 9,
-            depth: 1,
-            row_pitch: 256,
-        };
-        assert_eq!(compressed.box_bytes([4, 4, 0, 10, 9, 1]), Some(264..536));
-
-        let volume = PlacedFootprint {
-            offset: 512,
-            format: 28,
-            width: 4,
-            height: 3,
-            depth: 3,
-            row_pitch: 256,
-        };
-        assert_eq!(volume.box_bytes([1, 1, 1, 3, 3, 3]), Some(1028..2060));
     }
 
     #[test]
