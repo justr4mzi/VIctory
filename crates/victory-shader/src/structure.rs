@@ -1322,11 +1322,10 @@ impl<'a> Lanes<'a> {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
                 if n.ends_with("nz") {
-                    any
+                    vcc
                 } else {
-                    self.b.not(any)
+                    self.b.not(vcc)
                 }
             }
             n => {
@@ -1551,6 +1550,34 @@ mod tests {
         };
         assert!(matches!(s.bools.support(when)[..], [Atom::Uniform(_)]));
         assert_eq!(guarded(&s), 0);
+    }
+
+    #[test]
+    fn vcc_branch_tests_raw_vcc_without_exec() {
+        // v_cmp_eq_u32 vcc, 0, v0
+        // s_cbranch_vccnz -> 8
+        // S_ENDPGM
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBF87_0001, // s_cbranch_vccnz -> 8
+                0x7E02_0280, // 8: v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!()
+        };
+        let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        // In BDD representation: node(when) is (Atom::Lane(cmp), Bool::FALSE, Bool::TRUE)
+        // representing when = cmp ? 1 : 0.
+        assert_eq!(
+            s.bools.node(when),
+            Some((Atom::Lane(cmp), Bool::FALSE, Bool::TRUE))
+        );
+        assert_eq!(s.bools.support(when), vec![Atom::Lane(cmp)]);
     }
 
     #[test]
