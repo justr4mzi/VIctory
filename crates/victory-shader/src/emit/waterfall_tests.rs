@@ -19,6 +19,10 @@ use crate::{io, ir, resource, structure};
 /// [`build`] of a program that takes `handles` handles with each lane's own
 /// heap index.
 fn build(words: &[u32], buffers: bool, handles: u32) -> HostShader {
+    build_opts(words, buffers, handles, false)
+}
+
+fn build_opts(words: &[u32], buffers: bool, handles: u32, expect_wave_ops: bool) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -74,9 +78,9 @@ fn build(words: &[u32], buffers: bool, handles: u32) -> HostShader {
         mesh_stride: 0,
     })
     .expect("lower");
-    // Accesses with each lane's own heap index, no wave operation.
+    // Accesses with each lane's own heap index, no wave operation unless expected.
     assert_eq!(lowered.nonuniform_handles, handles);
-    assert!(!lowered.wave_ops);
+    assert_eq!(lowered.wave_ops, expect_wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -363,5 +367,31 @@ fn image_resinfo_returns_zero_depth_for_a_2d_view() {
         for (lane, dimensions) in words.as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(*dimensions, [3, 2, 0, 1], "{label}, lane {lane}");
         }
+    }
+}
+
+#[test]
+fn compute_image_sample_uses_quad_gradients_and_validates() {
+    // `image_sample` in a compute shader lowers through quad gradients
+    // (or SampleLevel outside compute/cube), which DXIL accepts and
+    // validates in `build_opts`.
+    use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
+    const IMAGE_SAMPLE_LZ: u32 = 0xF09C_0F08;
+    const IMAGE_SAMPLE: u32 = 0xF080_0F08;
+    assert!(WATERFALL_INDEXED_WAVE32.contains(&IMAGE_SAMPLE_LZ));
+    let words: Vec<u32> = WATERFALL_INDEXED_WAVE32
+        .iter()
+        .map(|&w| {
+            if w == IMAGE_SAMPLE_LZ {
+                IMAGE_SAMPLE
+            } else {
+                w
+            }
+        })
+        .collect();
+    let shader = build_opts(&words, false, 1, true);
+    for (label, red) in sampled(&shader) {
+        let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
+        assert_eq!(red, want, "{label}");
     }
 }

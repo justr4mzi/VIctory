@@ -168,6 +168,9 @@ pub(crate) struct Shader {
     /// Each heap handle's resource properties, in creation order.
     #[cfg(test)]
     pub heap_props: Vec<(u32, u32)>,
+    /// Scalar buffer loads read raw from a descriptor loaded out of the
+    /// resource heap (no used-resource entry names it).
+    pub heap_raw_loads: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -230,6 +233,7 @@ impl Shader {
             nonuniform_handles: 0,
             #[cfg(test)]
             heap_props: Vec::new(),
+            heap_raw_loads: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
