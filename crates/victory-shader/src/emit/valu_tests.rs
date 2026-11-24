@@ -3106,3 +3106,113 @@ fn v_sad_family_matches_rdna2() {
         },
     );
 }
+
+#[test]
+fn v_frexp_f32_and_f16_match_rdna2() {
+    // VOP1 opcodes: 0x3f=v_frexp_exp_i32_f32, 0x40=v_frexp_mant_f32,
+    //               0x59=v_frexp_mant_f16,    0x5a=v_frexp_exp_i16_f16.
+    let exp_f32 = build_valu_cs(&[vop1(0x3f, 0, vgpr(1))]);
+    let mant_f32 = build_valu_cs(&[vop1(0x40, 0, vgpr(1))]);
+    // For f16 tests, initialize v0 = 0xDEAD_0000 so we also verify high-half preservation.
+    let mant_f16 = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(2)), // v_mov_b32 v0, v2 (sentinel upper half)
+        vop1(0x59, 0, vgpr(1)),
+    ]);
+    let exp_f16 = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(2)), // v_mov_b32 v0, v2 (sentinel upper half)
+        vop1(0x5a, 0, vgpr(1)),
+    ]);
+
+    // (input f32 bits, expected mantissa f32 bits, expected i32 exponent)
+    let f32_cases: &[(u32, u32, i32)] = &[
+        (0.0f32.to_bits(), 0.0f32.to_bits(), 0),
+        ((-0.0f32).to_bits(), (-0.0f32).to_bits(), 0),
+        (0.5f32.to_bits(), 0.5f32.to_bits(), 0),
+        (1.0f32.to_bits(), 0.5f32.to_bits(), 1),
+        ((-6.0f32).to_bits(), (-0.75f32).to_bits(), 3),
+        (0.125f32.to_bits(), 0.5f32.to_bits(), -2),
+        (f32::INFINITY.to_bits(), f32::INFINITY.to_bits(), 0),
+        (f32::NEG_INFINITY.to_bits(), f32::NEG_INFINITY.to_bits(), 0),
+        // Subnormals: 2^-127 = 0.5 * 2^-126; 3 * 2^-149 = 0.75 * 2^-147; -2^-149 = -0.5 * 2^-148
+        (0x0040_0000, 0.5f32.to_bits(), -126),
+        (0x0000_0003, 0.75f32.to_bits(), -147),
+        (0x8000_0001, (-0.5f32).to_bits(), -148),
+    ];
+    let f32_in: Vec<[u32; 4]> = f32_cases.iter().map(|&(x, _, _)| [x, 0, 0, 0]).collect();
+    run_cases(&mant_f32, &f32_in, |backend, i, inp, got| {
+        let want = f32_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_frexp_mant_f32({:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+    run_cases(&exp_f32, &f32_in, |backend, i, inp, got| {
+        let want = f32_cases[i].2 as u32;
+        assert_eq!(
+            got, want,
+            "{backend}: v_frexp_exp_i32_f32({:#010x}) = {} ({got:#010x}), want {}",
+            inp[0], got as i32, f32_cases[i].2,
+        );
+    });
+
+    // NaN: mantissa stays NaN, exponent is 0.
+    let qnan = 0x7FC0_0000u32;
+    run_cases(&mant_f32, &[[qnan, 0, 0, 0]], |backend, _, _, got| {
+        assert!(
+            f32::from_bits(got).is_nan(),
+            "{backend}: v_frexp_mant_f32(NaN) = {got:#010x}, want NaN",
+        );
+    });
+    run_cases(&exp_f32, &[[qnan, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, 0, "{backend}: v_frexp_exp_i32_f32(NaN) = {got}, want 0");
+    });
+
+    // f16 cases: (input f16, expected mantissa f16, expected i16 exponent)
+    // 0x0000=+0, 0x8000=-0, 0x3800=0.5, 0x3C00=1.0, 0xC600=-6.0 (-0.75 * 2^3, -0.75=0xBA00),
+    // 0x7BFF=65504 (max f16 -> mant=0x3BFF, exp=16), 0x0001=2^-24 (min subnormal -> 0.5 * 2^-23),
+    // 0x8003=-3*2^-24 (-0.75 * 2^-22), 0x7C00=+inf, 0xFC00=-inf.
+    let sentinel = 0xDEAD_0000u32;
+    let f16_cases: &[(u16, u16, i16)] = &[
+        (0x0000, 0x0000, 0),
+        (0x8000, 0x8000, 0),
+        (0x3800, 0x3800, 0),
+        (0x3C00, 0x3800, 1),
+        (0xC600, 0xBA00, 3),
+        (0x7BFF, 0x3BFF, 16),
+        (0x0001, 0x3800, -23),
+        (0x8003, 0xBA00, -22),
+        (0x7C00, 0x7C00, 0),
+        (0xFC00, 0xFC00, 0),
+    ];
+    let f16_in: Vec<[u32; 4]> = f16_cases
+        .iter()
+        .map(|&(x, _, _)| [u32::from(x), sentinel, 0, 0])
+        .collect();
+    run_cases(&mant_f16, &f16_in, |backend, i, inp, got| {
+        let want = sentinel | u32::from(f16_cases[i].1);
+        assert_eq!(
+            got, want,
+            "{backend}: v_frexp_mant_f16({:#06x}) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+    run_cases(&exp_f16, &f16_in, |backend, i, inp, got| {
+        let want = sentinel | u32::from(f16_cases[i].2 as u16);
+        assert_eq!(
+            got, want,
+            "{backend}: v_frexp_exp_i16_f16({:#06x}) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+
+    // f16 NaN: mantissa is f16 NaN (upper half preserved), exponent is 0.
+    run_cases(&mant_f16, &[[0x7E00, sentinel, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got & 0xFFFF_0000, sentinel);
+        let lo = (got & 0x7FFF) as u16;
+        assert!(lo > 0x7C00, "{backend}: v_frexp_mant_f16(NaN) lo={lo:#06x}, want NaN");
+    });
+    run_cases(&exp_f16, &[[0x7E00, sentinel, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, sentinel, "{backend}: v_frexp_exp_i16_f16(NaN) = {got:#010x}, want 0");
+    });
+}

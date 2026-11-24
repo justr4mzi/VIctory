@@ -2480,6 +2480,60 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, z, zero, m)
     }
 
+    /// Decomposes an f32 into `(mantissa, exponent)` per RDNA2 `v_frexp_*`:
+    /// - finite non-zero (normal or subnormal): `mantissa` in `(-1, -0.5] U [0.5, 1)`
+    ///   and `exponent` such that `a == mantissa * 2^exponent`;
+    /// - `±0`, `±inf`, `NaN`: `mantissa = a` (preserving sign/special value), `exponent = 0`.
+    fn frexp_f32(&mut self, a: V) -> (V, V) {
+        let c = self.cur;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let bits = self.as_int(a);
+        let sign_mask = k(self, 0x8000_0000);
+        let mag_mask = k(self, 0x7FFF_FFFF);
+        let mant_mask = k(self, 0x007F_FFFF);
+        let half_exp = k(self, 0x3F00_0000);
+        let (k0, k23, k255, k126) = (k(self, 0), k(self, 23), k(self, 255), k(self, 126));
+
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_mask);
+        let mag = self.s.m.bin(c, Bin::And, bits, mag_mask);
+        let exp_raw = self.s.m.bin(c, Bin::LShr, mag, k23);
+        let mant_raw = self.s.m.bin(c, Bin::And, mag, mant_mask);
+
+        // Normal path: biased exponent 1..=254 -> exponent = exp_raw - 126, mantissa exp = 126.
+        let norm_mant = self.s.m.bin(c, Bin::Or, sign, half_exp);
+        let norm_mant = self.s.m.bin(c, Bin::Or, norm_mant, mant_raw);
+        let norm_exp = self.s.m.bin(c, Bin::Sub, exp_raw, k126);
+
+        // Subnormal path (exp_raw == 0, mant_raw != 0): shift top bit of mant_raw to bit 23.
+        // FirstbitHi (op 33) counts leading zeros from bit 31: bit k -> lz = 31 - k in [9..=31].
+        let lz = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 33, &[mant_raw]);
+        let k8 = k(self, 8);
+        let sh = self.s.m.bin(c, Bin::Sub, lz, k8);
+        let k31 = k(self, 31);
+        let sh_safe = self.s.m.bin(c, Bin::And, sh, k31);
+        let sub_mant_bits = self.s.m.bin(c, Bin::Shl, mant_raw, sh_safe);
+        let sub_mant_bits = self.s.m.bin(c, Bin::And, sub_mant_bits, mant_mask);
+        let sub_mant = self.s.m.bin(c, Bin::Or, sign, half_exp);
+        let sub_mant = self.s.m.bin(c, Bin::Or, sub_mant, sub_mant_bits);
+        // Value = mant_raw * 2^-149 = (0.5..1) * 2^(-117 - lz).
+        let k_neg117 = k(self, (-117i32) as u32);
+        let sub_exp = self.s.m.bin(c, Bin::Sub, k_neg117, lz);
+
+        let is_exp0 = self.s.m.cmp(c, pred::EQ, exp_raw, k0);
+        let is_zero = self.s.m.cmp(c, pred::EQ, mag, k0);
+        let is_inf_nan = self.s.m.cmp(c, pred::EQ, exp_raw, k255);
+        let is_special = self.s.m.bin(c, Bin::Or, is_zero, is_inf_nan);
+
+        let mant_fin = self.s.m.select(c, is_exp0, sub_mant, norm_mant);
+        let exp_fin = self.s.m.select(c, is_exp0, sub_exp, norm_exp);
+
+        let mant_bits = self.s.m.select(c, is_special, bits, mant_fin);
+        let exp = self.s.m.select(c, is_special, k0, exp_fin);
+        (self.as_float(mant_bits), exp)
+    }
+
     // ---- lane booleans ----
 
     fn boolean(&mut self, b: Bool, at: usize) -> Result<V, Why> {
@@ -6498,6 +6552,16 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            "v_frexp_mant_f32" => {
+                let a = f(self, 0)?;
+                let (mant, _) = self.frexp_f32(a);
+                float(self, mant)
+            }
+            "v_frexp_exp_i32_f32" => {
+                let a = f(self, 0)?;
+                let (_, exp) = self.frexp_f32(a);
+                int(self, exp)
+            }
             "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
                 let mut a = f(self, 0)?;
                 if name == "v_cvt_rpi_i32_f32" {
@@ -7164,6 +7228,7 @@ impl<'a> Lower<'a> {
             "v_rndne_f16",
             "v_sin_f16",
             "v_cos_f16",
+            "v_frexp_mant_f16",
             "v_cvt_f16_u16",
             "v_cvt_f16_i16",
         ];
@@ -7183,6 +7248,7 @@ impl<'a> Lower<'a> {
             "v_cvt_i16_f16",
             "v_cvt_norm_i16_f16",
             "v_cvt_norm_u16_f16",
+            "v_frexp_exp_i16_f16",
         ];
         let all = [FLOAT1, FLOAT2, FLOAT3, INT];
         if !all.iter().any(|l| l.contains(&name))
@@ -7340,6 +7406,10 @@ impl<'a> Lower<'a> {
                     let one = self.s.m.f32(1.0f32.to_bits());
                     self.s.m.bin(c, Bin::SDiv, one, a)
                 }
+                "v_frexp_mant_f16" => {
+                    let a = self.half_fsrc(inst, 0)?;
+                    self.frexp_f32(a).0
+                }
                 _ => {
                     let a = self.half_fsrc(inst, 0)?;
                     let op = match name {
@@ -7371,6 +7441,14 @@ impl<'a> Lower<'a> {
             }
             let r = self.cvt_norm16(inst, name == "v_cvt_norm_i16_f16")?;
             return self.write_half(inst, r, guard);
+        }
+        if name == "v_frexp_exp_i16_f16" {
+            if v.clamp || v.omod != 0 {
+                return Err("modifiers on a 16-bit integer operation");
+            }
+            let a = self.half_fsrc(inst, 0)?;
+            let (_, exp) = self.frexp_f32(a);
+            return self.write_half(inst, exp, guard);
         }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
         if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
