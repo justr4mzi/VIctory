@@ -799,6 +799,60 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// Adapts the requested view format to a format compatible with host D3D12.
+///
+/// Returns `true` if the view is permitted, mutating `format` to a valid typed format
+/// when necessary (e.g. mapping a typeless view on a typeless texture to its primary
+/// concrete format). Returns `false` if the view format belongs to an incompatible
+/// family or cannot be created.
+pub(crate) fn adapt_view_format(
+    own: u32,
+    mut format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+) -> bool {
+    use crate::resource::{family, first_concrete, is_typeless};
+    let typeless = is_typeless(own);
+    if let Some(format) = format.as_deref_mut()
+        && unordered
+        && let Some(&(_, linear)) = crate::resource::SRGB
+            .iter()
+            .find(|&&(s, _)| s == format.0 as u32)
+    {
+        format.0 = linear as i32;
+    }
+    let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    if view == 0 && format.is_none() {
+        return !typeless;
+    }
+    // A texture whose console format PC forbids as a render target or UAV
+    // was substituted (`resource::target_format`): views name its host format.
+    if view != 0 && view != own && crate::resource::target_format(view) == own {
+        if let Some(format) = format {
+            *format = DXGI_FORMAT(own as i32);
+        }
+        return true;
+    }
+    if view != 0 && family(view) != family(own) {
+        once!(view, own, "view format of another family");
+        return false;
+    }
+    if let Some(format) = format {
+        if !typeless {
+            *format = DXGI_FORMAT(own as i32);
+        } else if view == 0 || is_typeless(view) {
+            let concrete = first_concrete(own);
+            tracing::debug!(
+                own,
+                view,
+                concrete,
+                "typeless view on typeless resource remapped to concrete format"
+            );
+            *format = DXGI_FORMAT(concrete as i32);
+        }
+    }
+    true
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -807,8 +861,8 @@ fn buffer_uav(
 /// family takes the texture's format.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
-fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
-    use crate::resource::{DEPTH_FORMATS, family};
+fn fits(texture: &ID3D12Resource, format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+    use crate::resource::DEPTH_FORMATS;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     let allowed = if unordered {
@@ -826,38 +880,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         );
         return false;
     }
-    // Every family has more than one format, its typeless one first.
-    let typeless = family(own) == own && family(own + 1) == own;
-    if let Some(format) = format.as_deref_mut()
-        && unordered
-        && let Some(&(_, linear)) = crate::resource::SRGB
-            .iter()
-            .find(|&&(s, _)| s == format.0 as u32)
-    {
-        format.0 = linear as i32;
-    }
-    let view = format.as_ref().map_or(0, |f| f.0 as u32);
-    if view == 0 {
-        return !typeless;
-    }
-    // A texture whose console format PC forbids as a render target or UAV
-    // was substituted (`resource::target_format`): views name its host format.
-    if view != own && crate::resource::target_format(view) == own {
-        if let Some(format) = format {
-            *format = d.Format;
-        }
-        return true;
-    }
-    if family(view) != family(own) {
-        once!(view, own, "view format of another family");
-        return false;
-    }
-    if let Some(format) = format
-        && !typeless
-    {
-        *format = d.Format;
-    }
-    true
+    adapt_view_format(own, format, unordered)
 }
 
 /// The unordered access view a null description makes of a 2D texture
@@ -1956,5 +1979,62 @@ void main(uint3 id : SV_DispatchThreadID) {
             (&title[..68], &title[100..]),
             (&before[..68], &before[100..])
         );
+    }
+
+    /// Typeless SRV and UAV views on typeless resources are remapped to the first
+    /// concrete format of their family so D3D12 can create the view without E_INVALIDARG.
+    #[test]
+    fn typeless_view_on_typeless_resource_remaps_to_concrete_format() {
+        // R8G8B8A8_TYPELESS (27) with R8G8B8A8_TYPELESS view (27) -> R8G8B8A8_UNORM (28)
+        let mut fmt = DXGI_FORMAT(27);
+        assert!(adapt_view_format(27, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 28);
+
+        // B8G8R8A8_TYPELESS (90) with B8G8R8A8_TYPELESS view (90) -> B8G8R8A8_UNORM (87)
+        let mut fmt = DXGI_FORMAT(90);
+        assert!(adapt_view_format(90, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 87);
+
+        // R32_TYPELESS (39) with R32_TYPELESS view (39) -> R32_FLOAT (41)
+        let mut fmt = DXGI_FORMAT(39);
+        assert!(adapt_view_format(39, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 41);
+
+        // R24G8_TYPELESS (44) with R24G8_TYPELESS view (44) -> R24_UNORM_X8_TYPELESS (46)
+        let mut fmt = DXGI_FORMAT(44);
+        assert!(adapt_view_format(44, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 46);
+
+        // R32G8X24_TYPELESS (19) with R32G8X24_TYPELESS view (19) -> R32_FLOAT_X8X24_TYPELESS (21)
+        let mut fmt = DXGI_FORMAT(19);
+        assert!(adapt_view_format(19, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 21);
+
+        // UNKNOWN view (0) on typeless texture -> first concrete format
+        let mut fmt = DXGI_FORMAT(0);
+        assert!(adapt_view_format(27, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 28);
+
+        // Typed view (29 = R8G8B8A8_UNORM_SRGB) on typeless texture (27) stays 29
+        let mut fmt = DXGI_FORMAT(29);
+        assert!(adapt_view_format(27, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 29);
+
+        // Typeless view (27) on typed texture (28) adopts texture's format (28)
+        let mut fmt = DXGI_FORMAT(27);
+        assert!(adapt_view_format(28, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 28);
+
+        // Typeless texture with None format is refused
+        assert!(!adapt_view_format(27, None, false));
+
+        // Incompatible family is refused
+        let mut fmt = DXGI_FORMAT(10);
+        assert!(!adapt_view_format(27, Some(&mut fmt), false));
+
+        // UAV with sRGB (29) converts to linear (28)
+        let mut fmt = DXGI_FORMAT(29);
+        assert!(adapt_view_format(27, Some(&mut fmt), true));
+        assert_eq!(fmt.0, 28);
     }
 }
