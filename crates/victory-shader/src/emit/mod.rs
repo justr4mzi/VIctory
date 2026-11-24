@@ -682,6 +682,111 @@ mod tests {
         }
     }
 
+    /// A wave32 compute program with the whole-wave section the console
+    /// compiler makes of an inclusive OR prefix (`WaveMultiPrefixBitOr`
+    /// over every lane, plus the lane's own value): row_shr DPP steps
+    /// inside each row of 16, then lane 15 joined into the upper row. Each
+    /// lane stores its result at its own offset of a raw UAV.
+    fn or_prefix_cs() -> NativeProgram {
+        const fn sop1(op: u32, sdst: u32, src0: u32) -> u32 {
+            0xBE80_0000 | sdst << 16 | op << 8 | src0
+        }
+        const fn vop2(op: u32, vdst: u32, src0: u32, vsrc1: u32) -> u32 {
+            op << 25 | vdst << 17 | vsrc1 << 9 | src0
+        }
+        const fn vop3(op: u32, vdst: u32, src0: u32, src1: u32, src2: u32) -> [u32; 2] {
+            [0x35 << 26 | op << 16 | vdst, src0 | src1 << 9 | src2 << 18]
+        }
+        /// v_or_b32_dpp v1, v1, v1 row_shr:n bound_ctrl:1.
+        const fn or_shr(n: u32) -> [u32; 2] {
+            [
+                vop2(0x1C, 1, 0xFA, 1),
+                1 | (0x110 | n) << 8 | 1 << 19 | 0xF << 24 | 0xF << 28,
+            ]
+        }
+        let (exec_lo, v0, v1) = (126, 256, 257);
+        let mut words = vec![
+            sop1(0x03, 1, 0x80), // s_mov_b32 s1, 0
+        ];
+        // s_load_dwordx4 s[8:11], s[0:1], 0
+        words.extend([0x3D << 26 | 0x02 << 18 | 8 << 6, 125 << 25]);
+        words.push(sop1(0x3D, 2, 193)); // s_or_saveexec_b32 s2, -1
+        words.extend(vop3(0x101, 1, 0x80, v0, 2)); // v_cndmask_b32 v1, 0, v0, s2
+        for n in [1, 2, 4, 8] {
+            words.extend(or_shr(n));
+        }
+        words.extend(vop3(0x360, 3, v1, 128 + 15, 0)); // v_readlane_b32 s3, v1, 15
+        words.extend([sop1(0x03, exec_lo, 0xFF), 0xFFFF_0000]); // s_mov_b32 exec_lo, 0xffff0000
+        words.push(vop2(0x1C, 1, 3, 1)); // v_or_b32 v1, s3, v1
+        words.push(sop1(0x03, exec_lo, 2)); // s_mov_b32 exec_lo, s2
+        words.push(vop2(0x1A, 2, 0x82, 0)); // v_lshlrev_b32 v2, 2, v0
+        // buffer_store_dword v1, v2, s[8:11], 0 offen
+        words.extend([
+            0x38 << 26 | 0x1C << 18 | 1 << 12,
+            0x80 << 24 | 2 << 16 | 1 << 8 | 2,
+        ]);
+        words.push(0xBF81_0000); // s_endpgm
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![crate::native::RootParam {
+                root: crate::native::RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![crate::native::UsedResource {
+                kind: crate::native::ResourceType::Uav,
+                root: crate::native::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1, // one user SGPR: s0
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// The OR prefix becomes `WaveMultiPrefixOp` (DXIL has no plain bitwise
+    /// prefix) instead of failing the translation.
+    #[test]
+    fn a_bitwise_wave_prefix_is_a_multi_prefix() {
+        let native = or_prefix_cs();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let shapes: Vec<_> = (0..p.blocks.len())
+            .flat_map(|b| wave::sections(&p, b).into_values())
+            .flat_map(|s| s.shapes.into_values())
+            .collect();
+        assert!(
+            shapes
+                .iter()
+                .any(|s| matches!(s, wave::Shape::Prefix(wave::Op::Or, _, _, 0, true))),
+            "{shapes:?}"
+        );
+        assert!(!out.dxil.is_empty());
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {

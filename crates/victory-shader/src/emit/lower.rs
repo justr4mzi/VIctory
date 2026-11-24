@@ -2304,7 +2304,38 @@ impl<'a> Lower<'a> {
                     r
                 }
             }
-            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
+            (Op::Or | Op::And | Op::Xor, Some(inclusive)) => {
+                // DXIL has no plain bitwise prefix; WaveMultiPrefixOp over
+                // one partition holding every active lane is one (exclusive,
+                // the identity in the first lane). Inactive lanes already
+                // hold the identity.
+                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                let yes = self.s.m.bool(true);
+                let all = self
+                    .s
+                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[yes]);
+                let parts: Vec<V> = (0..4).map(|k| self.s.m.extract(c, all, k)).collect();
+                let (kind, bin) = match op {
+                    Op::And => (1, Bin::And),
+                    Op::Or => (2, Bin::Or),
+                    _ => (3, Bin::Xor),
+                };
+                let (k, u) = (self.s.m.i8(kind), self.s.m.i8(1));
+                let r = self.s.op(
+                    c,
+                    "waveMultiPrefixOp.i32",
+                    Attr::NoUnwind,
+                    i32t,
+                    166,
+                    &[arg, parts[0], parts[1], parts[2], parts[3], k, u],
+                );
+                if inclusive {
+                    self.s.m.bin(c, bin, r, arg)
+                } else {
+                    r
+                }
+            }
+            (_, Some(_)) => return Err("a wave prefix of a minimum or maximum"),
             (Op::Or | Op::And | Op::Xor, None) => {
                 let k = self.s.m.i8(match op {
                     Op::And => 0,
