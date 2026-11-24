@@ -865,6 +865,10 @@ fn uav_bits(uav: bool, glc: bool) -> u32 {
     }
 }
 
+/// The image atomics made by [`Lower::atomic_loop`], in place of a DXIL
+/// atomic operation code.
+const ATOMIC_LOOP: u32 = u32::MAX - 1;
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>) -> Self {
         let p = x.p;
@@ -2806,6 +2810,66 @@ impl<'a> Lower<'a> {
                 phi
             })
             .collect()
+    }
+
+    /// An image atomic DXIL has no operation for (`inc`, `dec`, `fcmpswap`,
+    /// `fmin`, `fmax`), on the dword at `coords` of the 32-bit integer view
+    /// `h`: a compare-and-swap loop from a first guess of 0, until the
+    /// exchange finds the value the new one was made from (a null view reads
+    /// 0, so it leaves at once). `vals`: the data (fcmpswap: new, compare).
+    /// Returns the old value.
+    fn atomic_loop(&mut self, h: V, coords: &[V], op: &str, vals: &[V]) -> V {
+        let i32t = self.s.t.i32;
+        let entry = self.cur;
+        let (head, done) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(entry, Term::Br(head));
+        self.cur = head;
+        let old = self.s.m.phi(head, i32t);
+        let (data, zero, one) = (vals[0], self.s.m.i32(0), self.s.m.i32(1));
+        let new = match op {
+            // old >= data ? 0 : old + 1
+            "inc" => {
+                let up = self.s.m.bin(head, Bin::Add, old, one);
+                let wrap = self.s.m.cmp(head, pred::IUGE, old, data);
+                self.s.m.select(head, wrap, zero, up)
+            }
+            // old == 0 || old > data ? data : old - 1
+            "dec" => {
+                let down = self.s.m.bin(head, Bin::Sub, old, one);
+                let empty = self.s.m.cmp(head, pred::EQ, old, zero);
+                let over = self.s.m.cmp(head, pred::IUGT, old, data);
+                let reload = self.s.m.bin(head, Bin::Or, empty, over);
+                self.s.m.select(head, reload, data, down)
+            }
+            // A float compare: -0 matches +0, NaN matches nothing.
+            "fcmpswap" => {
+                let (o, c) = (self.as_float(old), self.as_float(vals[1]));
+                let eq = self.s.m.cmp(head, pred::OEQ, o, c);
+                self.s.m.select(head, eq, data, old)
+            }
+            // As v_min_f32 and v_max_f32.
+            _ => {
+                let (d, o) = (self.as_float(data), self.as_float(old));
+                let m = self.binary(if op == "fmax" { 35 } else { 36 }, d, o);
+                self.as_int(m)
+            }
+        };
+        let mut args = vec![h];
+        args.extend_from_slice(coords);
+        args.extend([old, new]);
+        let prev = self.s.op(
+            head,
+            "atomicCompareExchange.i32",
+            Attr::NoUnwind,
+            i32t,
+            79,
+            &args,
+        );
+        let found = self.s.m.cmp(head, pred::EQ, prev, old);
+        self.s.m.terminate(head, Term::CondBr(found, done, head));
+        self.s.m.set_phi(old, vec![(zero, entry), (prev, head)]);
+        self.cur = done;
+        prev
     }
 
     /// Code that depends on the lane layout: wave operations, and in compute
@@ -8451,16 +8515,20 @@ impl<'a> Lower<'a> {
                 "umax" => 7,
                 "swap" => 8,
                 "cmpswap" => u32::MAX,
+                // No DXIL operation: a compare-and-swap loop (`atomic_loop`).
+                "inc" | "dec" | "fcmpswap" | "fmin" | "fmax" => ATOMIC_LOOP,
                 _ => return Err(name),
             };
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's). Two
-            // dwords per value are a 64-bit atomic on an R32G32 view.
-            let wide = match (*dmask, code == u32::MAX) {
+            // dmask: the data dwords (the compare-and-swaps: twice the
+            // value's). Two dwords per value are a 64-bit atomic on an
+            // R32G32 view (except compare-and-swap loops, which stay 32-bit).
+            let pair = matches!(op, "cmpswap" | "fcmpswap");
+            let wide = match (*dmask, pair) {
                 (1, false) | (3, true) => false,
-                (3, false) | (0xF, true) => true,
+                (3, false) | (0xF, true) if code != ATOMIC_LOOP => true,
                 _ => return Err("an image atomic's data mask"),
             };
             let iu = self.s.m.undef(self.s.t.i32);
@@ -8474,7 +8542,7 @@ impl<'a> Lower<'a> {
             if wide {
                 return self.image_atomic64(inst, site, src, kind, cs, reg, guard, op, code);
             }
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
+            let vals = self.vgprs(inst, data, if pair { 2 } else { 1 })?;
             let mut value = vals[0];
             if op == "sub" {
                 let z = self.s.m.i32(0);
@@ -8488,7 +8556,9 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
             let mut args = vec![h];
-            let r = if code == u32::MAX {
+            let r = if code == ATOMIC_LOOP {
+                self.atomic_loop(h, &cs, op, &vals)
+            } else if code == u32::MAX {
                 // cmpswap: data is (new, compare).
                 args.extend(cs);
                 args.extend([vals[1], vals[0]]);
