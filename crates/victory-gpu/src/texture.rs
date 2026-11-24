@@ -796,11 +796,6 @@ mod tests {
         );
         forget(fake_resource as usize);
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn host_written_clears_after_write_watched_memory_is_written() {

@@ -89,6 +89,8 @@ impl Drop for Shadow {
     /// With a range not copied back (its list was reset meanwhile).
     fn drop(&mut self) {
         forget(self.before.get_mut().unwrap_or_else(|e| e.into_inner()));
+        #[cfg(windows)]
+        crate::host::release_late(self.buffer.clone());
     }
 }
 
@@ -144,13 +146,6 @@ const NOT_WATCHED: u8 = 2;
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
-
-#[cfg(windows)]
-impl Drop for Shadow {
-    fn drop(&mut self) {
-        crate::host::release_late(self.buffer.clone());
-    }
-}
 
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
