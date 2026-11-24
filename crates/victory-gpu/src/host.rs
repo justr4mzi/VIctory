@@ -1370,6 +1370,31 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
+    /// The latest producer of this range if it wrote a covering host
+    /// copy on the GPU. Deferred CPU writes keep their upload snapshots.
+    pub(crate) fn written_shadow(
+        &self,
+        address: usize,
+        len: usize,
+    ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        let end = address.checked_add(len)?;
+        let overlaps = |at: usize, size: usize| size != 0 && at < end && address < at + size;
+        for step in self.deferred().copies.iter().rev() {
+            match step {
+                Step::GpuWrite(shadow, at, size) if overlaps(*at, *size) => {
+                    // A partial producer still needs the copy's CPU snapshot
+                    // for bytes that subsequent refreshes can overwrite.
+                    return (*at <= address && end <= at + size).then(|| shadow.clone());
+                }
+                Step::Copy(dst, _, size) if overlaps(*dst, *size) => return None,
+                // Raw deferred CPU work can write this range too.
+                Step::Run(_) => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));

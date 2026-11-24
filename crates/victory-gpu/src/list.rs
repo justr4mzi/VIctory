@@ -510,9 +510,50 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
-/// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// Uses the host copy when the list already wrote the footprint's buffer.
+/// Other uploads keep a separate CPU snapshot for each copy.
+#[cfg(windows)]
+fn placed_copy_source(
+    list: &crate::host::HostList,
+    resource: This,
+    offset: u64,
+    bytes: u64,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64)> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+
+    let data = buffer_range(resource, offset, bytes)?;
+    let address = data as u64;
+    let Some(shadow) = list.written_shadow(data as usize, bytes as usize) else {
+        let (upload, staging) = list.upload(crate::host::host()?, bytes)?;
+        // Wine can report the mapped upload address as MEM_FREE.
+        list.defer_fill(staging, data, bytes as usize);
+        return Some((upload, 0));
+    };
+    let offset = shadow.offset(address);
+    let staging = if offset.is_multiple_of(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.into()) {
+        None
+    } else {
+        // A guest footprint can start at an unaligned offset in the shadow.
+        // Rebase it on the GPU so earlier writes remain visible to this copy.
+        Some(crate::host::host()?.shared_buffer(bytes)?.0)
+    };
+    shadow.refresh(list, address, bytes);
+    list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+    let Some(staging) = staging else {
+        return Some((shadow.buffer.clone(), offset));
+    };
+    list.buffer_state(&staging, COPY_DEST);
+    // SAFETY: both buffers are held by the list; the source range is checked
+    // and the staging buffer has exactly enough space for the footprint.
+    unsafe {
+        list.list.CopyBufferRegion(&staging, 0, &shadow.buffer, offset, bytes);
+    }
+    list.buffer_state(&staging, crate::host::BUFFER_READ);
+    Some((staging, 0))
+}
+
+/// Texture to texture on the GPU. A placed buffer source uses the host copy
+/// after a GPU write in this list, or an upload buffer filled at submission.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -541,30 +582,26 @@ extern "system" fn copy_texture_region(
             return;
         };
         let mut from = src;
-        let _upload; // keeps the source alive while this call records it
+        let _buffer; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let Some(bytes) = src.footprint.bytes() else {
                 return;
             };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
+            let Some((buffer, offset)) =
+                placed_copy_source(list, src.resource, src.footprint.offset, bytes)
+            else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
-            };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from.footprint.offset = offset;
             #[cfg(feature = "diagnostics")]
             {
-                // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                // SAFETY: a live buffer; the range is inside it.
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() } + offset, bytes));
             }
-            _upload = buffer;
+            _buffer = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
