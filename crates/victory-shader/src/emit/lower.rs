@@ -442,6 +442,22 @@ impl<'a> Lower<'a> {
                         .support(g)
                         .iter()
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                }) || insts().any(|i| {
+                    matches!(
+                        i.name(),
+                        "v_cndmask_b32"
+                            | "v_add_co_ci_u32"
+                            | "v_sub_co_ci_u32"
+                            | "v_subrev_co_ci_u32"
+                    ) && match &i.fields {
+                        Fields::Valu(v) => match v.src.get(2) {
+                            Some(&Operand::Scalar { code, .. }) => i
+                                .read(Reg::S(code))
+                                .is_none_or(|m| !x.st.masks.contains_key(&m)),
+                            _ => false,
+                        },
+                        _ => false,
+                    }
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
@@ -1695,6 +1711,47 @@ impl<'a> Lower<'a> {
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
+        }
+    }
+
+    /// This lane's bit from a mask operand (`v_cndmask_b32` / `*_ci_u32`):
+    /// uses the tracked boolean when `structure` followed it, handles inline
+    /// `0`/`-1` constants, or tests this console lane's bit of the scalar
+    /// mask register (pair in wave64) when console lanes are active.
+    fn mask_cond(
+        &mut self,
+        inst: &Inst,
+        op: Option<&Operand>,
+        at: usize,
+        err: Why,
+    ) -> Result<V, Why> {
+        match op {
+            Some(&Operand::Const(128)) => Ok(self.s.m.bool(false)),
+            Some(&Operand::Const(193)) => Ok(self.s.m.bool(true)),
+            Some(&Operand::Scalar { code, .. }) => {
+                if let Some(m) = inst
+                    .read(Reg::S(code))
+                    .and_then(|v| self.x.st.masks.get(&v).copied())
+                {
+                    return self.boolean(m, at);
+                }
+                if !self.console_lanes {
+                    return Err(err);
+                }
+                let lo = inst.read(Reg::S(code)).ok_or(err)?;
+                let lo = self.i32_of(lo)?;
+                let hi = if self.x.native.wave64 {
+                    match inst.read(Reg::S(code + 1)) {
+                        Some(v) => Some(self.i32_of(v)?),
+                        None => Some(self.s.m.i32(0)),
+                    }
+                } else {
+                    None
+                };
+                self.s.flags |= flags::WAVE_OPS;
+                Ok(self.lane_bit(at, lo, hi))
+            }
+            _ => Err(err),
         }
     }
 
@@ -3300,55 +3357,87 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
+        let (src, uav, props, image) = if let Some((at, first)) = use_at {
+            let src = Source::Loaded { load: site, first };
+            let used = self.used_kind(&src);
+            let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+            let un = ui.name();
+            let uav = un.contains("store")
+                || un.contains("atomic")
+                || used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let u = if uav { 0x1000 } else { 0 };
+            let (props, image) = match &ui.fields {
+                Fields::Image { dim, .. } => {
+                    let kind = match dim {
+                        0 => 1,
+                        1 => 2,
+                        2 => 4,
+                        4 => 6,
+                        5 => 7,
+                        _ => return Err("an image dimension (cube or MSAA)"),
+                    };
+                    ((kind | u, 0x409), Some(kind))
+                }
+                Fields::Buffer { idxen, format, .. } => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    let props = if un.starts_with("buffer_load_format")
+                        || un.starts_with("buffer_store_format")
+                    {
+                        (10 | u, 0x409)
+                    } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
+                    {
+                        (12 | u, stride)
+                    } else {
+                        (11 | u, 0)
+                    };
+                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    (props, None)
+                }
+                Fields::Smem { .. } if un.starts_with("s_buffer_load_dword") => {
+                    if !matches!(
+                        used.map(|u| u.kind),
+                        Some(ResourceType::Srv | ResourceType::Uav)
+                    ) {
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    ((11 | u, 0), None)
+                }
+                _ => return Err("a scalar memory read as data"),
+            };
+            (src, uav, props, image)
+        } else {
+            let src = Source::Loaded {
+                load: site,
+                first: 0,
+            };
+            let Some(used) = self.used_kind(&src) else {
+                return Err("a descriptor read only as data");
+            };
+            if used.kind == ResourceType::Cbv {
+                return Err("a constant buffer's descriptor read as data");
             }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+            if !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
+                return Err("a descriptor read only as data");
+            }
+            let uav = used.kind == ResourceType::Uav;
+            let u = if uav { 0x1000 } else { 0 };
+            let (props, image) = if used.dwords == 4 {
+                let stride = used.stride;
+                let props = if stride >= 4 && stride.is_multiple_of(4) {
                     (12 | u, stride)
                 } else {
                     (11 | u, 0)
                 };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
-                }
                 (props, None)
-            }
-            Fields::Smem { .. } if un.starts_with("s_buffer_load_dword") => {
-                if !matches!(
-                    used.map(|u| u.kind),
-                    Some(ResourceType::Srv | ResourceType::Uav)
-                ) {
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                ((11 | u, 0), None)
-            }
-            _ => return Err("a scalar memory read as data"),
+            } else {
+                ((2 | u, 0x409), Some(2))
+            };
+            (src, uav, props, image)
+        };
+        let Source::Loaded { first, .. } = src else {
+            unreachable!()
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -4575,11 +4664,17 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) if code != NULL => inst.read(Reg::S(code)),
-                    Some(&Operand::Scalar { .. })
-                    | Some(&Operand::Const(128))
-                    | Some(&Operand::Literal(0)) => {
+                let cond = match v.src.get(2) {
+                    Some(&Operand::Scalar { code, .. }) if code == NULL => {
+                        return if v.abs != 0 || v.neg != 0 {
+                            let a = f(self, 0)?;
+                            float(self, a)
+                        } else {
+                            let a = s(self, 0)?;
+                            int(self, a)
+                        };
+                    }
+                    Some(&Operand::Const(128)) | Some(&Operand::Literal(0)) => {
                         return if v.abs != 0 || v.neg != 0 {
                             let a = f(self, 0)?;
                             float(self, a)
@@ -4597,12 +4692,8 @@ impl<'a> Lower<'a> {
                             int(self, bb)
                         };
                     }
-                    _ => None,
+                    other => self.mask_cond(inst, other, c, "a select on an untracked mask")?,
                 };
-                let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
-                let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
                     let r = self.s.m.select(c, cond, bb, a);
@@ -4620,14 +4711,12 @@ impl<'a> Lower<'a> {
                     std::mem::swap(&mut a, &mut bb);
                 }
                 let cin = if name.ends_with("_ci_u32") {
-                    let m = match v.src.get(2) {
-                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                        _ => None,
-                    };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
-                    Some(self.boolean(m, c)?)
+                    Some(self.mask_cond(
+                        inst,
+                        v.src.get(2),
+                        c,
+                        "a carry-in from an untracked mask",
+                    )?)
                 } else {
                     None
                 };
