@@ -3019,3 +3019,90 @@ fn v_div_fixup_f16_matches_rdna2() {
         }
     });
 }
+
+#[test]
+fn v_sad_family_matches_rdna2() {
+    let vop3_clamp = |op: u16| -> [u32; 2] {
+        let [mut w0, w1] = vop3(op, 0, vgpr(1), vgpr(2), vgpr(3));
+        w0 |= 1 << 15; // clamp = 1
+        [w0, w1]
+    };
+
+    // v_sad_u8 (0x15a)
+    let sad_u8 = build_valu_cs(&vop3(0x15a, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let sad_u8_clamp = build_valu_cs(&vop3_clamp(0x15a));
+    // Bytes: |0x10-0x20|=16, |0xFF-0x00|=255, |0x05-0x05|=0, |0x80-0x70|=16 -> sum = 287
+    run_cases(
+        &sad_u8,
+        &[
+            [0x8005_FF10, 0x7005_0020, 100, 0],
+            [0xFFFF_FFFF, 0x0000_0000, u32::MAX - 10, 0], // wraps: (2^32 - 11) + 1020 = 1009
+        ],
+        |backend, i, _, got| {
+            let want = [387u32, 1009][i];
+            assert_eq!(got, want, "{backend}: v_sad_u8 case {i}");
+        },
+    );
+    run_cases(
+        &sad_u8_clamp,
+        &[[0xFFFF_FFFF, 0x0000_0000, u32::MAX - 10, 0]], // saturates to u32::MAX
+        |backend, _, _, got| {
+            assert_eq!(got, u32::MAX, "{backend}: v_sad_u8 clamp");
+        },
+    );
+
+    // v_msad_u8 (0x171): zero bytes in src0 contribute 0 regardless of src1.
+    let msad_u8 = build_valu_cs(&vop3(0x171, 0, vgpr(1), vgpr(2), vgpr(3)));
+    // Byte 0: src0=0x00 -> skipped (even though src1=0xFF)
+    // Byte 1: |0x10-0x00| = 16 (src1=0 is NOT skipped!)
+    // Byte 2: src0=0x00 -> skipped
+    // Byte 3: |0x80-0x70| = 16 -> sum = 32
+    run_cases(
+        &msad_u8,
+        &[[0x8000_1000, 0x70AA_00FF, 5, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, 37, "{backend}: v_msad_u8");
+        },
+    );
+
+    // v_sad_u16 (0x15c)
+    let sad_u16 = build_valu_cs(&vop3(0x15c, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let sad_u16_clamp = build_valu_cs(&vop3_clamp(0x15c));
+    // Low: |0x0100 - 0x0300| = 0x200; High: |0xFFFF - 0x0001| = 0xFFFE -> sum = 0x101FE
+    run_cases(
+        &sad_u16,
+        &[[0xFFFF_0100, 0x0001_0300, 2, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, 0x10200, "{backend}: v_sad_u16");
+        },
+    );
+    run_cases(
+        &sad_u16_clamp,
+        &[[0xFFFF_FFFF, 0x0000_0000, u32::MAX - 5, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, u32::MAX, "{backend}: v_sad_u16 clamp");
+        },
+    );
+
+    // v_sad_u32 (0x15d)
+    let sad_u32 = build_valu_cs(&vop3(0x15d, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let sad_u32_clamp = build_valu_cs(&vop3_clamp(0x15d));
+    run_cases(
+        &sad_u32,
+        &[
+            [10, 30, 5, 0],
+            [0xFFFF_FFFF, 0, 10, 0], // wraps: (2^32 - 1) + 10 = 9
+        ],
+        |backend, i, _, got| {
+            let want = [25u32, 9][i];
+            assert_eq!(got, want, "{backend}: v_sad_u32 case {i}");
+        },
+    );
+    run_cases(
+        &sad_u32_clamp,
+        &[[0xFFFF_FFFF, 0, 10, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, u32::MAX, "{backend}: v_sad_u32 clamp");
+        },
+    );
+}

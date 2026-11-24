@@ -6840,6 +6840,28 @@ impl<'a> Lower<'a> {
                 let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
+            "v_sad_u8" | "v_msad_u8" | "v_sad_u16" | "v_sad_u32" => {
+                if v.omod != 0 || v.abs != 0 || v.neg != 0 {
+                    return Err("integer output modifiers");
+                }
+                let (a, b, acc) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let delta = match name {
+                    "v_sad_u8" | "v_msad_u8" => self.sad_lanes(a, b, 8, 4, name == "v_msad_u8"),
+                    "v_sad_u16" => self.sad_lanes(a, b, 16, 2, false),
+                    _ => self.abs_diff_u32(a, b),
+                };
+                let mut r = self.s.m.bin(c, Bin::Add, acc, delta);
+                if v.clamp {
+                    let over = self.s.m.cmp(c, pred::IULT, r, acc);
+                    let max = self.s.m.i32(u32::MAX);
+                    r = self.s.m.select(c, over, max, r);
+                }
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a result without a register");
+                };
+                self.write(inst, Reg::V(reg), r, guard);
+                Ok(())
+            }
             _ => {
                 let r = self.integer(inst, name)?;
                 int(self, r)
@@ -6909,6 +6931,49 @@ impl<'a> Lower<'a> {
                 Ok((x, self.s.m.i32(0)))
             }
         }
+    }
+
+    /// `|a - b|` for unsigned 32-bit values.
+    fn abs_diff_u32(&mut self, a: V, b: V) -> V {
+        let c = self.cur;
+        let ab = self.s.m.bin(c, Bin::Sub, a, b);
+        let ba = self.s.m.bin(c, Bin::Sub, b, a);
+        let ge = self.s.m.cmp(c, pred::IUGE, a, b);
+        self.s.m.select(c, ge, ab, ba)
+    }
+
+    /// Sum of unsigned absolute differences across `lanes` packed elements of
+    /// `bits` width (`8` or `16`). With `masked`, lanes where `a`'s element is
+    /// zero contribute 0 (`v_msad_u8`).
+    fn sad_lanes(&mut self, a: V, b: V, bits: u32, lanes: u32, masked: bool) -> V {
+        let c = self.cur;
+        let mask = self.s.m.i32((1u32 << bits) - 1);
+        let zero = self.s.m.i32(0);
+        let mut total = zero;
+        for lane in 0..lanes {
+            let (xa, xb) = if lane == 0 {
+                (a, b)
+            } else {
+                let sh = self.s.m.i32(lane * bits);
+                (
+                    self.s.m.bin(c, Bin::LShr, a, sh),
+                    self.s.m.bin(c, Bin::LShr, b, sh),
+                )
+            };
+            let xa = self.s.m.bin(c, Bin::And, xa, mask);
+            let xb = self.s.m.bin(c, Bin::And, xb, mask);
+            let mut diff = self.abs_diff_u32(xa, xb);
+            if masked {
+                let is_zero = self.s.m.cmp(c, pred::EQ, xa, zero);
+                diff = self.s.m.select(c, is_zero, zero, diff);
+            }
+            total = if lane == 0 {
+                diff
+            } else {
+                self.s.m.bin(c, Bin::Add, total, diff)
+            };
+        }
+        total
     }
 
     /// A 64-bit source (a register pair; inline constants sign-extend).
