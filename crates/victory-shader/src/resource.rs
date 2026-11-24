@@ -1703,7 +1703,7 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
             || v.neg != 0
             || v.sdwa.is_some()
             || v.dpp.is_some()
-            || !matches!(inst.name(), "v_mov_b32" | "v_readfirstlane_b32")
+            || inst.name() != "v_mov_b32"
         {
             return None;
         }
@@ -3090,37 +3090,5 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
-    }
-
-    #[test]
-    fn descriptors_copied_through_vgprs_and_readfirstlane_are_tracked() {
-        let r = track_words(
-            &[
-                0xBE82_0309, // s_mov_b32 s2, s9
-                0xBE83_0380, // s_mov_b32 s3, 0
-                0xF408_0201,
-                0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], null
-                0x7E00_0208, // v_mov_b32 v0, s8
-                0x7E02_0209, // v_mov_b32 v1, s9
-                0x7E04_020A, // v_mov_b32 v2, s10
-                0x7E06_020B, // v_mov_b32 v3, s11
-                0x7E08_0500, // v_readfirstlane_b32 s4, v0
-                0x7E0A_0501, // v_readfirstlane_b32 s5, v1
-                0x7E0C_0502, // v_readfirstlane_b32 s6, v2
-                0x7E0E_0503, // v_readfirstlane_b32 s7, v3
-                0xF420_0002,
-                0xFA00_0000, // s_buffer_load_dword s0, s[4:7], null
-                S_ENDPGM,
-            ],
-            &[param(Table, 9, 1)],
-            HwStage::Ps,
-        );
-        assert_eq!(
-            r.descriptors[0].source,
-            Source::Loaded {
-                load: (0, 2),
-                first: 0
-            }
-        );
     }
 }
