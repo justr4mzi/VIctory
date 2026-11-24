@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Memory::{
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    SEC_RESERVE, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -733,7 +733,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     }
     if !commit(base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+        unsafe { victory_gpu::unmap_title_view(base, len) };
         return false;
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
@@ -816,17 +816,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
-        victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
-        };
+        unsafe { victory_gpu::unmap_title_view(at, size) };
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
