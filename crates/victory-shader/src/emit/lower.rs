@@ -300,6 +300,7 @@ enum MaskData {
 }
 
 /// What a value holding a lane mask read as a number stops with.
+const DESCRIPTOR_OTHER: Why = "a descriptor's address or format read as data";
 const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
@@ -3515,7 +3516,7 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
+        const OTHER: Why = DESCRIPTOR_OTHER;
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -9049,6 +9050,14 @@ impl<'a> Lower<'a> {
                         if self.x.st.masks.contains_key(&arg)
                             || self.x.st.highs.contains_key(&arg) =>
                     {
+                        self.s.m.undef(self.s.t.i32)
+                    }
+                    // A descriptor's address or format dword reaching a join
+                    // that also takes data: the console reuses the registers
+                    // once the descriptor is dead.
+                    // shortcut: undefined on that edge, assuming the program
+                    // reads the joined value only on paths from a data edge.
+                    (Some(Val::Missing(why)), false) if why == DESCRIPTOR_OTHER => {
                         self.s.m.undef(self.s.t.i32)
                     }
                     (Some(Val::Missing(why)), _)
