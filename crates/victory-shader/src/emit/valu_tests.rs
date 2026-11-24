@@ -2834,3 +2834,89 @@ fn v_ldexp_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_pk_fmac_f16_matches_rdna2() {
+    // VOP2 `v_pk_fmac_f16 v0, v1, v2` (opcode 0x3c), initialized from v3 (root constant s2).
+    let vop2_cs = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(3)),          // v_mov_b32 v0, v3 (accumulator)
+        vop2(0x3c, 0, vgpr(1), 2),        // v_pk_fmac_f16 v0, v1, v2
+    ]);
+    // VOP2 with inline constant 1.0 (0xF2): GFX10 puts 1.0 in lo f16 and 0.0 in hi f16.
+    let vop2_inline_cs = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(3)),          // v_mov_b32 v0, v3
+        vop2(0x3c, 0, 0xF2, 2),           // v_pk_fmac_f16 v0, 1.0, v2
+    ]);
+    // VOP3 `v_pk_fmac_f16 v0, |v1|, -v2 clamp` (opcode 0x13c): abs[0], neg[1], clamp.
+    let [mut w0, mut w1] = vop3(0x13c, 0, vgpr(1), vgpr(2), 0);
+    w0 |= (1 << 8) | (1 << 15); // abs[0], clamp
+    w1 |= 1 << 30;              // neg[1]
+    let vop3_mod_cs = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(3)), // v_mov_b32 v0, v3
+        w0,
+        w1,
+    ]);
+
+    let pack = |lo: u16, hi: u16| u32::from(lo) | (u32::from(hi) << 16);
+    // f16 constants: 0.0=0x0000, 0.5=0x3800, 1.0=0x3C00, 2.0=0x4000, 3.0=0x4200,
+    // 4.0=0x4400, 5.0=0x4500, 7.0=0x4700, 10.0=0x4900, -2.0=0xC000, -3.0=0xC200.
+    let vop2_cases: &[([u32; 4], u32)] = &[
+        // lo: 2.0 * 3.0 + 1.0 = 7.0; hi: -2.0 * 4.0 + 10.0 = 2.0
+        (
+            [pack(0x4000, 0xC000), pack(0x4200, 0x4400), pack(0x3C00, 0x4900), 0],
+            pack(0x4700, 0x4000),
+        ),
+        // lo: 0.5 * 4.0 + 3.0 = 5.0; hi: 0.0 * 7.0 + (-3.0) = -3.0
+        (
+            [pack(0x3800, 0x0000), pack(0x4400, 0x4700), pack(0x4200, 0xC200), 0],
+            pack(0x4500, 0xC200),
+        ),
+    ];
+    let vop2_in: Vec<[u32; 4]> = vop2_cases.iter().map(|c| c.0).collect();
+    run_cases(&vop2_cs, &vop2_in, |backend, i, inp, got| {
+        let want = vop2_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_pk_fmac_f16({:#010x}, {:#010x}, acc={:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+
+    // Inline 1.0: lo = 1.0 * 3.0 + 2.0 = 5.0; hi = 0.0 * 4.0 + 7.0 = 7.0 (unchanged).
+    run_cases(
+        &vop2_inline_cs,
+        &[[0, pack(0x4200, 0x4400), pack(0x4000, 0x4700), 0]],
+        |backend, _, _, got| {
+            let want = pack(0x4500, 0x4700);
+            assert_eq!(
+                got, want,
+                "{backend}: v_pk_fmac_f16(1.0, ...) = {got:#010x}, want {want:#010x}",
+            );
+        },
+    );
+
+    // VOP3 abs[0], neg[1], clamp:
+    // lo: |-2.0| * (-0.5) + 1.5(=0x3E00) = 0.5 (in [0, 1]) -> 0x3800
+    // hi: |-2.0| * (-2.0) + 1.0 = -3.0 -> clamped to 0.0 (0x0000)
+    // case 2: lo: |-2.0| * (-(-1.0)) + 0.5 = 2.5 -> clamped to 1.0 (0x3C00)
+    //         hi: |0.5| * (-(-0.5)) + 0.25(=0x3400) = 0.5 (0x3800)
+    let vop3_cases: &[([u32; 4], u32)] = &[
+        (
+            [pack(0xC000, 0xC000), pack(0x3800, 0x4000), pack(0x3E00, 0x3C00), 0],
+            pack(0x3800, 0x0000),
+        ),
+        (
+            [pack(0xC000, 0x3800), pack(0xBC00, 0xB800), pack(0x3800, 0x3400), 0],
+            pack(0x3C00, 0x3800),
+        ),
+    ];
+    let vop3_in: Vec<[u32; 4]> = vop3_cases.iter().map(|c| c.0).collect();
+    run_cases(&vop3_mod_cs, &vop3_in, |backend, i, inp, got| {
+        let want = vop3_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_pk_fmac_f16_e64(|{:#010x}|, -{:#010x}, acc={:#010x}) clamp = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}

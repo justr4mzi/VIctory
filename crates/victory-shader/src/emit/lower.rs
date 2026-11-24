@@ -6143,6 +6143,9 @@ impl<'a> Lower<'a> {
         if let Some(r) = self.valu16(inst, name, guard) {
             return r;
         }
+        if name == "v_pk_fmac_f16" {
+            return self.pk_fmac_f16(inst, guard);
+        }
         if let Some(op) = name.strip_prefix("v_pk_") {
             return self.packed16(inst, op, guard);
         }
@@ -7405,6 +7408,89 @@ impl<'a> Lower<'a> {
         };
         let m = self.s.m.i32(0xFFFF);
         Ok(self.s.m.bin(c, Bin::And, x, m))
+    }
+
+    /// `v_pk_fmac_f16` (VOP2 `0x3c` / VOP3 `0x13c`): two packed f16
+    /// multiply-accumulates (`d.lo = s0.lo * s1.lo + d.lo`, same for `hi`).
+    /// VOP3 `abs`/`neg`/`omod`/`clamp` apply to both halves.
+    fn pk_fmac_f16(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() {
+            return Err("SDWA on v_pk_fmac_f16");
+        }
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a packed result outside a VGPR");
+        };
+        let c = self.cur;
+        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let old = match inst.read(Reg::V(reg)) {
+            Some(o) => self.i32_of(o)?,
+            None => self.s.m.i32(0),
+        };
+        let s0_raw = match self.src0 {
+            Some(x) => x,
+            None => {
+                let op = *v.src.first().ok_or("a missing operand")?;
+                self.f16_operand(inst, &op)?
+            }
+        };
+        let op1 = *v.src.get(1).ok_or("a missing operand")?;
+        let s1_raw = self.f16_operand(inst, &op1)?;
+
+        let k16 = self.s.m.i32(16);
+        let m16 = self.s.m.i32(0xFFFF);
+        let mut halves = Vec::with_capacity(2);
+        for high in [false, true] {
+            let mut lane_f = |raw: V, k: usize| {
+                let h = if high {
+                    self.s.m.bin(c, Bin::LShr, raw, k16)
+                } else {
+                    raw
+                };
+                let h = self.s.m.bin(c, Bin::And, h, m16);
+                let mut f = self
+                    .s
+                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+                if v.abs >> k & 1 != 0 {
+                    f = self.unary(6, f);
+                }
+                if v.neg >> k & 1 != 0 {
+                    let z = self.s.m.f32(0x8000_0000);
+                    f = self.s.m.bin(c, Bin::Sub, z, f);
+                }
+                f
+            };
+            let a = lane_f(s0_raw, 0);
+            let b = lane_f(s1_raw, 1);
+            let acc_h = if high {
+                self.s.m.bin(c, Bin::LShr, old, k16)
+            } else {
+                old
+            };
+            let acc_h = self.s.m.bin(c, Bin::And, acc_h, m16);
+            let acc = self
+                .s
+                .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[acc_h]);
+            let mut f = self.fmad(a, b, acc);
+            if v.omod != 0 {
+                let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+                let kf = self.s.m.f32(factor.to_bits());
+                f = self.s.m.bin(c, Bin::Mul, f, kf);
+            }
+            if v.clamp {
+                f = self.unary(7, f);
+            }
+            let h = self
+                .s
+                .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+            halves.push(self.s.m.bin(c, Bin::And, h, m16));
+        }
+        let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
+        let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
+        self.write(inst, Reg::V(reg), r, guard);
+        Ok(())
     }
 
     /// Packed 16-bit operations (`v_pk_*`): each half computed as the
