@@ -8410,6 +8410,14 @@ impl<'a> Lower<'a> {
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
         };
+        // The words before the coordinates (texel offsets, bias, reference)
+        // take a whole VGPR each, a16 or not; with a16 the bias is an f16 in
+        // its low half, and the 16-bit coordinates start at the next VGPR.
+        let extra_dword = |l: &mut Self, k: usize| -> Result<V, Why> {
+            let r = *regs.get(k).ok_or("an image address")?;
+            let v = inst.read(Reg::V(r)).ok_or("an image address")?;
+            l.i32_of(v)
+        };
         let src = self
             .descriptors
             .get(&(site, false))
@@ -8634,13 +8642,17 @@ impl<'a> Lower<'a> {
             // Each of these takes a whole dword, with a16 too (a bias then
             // is f16 in the low half): the addresses after them start at the
             // next dword, two 16-bit halves per extra.
-            let extras =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
-            let first = if *a16 { 2 * extras } else { extras };
+            let extras = usize::from(offset_word)
+                + usize::from(name.starts_with("image_sample_b"))
+                + usize::from(cmp);
+            let first = extras;
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
             let grads = if op == 63 { 2 * spatial } else { 0 };
+            // Where the coordinates start, in address components: with a16
+            // two per VGPR, after `first` whole VGPRs.
+            let base = if *a16 { 2 * first } else { first };
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -8654,7 +8666,7 @@ impl<'a> Lower<'a> {
             // CalculateLOD takes only spatial coordinates, even for an array.
             let active_coords = if op == 81 { spatial } else { coords };
             for (k, slot) in cs.iter_mut().enumerate().take(active_coords) {
-                let x = addr_val(self, first + grads + k)?;
+                let x = addr_val(self, base + grads + k)?;
                 *slot = to_float(self, x);
             }
             if matches!(kind, 5 | 9) {
@@ -8719,10 +8731,21 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, shs[0]];
             args.extend(&cs);
             let clamp = if name.contains("_cl") {
-                let x = addr_val(self, first + grads + coords)?;
+                let x = addr_val(self, base + grads + coords)?;
                 to_float(self, x)
             } else {
                 fu
+            };
+            let sample_bias = |l: &mut Self| -> Result<V, Why> {
+                let bias = extra_dword(l, 0)?;
+                Ok(if *a16 {
+                    let mask = l.s.m.i32(0xFFFF);
+                    let half = l.s.m.bin(c, Bin::And, bias, mask);
+                    let f = l.s.t.f32;
+                    l.s.op(c, "legacyF16ToF32", Attr::ReadNone, f, 131, &[half])
+                } else {
+                    l.as_float(bias)
+                })
             };
             // In compute shaders an implicit level of detail comes from
             // the lanes' quads, as the hardware takes it: DXIL derivatives
@@ -8738,8 +8761,7 @@ impl<'a> Lower<'a> {
                     let mut g = self.quad_gradients(&cs[..spatial]);
                     if op == 61 {
                         // A bias scales the footprint by 2^bias.
-                        let bias = addr_val(self, 0)?;
-                        let bias = to_float(self, bias);
+                        let bias = sample_bias(self)?;
                         let scale = self.unary(21, bias);
                         for x in g.iter_mut().filter(|x| **x != fu) {
                             *x = self.s.m.bin(c, Bin::Mul, *x, scale);
@@ -8757,7 +8779,7 @@ impl<'a> Lower<'a> {
                     if offset_word {
                         // DXIL takes immediate offsets in -8..=7; the
                         // console's are 6-bit and may be computed.
-                        let w = addr_val(self, 0)?;
+                        let w = extra_dword(self, 0)?;
                         let w = self
                             .s
                             .m
@@ -8778,8 +8800,7 @@ impl<'a> Lower<'a> {
                     ("sample.f32", 60)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
-                    let bias = to_float(self, bias);
+                    let bias = sample_bias(self)?;
                     args.extend(&os);
                     args.extend([bias, clamp]);
                     ("sampleBias.f32", 61)
@@ -8787,13 +8808,13 @@ impl<'a> Lower<'a> {
                 63 => {
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
-                        let x = addr_val(self, first + k)?;
+                        let x = addr_val(self, base + k)?;
                         g[k] = to_float(self, x);
-                        let y = addr_val(self, first + spatial + k)?;
+                        let y = addr_val(self, base + spatial + k)?;
                         g[3 + k] = to_float(self, y);
                     }
                     let clamp = if name == "image_sample_d_cl" {
-                        let x = addr_val(self, first + grads + coords)?;
+                        let x = addr_val(self, base + grads + coords)?;
                         to_float(self, x)
                     } else {
                         fu
@@ -8838,7 +8859,7 @@ impl<'a> Lower<'a> {
                         if matches!(kind, 5 | 9) {
                             return Err("a cube gather with an offset");
                         }
-                        let w = addr_val(self, 0)?;
+                        let w = extra_dword(self, 0)?;
                         for (k, at) in [(0, 26), (1, 18)] {
                             // Bits at..at+5 sign-extended: shift up, then down.
                             let left = self.s.m.i32(at);
@@ -10985,6 +11006,33 @@ mod tests {
         // lane's own entry.
         assert_eq!(l.nonuniform_handles, 2);
         assert!(!l.wave_ops);
+    }
+
+    #[test]
+    fn a_biased_sample_of_16_bit_coordinates_reads_the_bias_from_its_own_vgpr() {
+        // With a16 the bias takes a whole VGPR, an f16 in its low half, and
+        // the packed 16-bit coordinates start at the next one: v2 holds the
+        // bias (-1.0 as f16), v3 the coordinates (0, 0).
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+            0xF408_0403,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], null
+            0x7E04_02FF,
+            0x0000_BC00, // v_mov_b32 v2, 0xbc00
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xF094_0108,
+            0x4082_0102, // image_sample_b v1, v[2:3], s[8:15], s[16:19] dmask:0x1 dim:2D a16
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_tables();
+        lower_with(&words, layout, used).unwrap();
     }
 
     /// [`texture_tables`] with a raw buffer UAV at dword 16 of the first.
