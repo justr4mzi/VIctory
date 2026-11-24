@@ -7167,6 +7167,7 @@ impl<'a> Lower<'a> {
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
         // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
         // lowering accepts what it refuses when the same value is read directly.
+        let direct_reads = self.read_phis.clone();
         let mut work: Vec<Value> = self.read_phis.iter().copied().collect();
         while let Some(v) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
@@ -7191,7 +7192,11 @@ impl<'a> Lower<'a> {
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Missing(why)), _)
+                        if direct_reads.contains(&phi.value)
+                            || (self.read_phis.contains(&phi.value)
+                                && (why.contains("s_memtime") || why.contains("scalar memory"))) =>
+                    {
                         return Err(Stop::Retry(phi.value, why));
                     }
                     _ if self.read_phis.contains(&phi.value) => {
