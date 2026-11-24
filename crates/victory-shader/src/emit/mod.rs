@@ -157,6 +157,10 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Table descriptors loaded at constant offsets, with the DXIL resource
+    /// properties the shader annotates them with (sorted by `(slot, dword)`,
+    /// deduplicated; UAV annotations take precedence).
+    pub table_views: Vec<TableView>,
 }
 
 impl HostShader {
@@ -184,6 +188,19 @@ pub struct UserData {
     pub root: RootType,
     /// Dword within the parameter.
     pub dword: u32,
+}
+
+/// One table descriptor loaded at a constant offset and the DXIL resource
+/// properties (`dx.types.ResourceProperties`) the shader annotates it with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableView {
+    /// Root parameter index of the descriptor table.
+    pub slot: u8,
+    /// Dword offset of the descriptor within the table.
+    pub dword: u32,
+    /// Resource kind and flags (UAV bit `0x1000`) in `.0`; component
+    /// type/count or structure stride in `.1`.
+    pub props: (u32, u32),
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -309,6 +326,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        table_views: l.table_views,
     })
 }
 
@@ -566,6 +584,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            table_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -576,6 +595,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                table_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

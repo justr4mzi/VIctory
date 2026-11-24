@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, TableView, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -89,8 +89,8 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         "shader.dxil"
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
-        1
+        // Bumped with MAGIC when the encoded HostShader layout changes.
+        2
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
@@ -131,7 +131,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -210,6 +210,12 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, s.table_views.len() as u32);
+    for v in &s.table_views {
+        for w in [u32::from(v.slot), v.dword, v.props.0, v.props.1] {
+            word(&mut out, w);
+        }
+    }
     out
 }
 
@@ -266,6 +272,15 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let n = r.word()? as usize;
+    let mut table_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        table_views.push(TableView {
+            slot: u8::try_from(r.word()?).ok()?,
+            dword: r.word()?,
+            props: (r.word()?, r.word()?),
+        });
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -274,6 +289,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        table_views,
     })
 }
 
@@ -300,6 +316,18 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            table_views: vec![
+                TableView {
+                    slot: 1,
+                    dword: 8,
+                    props: (11 | 0x1000, 0),
+                },
+                TableView {
+                    slot: 1,
+                    dword: 16,
+                    props: (12 | 0x1000, 32),
+                },
+            ],
         }
     }
 
@@ -324,7 +352,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -355,5 +383,6 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+        assert_eq!(decode(b"VSH1"), None);
     }
 }

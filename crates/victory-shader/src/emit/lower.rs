@@ -8,10 +8,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
+use super::{TableView, UserData};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -43,6 +43,7 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    pub table_views: Vec<TableView>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -168,6 +169,7 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    table_views: BTreeMap<(u8, u32), (u32, u32)>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -375,6 +377,13 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Deterministic preference when the same table slot is annotated with
+/// multiple DXIL `ResourceProperties`: UAV annotations win over non-UAV ones.
+fn prefer_props(cur: (u32, u32), new: (u32, u32)) -> (u32, u32) {
+    let key = |p: (u32, u32)| (p.0 & 0x1000 != 0, p);
+    if key(new) > key(cur) { new } else { cur }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -501,6 +510,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            table_views: BTreeMap::new(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -931,6 +941,11 @@ impl<'a> Lower<'a> {
         }
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
+        let table_views = self
+            .table_views
+            .into_iter()
+            .map(|((slot, dword), props)| TableView { slot, dword, props })
+            .collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
@@ -946,6 +961,7 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            table_views,
         })
     }
 
@@ -3568,6 +3584,31 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    /// Records the DXIL annotation of a view descriptor loaded from a table at
+    /// a constant offset, so the host can place a matching null descriptor when
+    /// the title has no view at that slot.
+    // shortcut: dynamically indexed table descriptors (`a.dynamic.is_some()`)
+    // are not recorded; their empty slots keep the host's default null view.
+    fn record_table_view(&mut self, load: Site, first: u8, props: (u32, u32)) {
+        let Some(a) = self.scalar.get(&load) else {
+            return;
+        };
+        if a.dynamic.is_some() {
+            return;
+        }
+        let Some(rp) = self.x.native.layout.get(a.param) else {
+            return;
+        };
+        if rp.root != RootType::Table {
+            return;
+        }
+        let dword = (a.offset / 4) + u32::from(first);
+        self.table_views
+            .entry((rp.slot, dword))
+            .and_modify(|cur| *cur = prefer_props(*cur, props))
+            .or_insert(props);
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
         &mut self,
@@ -3586,6 +3627,10 @@ impl<'a> Lower<'a> {
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
+                // Its offset is only the first lane's, so it is not recorded.
+                if !sampler && !per_lane {
+                    self.record_table_view(*load, *first, props);
+                }
                 let h = self
                     .s
                     .heap_handle(self.cur, index, sampler, per_lane, props);
@@ -3641,6 +3686,7 @@ impl<'a> Lower<'a> {
                 // join picks one with a phi.
                 let _ = site;
                 let mut incoming = Vec::new();
+                let mut loaded = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
                     if self.block[q].is_none() {
                         continue;
@@ -3653,8 +3699,14 @@ impl<'a> Lower<'a> {
                     let index = self.heap_index(*load, *first, sampler);
                     self.cur = here;
                     incoming.push((index?, at));
+                    loaded.push((*load, *first));
                 }
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+                if !sampler {
+                    for (load, first) in loaded {
+                        self.record_table_view(load, first, props);
+                    }
+                }
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
                 Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
@@ -3674,6 +3726,10 @@ impl<'a> Lower<'a> {
                 };
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
+                if !sampler {
+                    self.record_table_view(a, fa, props);
+                    self.record_table_view(b, fb, props);
+                }
                 let index = self.s.m.select(self.cur, cond, set, clear);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
@@ -7331,7 +7387,7 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, TableView, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -7379,6 +7435,71 @@ mod tests {
         assert_eq!(p.get(&0), Some(&1));
         assert_eq!(p.get(&3), Some(&4));
         assert_eq!(p.get(&5), None);
+    }
+
+    const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
+        0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
+    }
+
+    /// `s_load_dwordx4 s[dst:dst+3], s[base:base+1], offset` with `soffset`
+    /// (`125` = NULL, `0..105` = SGPR).
+    const fn s_load_dwordx4(dst: u8, base: u8, offset: u32, soffset: u8) -> [u32; 2] {
+        [
+            0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+            (soffset as u32) << 25 | (offset & 0x1F_FFFF),
+        ]
+    }
+
+    const fn buffer_load_dword(vdata: u8, srsrc: u8, idxen: bool) -> [u32; 2] {
+        [
+            0x38 << 26 | 0x0C << 18 | (idxen as u32) << 13,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+        ]
+    }
+
+    const fn buffer_store_dword(vdata: u8, srsrc: u8, idxen: bool) -> [u32; 2] {
+        [
+            0x38 << 26 | 0x1C << 18 | (idxen as u32) << 13,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+        ]
+    }
+
+    fn lower_table_views(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        user_sgprs: u8,
+    ) -> Vec<TableView> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout,
+            used,
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: u32::from(user_sgprs) << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap()
+        .table_views
     }
 
     /// Whether a synthetic compute program translates with these input registers.
@@ -7947,5 +8068,161 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
+    }
+
+    #[test]
+    fn table_views_record_srv_uav_structured_and_skip_dynamic() {
+        let layout = vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 16,
+                lower_bound: 1,
+                stride: 32,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+        ];
+        let mut words = vec![s_mov_b32(5, 0x80)];
+        words.extend_from_slice(&s_load_dwordx4(8, 4, 0, 125));
+        words.extend_from_slice(&s_load_dwordx4(12, 4, 32, 125));
+        words.extend_from_slice(&s_load_dwordx4(16, 4, 64, 125));
+        words.push(0x7E28_0500); // v_readfirstlane_b32 s20, v0: an offset from no root parameter
+        words.extend_from_slice(&s_load_dwordx4(20, 4, 96, 20)); // dynamic soffset s20
+        words.extend_from_slice(&buffer_load_dword(0, 8, false));
+        words.extend_from_slice(&buffer_store_dword(0, 12, false));
+        words.extend_from_slice(&buffer_store_dword(0, 16, true));
+        words.extend_from_slice(&buffer_store_dword(0, 20, false));
+        words.push(S_ENDPGM);
+
+        assert_eq!(
+            lower_table_views(&words, layout, used, 5),
+            vec![
+                TableView {
+                    slot: 1,
+                    dword: 0,
+                    props: (11, 0),
+                },
+                TableView {
+                    slot: 1,
+                    dword: 8,
+                    props: (11 | 0x1000, 0),
+                },
+                TableView {
+                    slot: 1,
+                    dword: 16,
+                    props: (12 | 0x1000, 32),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn table_views_prefer_uav_and_record_phi_arms() {
+        let layout = vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ];
+        // Same table slot read as SRV and written as UAV: UAV wins in either order.
+        for load_first in [true, false] {
+            let mut words = vec![s_mov_b32(5, 0x80)];
+            words.extend_from_slice(&s_load_dwordx4(8, 4, 32, 125));
+            if load_first {
+                words.extend_from_slice(&buffer_load_dword(0, 8, false));
+                words.extend_from_slice(&buffer_store_dword(0, 8, false));
+            } else {
+                words.extend_from_slice(&buffer_store_dword(0, 8, false));
+                words.extend_from_slice(&buffer_load_dword(0, 8, false));
+            }
+            words.push(S_ENDPGM);
+            assert_eq!(
+                lower_table_views(&words, layout.clone(), vec![], 5),
+                vec![TableView {
+                    slot: 1,
+                    dword: 8,
+                    props: (11 | 0x1000, 0),
+                }]
+            );
+        }
+
+        // Control-flow join (`Source::Phi`) records both incoming table slots.
+        let mut phi_words = vec![
+            s_mov_b32(5, 0x80),
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_0003, // s_cbranch_scc1 +3 dwords -> arm 2
+        ];
+        phi_words.extend_from_slice(&s_load_dwordx4(8, 4, 32, 125)); // arm 1 (2 dwords)
+        phi_words.push(0xBF82_0002); // s_branch +2 dwords -> join (1 dword)
+        phi_words.extend_from_slice(&s_load_dwordx4(8, 4, 64, 125)); // arm 2 (2 dwords)
+        phi_words.extend_from_slice(&buffer_store_dword(0, 8, false));
+        phi_words.push(S_ENDPGM);
+        assert_eq!(
+            lower_table_views(&phi_words, layout, vec![], 5),
+            vec![
+                TableView {
+                    slot: 1,
+                    dword: 8,
+                    props: (11 | 0x1000, 0),
+                },
+                TableView {
+                    slot: 1,
+                    dword: 16,
+                    props: (11 | 0x1000, 0),
+                },
+            ]
+        );
     }
 }
