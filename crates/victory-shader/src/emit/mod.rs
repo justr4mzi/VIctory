@@ -74,6 +74,17 @@
 //!   count as `DispatchMesh(x, 1, 1)`. Per-primitive outputs (`PSG1`) are
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
+//! * **Geometry shaders** (added 2026-11-24; [`translate`] still picks
+//!   the VS, [`translate_stage`] the ES or GS half): the console's legacy ES-GS pair (rings in LDS).
+//!   The ES half of a vertex container ([`HwStage::Es`]) becomes a vertex
+//!   shader whose outputs are the container's `OSG1` (ESGS parameter n must
+//!   be row n). The GS half ([`HwStage::Gs`], `gs_6_6`) reads input row n
+//!   of each vertex where the console reads ESGS dwords 4n..4n+3, keeps
+//!   what it writes to the GSVS ring in a per-thread array, and at each
+//!   emit stores the outputs the embedded copy shader would export from it
+//!   (its `OSG1`, so the title's pixel shaders link) then `EmitStream`;
+//!   triangles in, triangle strips out, one stream, the record's maximum
+//!   vertex count. User data and descriptors as above.
 
 mod bitcode;
 pub mod clamp;
@@ -208,21 +219,40 @@ pub struct TableView {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_program(
+        container,
+        |s| matches!(s, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms),
+        "a container without a vertex, pixel, compute or mesh program",
+    )
+}
+
+/// Translates the container's program of hardware stage `stage`: for a
+/// pipeline with a geometry stage, [`HwStage::Es`] of the vertex container
+/// (the vertex shader that feeds it) and [`HwStage::Gs`] of the geometry
+/// container. Other stages are what [`translate`] picks.
+pub fn translate_stage(container: &[u8], stage: HwStage) -> Result<HostShader, ShaderError> {
+    translate_program(
+        container,
+        |s| s == stage,
+        "a container without a program of the stage asked for",
+    )
+}
+
+fn translate_program(
+    container: &[u8],
+    wanted: impl Fn(HwStage) -> bool,
+    missing: &'static str,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
         .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-            )
-        })
+        .find(|p| wanted(p.stage))
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: missing,
         })?;
     let spilled = native.spills_root_args();
     let p = ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)?;
