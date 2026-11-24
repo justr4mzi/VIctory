@@ -1882,4 +1882,85 @@ mod barycentric_tests {
             v.validate(&mut out.dxil.clone()).unwrap();
         }
     }
+
+    #[test]
+    fn reading_a_packed_input_padding_half_yields_zero() {
+        // v_interp_p1ll_f16 v4, v0, attr0.y high
+        // v_interp_p2_f16 v4, v1, attr0.y, v4 high
+        // exp mrt0, v4, v4, v4, v4 done compr vm
+        // s_endpgm
+        let words = [
+            0xD742_0004u32,
+            0x0002_0140,
+            0xD75A_0004,
+            0x0412_0340,
+            0xF800_180F,
+            0x0404_0404,
+            0xBF81_0000,
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 5,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                rsrc2: 0,
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b0011,
+                    attr: 0,
+                    flat: false,
+                    fp16: true,
+                    pack2: true,
+                    row2: 0,
+                }],
+                input_addr: 2,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let tex = SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 3,
+            usage: 0b0111,
+            half: true,
+        };
+        let mrt = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let isg1 = super::container::signature(&[tex], true);
+        let osg1 = super::container::signature(&[mrt], false);
+        let bytes =
+            crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
 }
