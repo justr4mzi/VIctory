@@ -9172,11 +9172,29 @@ impl<'a> Lower<'a> {
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
                     let _ = self.lazy_barycentric(arg);
                 }
+                let lo = self.x.st.highs.get(&arg).copied().unwrap_or(arg);
+                let ballot_ok = self.mask_data == MaskData::Host
+                    && !bit
+                    && self.read_phis.contains(&phi.value)
+                    && self.x.st.masks.contains_key(&lo)
+                    && self.def_block.get(&lo).is_some_and(|&d| d != self.cur_ir);
+                let ballot = if ballot_ok {
+                    self.mask_dword(arg).ok()
+                } else {
+                    None
+                };
+                let ballot_ok = ballot.is_some();
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
+                    // A mask dword the other path left in the register: its ballot
+                    // (a pixel or vertex program reads such a join only through a
+                    // zero test or a count). shortcut: the ballot is the host
+                    // wave's, so a join read some other way would differ from the
+                    // console, which `mask_ok` does not see; upgrade if one shows up.
+                    (None | Some(Val::Missing(_)), false) if ballot_ok => ballot.unwrap(),
                     // A lane mask's dword reaching a join that also takes
                     // data: the registers are reused once the mask is dead.
                     // shortcut: undefined on that edge, assuming the program
