@@ -4406,3 +4406,22 @@ fn duplicate_branch_target_critical_edge_produces_valid_dxil() {
         assert_eq!(got, cases[i].1, "{backend}: case {i}");
     });
 }
+
+/// A program that allocates no LDS has every access out of bounds on the
+/// console: `ds_write_b32` drops its data and `ds_read_b32` returns 0.
+#[test]
+fn ds_ops_without_lds_read_zero_and_drop_writes() {
+    // v0 = address (nonzero, so a read that did nothing would show), then
+    // write v1 there and read it back into v0.
+    let shader = build_valu_cs(&[
+        vop1(0x001, 0, 256 + 2), // v_mov_b32 v0, v2
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        0xD8D8_0000,
+        0x0000_0000, // ds_read_b32 v0, v0
+    ]);
+    let cases = [[0xDEAD_BEEF, 4, 0, 0], [1, 64, 0, 0], [0x1234, 0x100, 0, 0]];
+    run_cases(&shader, &cases, |backend, i, inp, got| {
+        assert_eq!(got, 0, "{backend}: case {i} {inp:x?} read {got:#x}");
+    });
+}
