@@ -35,13 +35,94 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// The thread preparing a submission ([`Sweep`]), if one is.
+    sweeper: Option<std::thread::ThreadId>,
+    /// Page ranges that thread asked the kernel about in this sweep
+    /// (sorted, disjoint, end exclusive).
+    swept: Vec<(usize, usize)>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    sweeper: None,
+    swept: Vec::new(),
 });
+
+/// While alive, the calling thread prepares one submission: the title's
+/// writes it must see were all made before the submission began (but for
+/// steps the preparation runs itself, [`Sweep::title_written`]), so a page
+/// the kernel was asked about once in the sweep need not be asked about
+/// again. Nested buffers in the world (several views into one 174 MB
+/// block) otherwise asked about the same pages ~20 times a frame, 120-180
+/// ms of a frame on an RX 6700 XT (2026-11-24).
+pub(crate) struct Sweep(());
+
+impl Sweep {
+    pub(crate) fn begin() -> Self {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.sweeper = Some(std::thread::current().id());
+        j.swept.clear();
+        Sweep(())
+    }
+
+    /// The thread in a sweep is about to write title memory itself (a step
+    /// run on the CPU between lists): what it asked about before must be
+    /// asked about again.
+    pub(crate) fn title_written() {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if j.sweeper == Some(std::thread::current().id()) {
+            j.swept.clear();
+        }
+    }
+}
+
+impl Drop for Sweep {
+    fn drop(&mut self) {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.sweeper = None;
+        j.swept.clear();
+    }
+}
+
+/// The parts of `[first, last)` not in `swept` (sorted, disjoint).
+fn gaps(swept: &[(usize, usize)], first: usize, last: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut at = first;
+    for &(a, e) in swept {
+        if e <= at {
+            continue;
+        }
+        if a >= last {
+            break;
+        }
+        if a > at {
+            out.push((at, a));
+        }
+        at = at.max(e);
+        if at >= last {
+            break;
+        }
+    }
+    if at < last {
+        out.push((at, last));
+    }
+    out
+}
+
+/// Adds `[first, last)` to `swept`, keeping it sorted and disjoint.
+fn sweep_in(swept: &mut Vec<(usize, usize)>, first: usize, last: usize) {
+    let i = swept.partition_point(|&(_, e)| e < first);
+    let mut j = i;
+    let (mut a, mut e) = (first, last);
+    while j < swept.len() && swept[j].0 <= e {
+        a = a.min(swept[j].0);
+        e = e.max(swept[j].1);
+        j += 1;
+    }
+    swept.splice(i..j, [(a, e)]);
+}
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
@@ -54,41 +135,62 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
+    // In a sweep, only what this thread has not asked about yet in it.
+    let sweeping = j.sweeper == Some(std::thread::current().id());
+    let asks = if sweeping {
+        gaps(&j.swept, first, last)
+    } else {
+        vec![(first, last)]
+    };
+    let mut found: Vec<usize> = Vec::new();
+    let mut failed = false;
+    for &(a, e) in &asks {
+        let mut count = (e - a) * PAGE / KERNEL_PAGE;
+        j.found.resize(count.max(j.found.len()), 0);
+        let mut granularity = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: the answer buffer holds `count` entries.
+        failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (a * PAGE) as *const _,
+                (e - a) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+        }
+        if failed {
+            break;
+        }
+        found.extend(j.found[..count].iter().map(|&at| at / PAGE));
+    }
     let guarded = if failed {
-        count = 0;
+        // Not write-watched memory (the kernel answers for a whole
+        // allocation or not at all), so none of the range went in `swept`.
+        found.clear();
         if !guarded {
             return None;
         }
         guard(first * PAGE, last * PAGE)?
     } else {
+        if sweeping {
+            for &(a, e) in &asks {
+                sweep_in(&mut j.swept, a, e);
+            }
+        }
         Vec::new()
     };
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
-    }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    for page in found.into_iter().chain(guarded) {
         j.written.insert(page, now);
     }
     Some((
@@ -324,6 +426,77 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn gaps_and_sweeps_keep_ranges_disjoint() {
+        let mut s = Vec::new();
+        assert_eq!(gaps(&s, 0, 10), [(0, 10)]);
+        sweep_in(&mut s, 4, 6);
+        sweep_in(&mut s, 10, 12);
+        assert_eq!(gaps(&s, 0, 20), [(0, 4), (6, 10), (12, 20)]);
+        assert_eq!(gaps(&s, 4, 6), []);
+        assert_eq!(gaps(&s, 5, 11), [(6, 10)]);
+        sweep_in(&mut s, 6, 10); // touching both: one range
+        assert_eq!(s, [(4, 12)]);
+        sweep_in(&mut s, 0, 2);
+        sweep_in(&mut s, 1, 5);
+        assert_eq!(s, [(0, 12)]);
+    }
+
+    /// A fresh write-watched allocation of `pages` pages. Never freed: the
+    /// journal keeps its pages, and a later test given the same addresses
+    /// would find them written.
+    fn watched(pages: usize) -> usize {
+        // SAFETY: a fresh allocation, kept for the rest of the run.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                pages * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        p
+    }
+
+    /// In a sweep a nested range is not asked about again, yet sees what
+    /// the outer asking found; after the sweep the kernel is asked as before.
+    #[test]
+    fn a_sweep_shares_the_kernels_answer_with_nested_ranges() {
+        let p = watched(4);
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 2 * PAGE) as *mut u8).write(1) };
+        let sweep = Sweep::begin();
+        let (outer, all) = writes(p, p + 4 * PAGE, false).expect("watched");
+        assert_eq!(all, [(p / PAGE + 2, outer)]);
+        // Written after the outer asking by another party, inside the
+        // sweep: seen from the next submission's sweep on.
+        // SAFETY: as above.
+        unsafe { ((p + 3 * PAGE) as *mut u8).write(1) };
+        let (inner, nested) = writes(p + 2 * PAGE, p + 4 * PAGE, false).expect("watched");
+        assert!(inner > outer);
+        assert_eq!(nested, [(p / PAGE + 2, outer)]);
+        drop(sweep);
+        let (later, after) = writes(p + 2 * PAGE, p + 4 * PAGE, false).expect("watched");
+        assert_eq!(after, [(p / PAGE + 2, outer), (p / PAGE + 3, later)]);
+    }
+
+    /// A write the sweeping thread makes itself (after `title_written`) is
+    /// seen by the next asking in the same sweep.
+    #[test]
+    fn a_sweep_asks_again_after_its_own_write() {
+        let p = watched(2);
+        let sweep = Sweep::begin();
+        let (_, before) = writes(p, p + 2 * PAGE, false).expect("watched");
+        assert!(before.is_empty());
+        Sweep::title_written();
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + PAGE) as *mut u8).write(1) };
+        let (now, after) = writes(p, p + 2 * PAGE, false).expect("watched");
+        assert_eq!(after, [(p / PAGE + 1, now)]);
+        drop(sweep);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
