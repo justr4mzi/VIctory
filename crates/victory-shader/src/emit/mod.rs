@@ -98,6 +98,8 @@ pub mod host;
 #[cfg(all(test, windows))]
 mod image_atomic_tests;
 mod lower;
+#[cfg(test)]
+mod mesh_tests;
 mod sampler;
 #[cfg(all(test, windows))]
 mod sampler_tests;
