@@ -518,18 +518,26 @@ fn placed_copy_source(
     resource: This,
     offset: u64,
     bytes: u64,
+    read: &std::ops::Range<u64>,
 ) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64)> {
     use windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
 
     let data = buffer_range(resource, offset, bytes)?;
     let address = data as u64;
-    let Some(shadow) = list.written_shadow(data as usize, bytes as usize) else {
+    let read_address = address + read.start;
+    let read_bytes = read.end - read.start;
+    let source = list
+        .written_shadow(read_address as usize, read_bytes as usize)
+        .and_then(|shadow| {
+            let offset = shadow.offset_for_range(address, bytes)?;
+            Some((shadow, offset))
+        });
+    let Some((shadow, offset)) = source else {
         let (upload, staging) = list.upload(crate::host::host()?, bytes)?;
         // Wine can report the mapped upload address as MEM_FREE.
         list.defer_fill(staging, data, bytes as usize);
         return Some((upload, 0));
     };
-    let offset = shadow.offset(address);
     let staging = if offset.is_multiple_of(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.into()) {
         None
     } else {
@@ -537,7 +545,7 @@ fn placed_copy_source(
         // Rebase it on the GPU so earlier writes remain visible to this copy.
         Some(crate::host::host()?.shared_buffer(bytes)?.0)
     };
-    shadow.refresh(list, address, bytes);
+    shadow.refresh(list, read_address, read_bytes);
     list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
     let Some(staging) = staging else {
         return Some((shadow.buffer.clone(), offset));
@@ -546,7 +554,13 @@ fn placed_copy_source(
     // SAFETY: both buffers are held by the list; the source range is checked
     // and the staging buffer has exactly enough space for the footprint.
     unsafe {
-        list.list.CopyBufferRegion(&staging, 0, &shadow.buffer, offset, bytes);
+        list.list.CopyBufferRegion(
+            &staging,
+            read.start,
+            &shadow.buffer,
+            offset + read.start,
+            read_bytes,
+        );
     }
     list.buffer_state(&staging, crate::host::BUFFER_READ);
     Some((staging, 0))
@@ -585,12 +599,17 @@ extern "system" fn copy_texture_region(
         let _buffer; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
+        // SAFETY: the title passes source box coordinates or null.
+        let source_box = unsafe { source_box.as_ref() };
         if src.kind == FOOTPRINT {
             let Some(bytes) = src.footprint.bytes() else {
                 return;
             };
+            let read_span = source_box
+                .and_then(|bounds| src.footprint.box_bytes(*bounds))
+                .unwrap_or(0..bytes);
             let Some((buffer, offset)) =
-                placed_copy_source(list, src.resource, src.footprint.offset, bytes)
+                placed_copy_source(list, src.resource, src.footprint.offset, bytes, &read_span)
             else {
                 return;
             };
@@ -599,7 +618,10 @@ extern "system" fn copy_texture_region(
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer; the range is inside it.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() } + offset, bytes));
+                read = Some((
+                    unsafe { buffer.GetGPUVirtualAddress() } + offset + read_span.start,
+                    read_span.end - read_span.start,
+                ));
             }
             _buffer = buffer;
         } else {
@@ -616,7 +638,7 @@ extern "system" fn copy_texture_region(
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        let host_box = source_box.map(|bounds| std::ptr::from_ref(bounds).cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
