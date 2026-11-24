@@ -3641,23 +3641,32 @@ impl<'a> Lower<'a> {
             };
             (src, uav, props, image)
         } else {
+            // Read as data and never used directly or via another load of the
+            // same entry: a table range names its kind, and an 8-dword load in
+            // a Table/ResourceHeap with no range naming it (runtime index) is
+            // taken as a 2D image (`#1067`).
             let src = Source::Loaded {
                 load: site,
                 first: 0,
             };
-            let Some(used) = self.used_kind(&src) else {
-                return Err("a descriptor read only as data");
-            };
-            if used.kind == ResourceType::Cbv {
+            let used = self.used_kind(&src);
+            if matches!(used.map(|u| u.kind), Some(ResourceType::Cbv)) {
                 return Err("a constant buffer's descriptor read as data");
             }
-            if !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
-                return Err("a descriptor read only as data");
-            }
-            let uav = used.kind == ResourceType::Uav;
+            let in_views = self
+                .scalar
+                .get(&site)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|rp| matches!(rp.root, RootType::Table | RootType::ResourceHeap));
+            let (uav, dwords, stride) = match used {
+                Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav) => {
+                    (u.kind == ResourceType::Uav, u.dwords, u.stride)
+                }
+                None if in_views && count == 8 => (false, 8, 0),
+                _ => return Err("a descriptor read only as data"),
+            };
             let u = if uav { 0x1000 } else { 0 };
-            let (props, image) = if used.dwords == 4 {
-                let stride = used.stride;
+            let (props, image) = if dwords == 4 {
                 let props = if stride >= 4 && stride.is_multiple_of(4) {
                     (12 | u, stride)
                 } else {
