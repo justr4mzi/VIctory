@@ -1566,14 +1566,14 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
-        if let Some(list) = host_list(this) {
-            crate::draw::viewports(list, items(viewports, count));
-        }
+        with_state(this, |list, s| {
+            crate::draw::viewports(list, s, items(viewports, count));
+        });
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        if let Some(list) = host_list(this) {
-            crate::draw::scissors(list, items(rects, count));
-        }
+        with_state(this, |list, s| {
+            crate::draw::scissors(list, s, items(rects, count));
+        });
     }
     pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
         with_state(this, |list, s| s.set_depth_bounds(list, min, max));
