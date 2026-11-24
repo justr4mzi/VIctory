@@ -326,7 +326,6 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         .iter()
         .filter_map(|&(reg, v)| loaded.iter().find(|l| l.0 == reg).map(|l| (v, l.1)))
         .collect();
-    let input_of = |v: Value| inputs.iter().find(|i| i.0 == v).map(|i| i.1);
     let attribute = |inst: &Inst, attr: &Operand| match *attr {
         Operand::Attr { index, chan, high } => ps_inputs
             .iter()
@@ -342,11 +341,6 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 "an interpolated attribute the stage data does not list",
             )),
         _ => Err(unsupported(inst.machine.offset, "an interpolation operand")),
-    };
-    // A VGPR value's barycentric kind and index, if it is one as loaded.
-    let barycentric = |v: Option<Value>| match v.and_then(input_of) {
-        Some(Input::Barycentric { kind, index }) => Some((kind, index)),
-        _ => None,
     };
 
     let mut io = Io {
@@ -386,6 +380,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         .collect();
     let halves = Halves {
         p,
+        inputs: &inputs,
         defs: &defs,
         phis: &phis,
     };
@@ -409,12 +404,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             };
                             // The first half's result is this one's old dst.
                             let interp = halves
-                                .pair(
-                                    attr,
-                                    inst.read(Reg::V(d)),
-                                    inst.read(Reg::V(reg)),
-                                    &barycentric,
-                                )
+                                .pair(attr, inst.read(Reg::V(d)), inst.read(Reg::V(reg)))
                                 .map_err(|what| unsupported(at, what))?;
                             push_pair(&mut io, site, interp, attribute);
                         }
@@ -430,7 +420,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             _ => None,
                         };
                         let interp = halves
-                            .pair(&v.src[0], read(2), read(1), &barycentric)
+                            .pair(&v.src[0], read(2), read(1))
                             .map_err(|what| unsupported(at, what))?;
                         push_pair(&mut io, site, interp, attribute);
                     }
@@ -536,14 +526,91 @@ fn push_pair(io: &mut Io, site: Site, pair: Pair, attribute: Attribute) {
     io.interps.push((site, pair.with(attribute)));
 }
 
+/// The source value of a plain VGPR-to-VGPR `v_mov_b32` copy (no modifiers,
+/// SDWA, or DPP).
+fn vgpr_copy(inst: &Inst) -> Option<Value> {
+    if inst.name() != "v_mov_b32" {
+        return None;
+    }
+    let Fields::Valu(v) = &inst.fields else {
+        return None;
+    };
+    if v.neg != 0
+        || v.abs != 0
+        || v.neg_hi != 0
+        || v.opsel != 0
+        || v.opsel_hi != 0
+        || v.clamp
+        || v.omod != 0
+        || v.sdwa.is_some()
+        || v.dpp.is_some()
+    {
+        return None;
+    }
+    let [Operand::Vector { reg, .. }] = v.src.as_slice() else {
+        return None;
+    };
+    inst.read(Reg::V(*reg))
+}
+
 /// Finds the first halves of interpolations.
 struct Halves<'a> {
     p: &'a Program,
+    inputs: &'a [(Value, Input)],
     defs: &'a std::collections::HashMap<Value, Site>,
     phis: &'a std::collections::HashMap<Value, (usize, usize)>,
 }
 
 impl Halves<'_> {
+    fn input_of(&self, v: Value) -> Option<Input> {
+        self.inputs.iter().find(|i| i.0 == v).map(|i| i.1)
+    }
+
+    /// A VGPR value's barycentric kind and index, following plain `v_mov_b32`
+    /// copies and phis whose incoming values agree.
+    fn barycentric(&self, v: Option<Value>) -> Option<(Barycentric, u8)> {
+        let mut seen = Vec::new();
+        let mut found = None;
+        self.barycentric_from(v?, &mut seen, &mut found)
+            .then_some(found)
+            .flatten()
+    }
+
+    fn barycentric_from(
+        &self,
+        v: Value,
+        seen: &mut Vec<Value>,
+        found: &mut Option<(Barycentric, u8)>,
+    ) -> bool {
+        if seen.contains(&v) {
+            return true;
+        }
+        if let Some(Input::Barycentric { kind, index }) = self.input_of(v) {
+            return match *found {
+                Some(prev) => prev == (kind, index),
+                None => {
+                    *found = Some((kind, index));
+                    true
+                }
+            };
+        }
+        if let Some(&site) = self.defs.get(&v) {
+            let Some(src) = vgpr_copy(&self.p.blocks[site.0].insts[site.1]) else {
+                return false;
+            };
+            seen.push(v);
+            return self.barycentric_from(src, seen, found);
+        }
+        let Some(&(b, i)) = self.phis.get(&v) else {
+            return false;
+        };
+        seen.push(v);
+        self.p.blocks[b].phis[i]
+            .args
+            .iter()
+            .all(|&a| self.barycentric_from(a, seen, found))
+    }
+
     /// The interpolation whose second half reads the first half's result
     /// `acc`, the barycentric `j`, and attribute `attr`: every first half
     /// must read the same attribute channel. With j and every first half's
@@ -554,7 +621,6 @@ impl Halves<'_> {
         attr: &Operand,
         acc: Option<Value>,
         j: Option<Value>,
-        barycentric: &impl Fn(Option<Value>) -> Option<(Barycentric, u8)>,
     ) -> Result<Pair, &'static str> {
         let mut first = Vec::new();
         self.sites(
@@ -562,7 +628,10 @@ impl Halves<'_> {
             &mut Vec::new(),
             &mut first,
         )?;
-        let mut kind = match barycentric(j) {
+        if first.is_empty() {
+            return Err("an interpolation without its first half");
+        }
+        let mut kind = match self.barycentric(j) {
             Some((kind, 1)) => Some(kind),
             _ => None,
         };
@@ -583,7 +652,7 @@ impl Halves<'_> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            if kind.is_some_and(|k| barycentric(i) != Some((k, 0))) {
+            if kind.is_some_and(|k| self.barycentric(i) != Some((k, 0))) {
                 kind = None;
             }
         }
@@ -593,15 +662,22 @@ impl Halves<'_> {
         })
     }
 
-    /// The instructions `v` comes from, through phis (`seen`: phis on the
-    /// way; a loop back to one adds nothing).
+    /// The instructions `v` comes from, through plain copies and phis (`seen`:
+    /// values on the way; a loop back to one adds nothing).
     fn sites(
         &self,
         v: Value,
         seen: &mut Vec<Value>,
         out: &mut Vec<Site>,
     ) -> Result<(), &'static str> {
+        if seen.contains(&v) {
+            return Ok(());
+        }
         if let Some(&site) = self.defs.get(&v) {
+            if let Some(src) = vgpr_copy(&self.p.blocks[site.0].insts[site.1]) {
+                seen.push(v);
+                return self.sites(src, seen, out);
+            }
             if !out.contains(&site) {
                 out.push(site);
             }
@@ -611,11 +687,9 @@ impl Halves<'_> {
             .phis
             .get(&v)
             .ok_or("an interpolation without its first half")?;
-        if !seen.contains(&v) {
-            seen.push(v);
-            for &a in &self.p.blocks[b].phis[i].args {
-                self.sites(a, seen, out)?;
-            }
+        seen.push(v);
+        for &a in &self.p.blocks[b].phis[i].args {
+            self.sites(a, seen, out)?;
         }
         Ok(())
     }
@@ -1052,6 +1126,135 @@ mod tests {
                 ((0, 2), Interp::Weighted { attribute }),
             ]
         );
+    }
+
+    #[test]
+    fn interpolation_follows_vgpr_copies() {
+        let p = program(&[
+            0x7E08_0300, // v_mov_b32 v4, v0 (i copy)
+            0x7E0A_0301, // v_mov_b32 v5, v1 (j copy)
+            0xC808_0004, // v_interp_p1_f32 v2, v4, attr0.x
+            0x7E06_0302, // v_mov_b32 v3, v2 (acc copy)
+            0xC80D_0005, // v_interp_p2_f32 v3, v5, attr0.x
+            0xF800_180F,
+            0x0303_0303, // exp mrt0, v3, v3, v3, v3 done vm
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(
+            io.interps,
+            [(
+                (0, 4),
+                Interp::Interpolated {
+                    attribute: Attribute {
+                        usage: Usage::Generic,
+                        row: 1,
+                        channel: 0,
+                        high: false,
+                    },
+                    barycentric: Barycentric::PerspectiveCenter,
+                    first: vec![(0, 2)],
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn interpolation_follows_agreeing_phis_and_falls_back_on_mismatched_or_modified_copies() {
+        // Both arms copy i/j, compute p1 into v2, join, copy v2 -> v3, then finish with p2.
+        let agreeing = program(&[
+            0xBF06_0100, // s_cmp_eq_u32 s0, s1
+            0xBF85_0004, // s_cbranch_scc1 -> 24
+            0x7E08_0300, // v_mov_b32 v4, v0
+            0x7E0A_0301, // v_mov_b32 v5, v1
+            0xC808_0004, // v_interp_p1_f32 v2, v4, attr0.x
+            0xBF82_0003, // s_branch -> 36
+            0x7E08_0300, // 24: v_mov_b32 v4, v0
+            0x7E0A_0301, // v_mov_b32 v5, v1
+            0xC808_0004, // v_interp_p1_f32 v2, v4, attr0.x
+            0x7E06_0302, // 36: v_mov_b32 v3, v2
+            0xC80D_0005, // v_interp_p2_f32 v3, v5, attr0.x
+            0xF800_180F,
+            0x0303_0303, // exp mrt0, v3, v3, v3, v3 done vm
+            S_ENDPGM,
+        ]);
+        let io = raise(&agreeing, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(io.interps.len(), 1);
+        let (
+            site,
+            Interp::Interpolated {
+                barycentric, first, ..
+            },
+        ) = &io.interps[0]
+        else {
+            panic!("{:?}", io.interps);
+        };
+        assert_eq!(*site, (3, 1));
+        assert_eq!(*barycentric, Barycentric::PerspectiveCenter);
+        assert_eq!(first, &[(1, 2), (2, 2)]);
+
+        // One arm passes i and the other passes j through a phi into p1.
+        let mismatched_phi = program(&[
+            0xBF06_0100, // s_cmp_eq_u32 s0, s1
+            0xBF85_0002, // s_cbranch_scc1 -> 16
+            0x7E08_0300, // v_mov_b32 v4, v0
+            0xBF82_0001, // s_branch -> 20
+            0x7E08_0301, // 16: v_mov_b32 v4, v1
+            0xC808_0004, // v_interp_p1_f32 v2, v4, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            S_ENDPGM,
+        ]);
+        let io = raise(&mismatched_phi, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert!(
+            !io.interps.is_empty()
+                && io
+                    .interps
+                    .iter()
+                    .all(|(_, i)| matches!(i, Interp::Weighted { .. })),
+            "expected Weighted fallback for mismatched phi: {:?}",
+            io.interps
+        );
+
+        // A modified v_mov_b32_e64 (neg on src0) is not treated as a plain barycentric copy.
+        let neg_bary = program(&[
+            0xD581_0004,
+            0x2000_0100, // v_mov_b32_e64 v4, -v0
+            0xC808_0004, // v_interp_p1_f32 v2, v4, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            S_ENDPGM,
+        ]);
+        let mov = &neg_bary.blocks[0].insts[0];
+        assert_eq!(mov.name(), "v_mov_b32");
+        assert!(matches!(&mov.fields, Fields::Valu(v) if v.neg != 0));
+        let io = raise(&neg_bary, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert!(
+            !io.interps.is_empty()
+                && io
+                    .interps
+                    .iter()
+                    .all(|(_, i)| matches!(i, Interp::Weighted { .. })),
+            "expected Weighted fallback for neg barycentric: {:?}",
+            io.interps
+        );
+
+        // A modified v_mov_b32_e64 (neg on src0) breaks the accumulator chain.
+        let neg_acc = program(&[
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xD581_0003,
+            0x2000_0102, // v_mov_b32_e64 v3, -v2
+            0xC80D_0001, // v_interp_p2_f32 v3, v1, attr0.x
+            S_ENDPGM,
+        ]);
+        let acc_mov = &neg_acc.blocks[0].insts[1];
+        assert_eq!(acc_mov.name(), "v_mov_b32");
+        assert!(matches!(&acc_mov.fields, Fields::Valu(v) if v.neg != 0));
+        assert!(matches!(
+            raise(&neg_acc, &pixel(vec![TEXCOORD], 2)),
+            Err(ShaderError::Unsupported {
+                what: "an interpolation without its first half",
+                ..
+            })
+        ));
     }
 
     #[test]
