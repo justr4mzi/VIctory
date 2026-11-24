@@ -5772,6 +5772,42 @@ impl<'a> Lower<'a> {
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
+            "v_permlanex16_b32" => {
+                // Cross-lane gather across adjacent 16-lane rows:
+                // S0 is the source vector value, S1/S2 provide nibble selectors.
+                // For each 16-lane row, lane i selects nibble i of {S2, S1}:
+                // lanes 0..7 use S1 nibbles 0..7; lanes 8..15 use S2 nibbles 0..7.
+                let (src, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                self.cross_lane(false)?;
+                let me = self.lane_index();
+                // alt_row = (lane & !31) | ((lane & 16) ^ 16)
+                let not31 = self.s.m.i32(!31);
+                let row_base = self.s.m.bin(c, Bin::And, me, not31);
+                let k16 = self.s.m.i32(16);
+                let row_bit = self.s.m.bin(c, Bin::And, me, k16);
+                let alt_bit = self.s.m.bin(c, Bin::Xor, row_bit, k16);
+                let alt_row = self.s.m.bin(c, Bin::Or, row_base, alt_bit);
+
+                // Nibble selector: lane_in_row = lane & 15.
+                // Lanes 0..7 index S1; lanes 8..15 index S2.
+                let k15 = self.s.m.i32(15);
+                let lane_in_row = self.s.m.bin(c, Bin::And, me, k15);
+                let k8 = self.s.m.i32(8);
+                let is_s2 = self.s.m.cmp(c, pred::IUGE, lane_in_row, k8);
+                let sel_word = self.s.m.select(c, is_s2, s2, s1);
+
+                // Shift: (lane_in_row & 7) * 4
+                let k7 = self.s.m.i32(7);
+                let nibble_idx = self.s.m.bin(c, Bin::And, lane_in_row, k7);
+                let four = self.s.m.i32(4);
+                let sh = self.s.m.bin(c, Bin::Shl, nibble_idx, four);
+                let shifted = self.s.m.bin(c, Bin::LShr, sel_word, sh);
+                let pick = self.s.m.bin(c, Bin::And, shifted, k15);
+
+                let target_lane = self.s.m.bin(c, Bin::Or, alt_row, pick);
+                let r = self.read_lane(src, target_lane);
+                int(self, r)
+            }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
