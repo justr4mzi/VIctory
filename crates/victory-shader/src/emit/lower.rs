@@ -6465,7 +6465,9 @@ impl<'a> Lower<'a> {
                     l.as_float(x)
                 }
             };
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // CalculateLOD takes only spatial coordinates, even for an array.
+            let active_coords = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(active_coords) {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
