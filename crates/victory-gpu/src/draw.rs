@@ -581,6 +581,25 @@ impl State {
                     }
                 }
             }
+            if let Some(param) = stage.stride_table {
+                let gpu = (self.heaps[0] != 0)
+                    .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                    .flatten()
+                    .and_then(|h| h.stride_table_gpu());
+                if let Some(gpu) = gpu {
+                    // SAFETY: an open list; the stride table buffer lives with the host heap.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootShaderResourceView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootShaderResourceView(param, gpu);
+                        }
+                    }
+                } else {
+                    once!("a shader reads the runtime stride table without a host view heap");
+                    return false;
+                }
+            }
         }
         true
     }
