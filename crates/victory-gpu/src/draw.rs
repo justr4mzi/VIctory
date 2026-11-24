@@ -320,18 +320,23 @@ impl State {
             };
             if record.resource.is_null() {
                 // A typed null RTV discards writes without changing the output slot.
-                if let Some(desc) = record.desc() {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                if let Some(desc) = record.desc()
+                    && let Some(rtv) = host.rtv(None, Some(&desc))
+                {
+                    rtvs.push(rtv);
                 }
                 continue;
             }
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
+            let Some(rtv) = host.rtv(Some(texture), record.desc().as_ref()) else {
+                continue;
+            };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            rtvs.push(rtv);
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -1936,7 +1941,11 @@ mod tests {
         crate::list::ensure_state(&list, target, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
         // SAFETY: open list, live target and graphics pipeline.
         unsafe {
-            l.ClearRenderTargetView(host.rtv(Some(color), None), &[0.0, 0.0, 1.0, 1.0], None);
+            l.ClearRenderTargetView(
+                host.rtv(Some(color), None).unwrap(),
+                &[0.0, 0.0, 1.0, 1.0],
+                None,
+            );
             l.SetGraphicsRootSignature(&root);
             l.SetPipelineState(&pso);
             l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
