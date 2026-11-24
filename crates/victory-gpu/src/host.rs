@@ -194,42 +194,66 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ..Default::default()
-        })?;
-        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let event = CreateEventW(None, false, false, None)?;
-        let rtvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        let dsvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let host = Host::from_device(device, messages)?;
         tracing::info!("host D3D12 device ready");
-        Ok(Host {
-            device,
-            queue,
-            fence,
-            submitted: Mutex::new(0),
-            event,
-            rtvs,
-            rtv_size,
-            dsvs,
-            dsv_size,
-            next_dsv: AtomicU32::new(0),
-            messages,
-            next_rtv: AtomicU32::new(0),
-            presenter: Mutex::new(None),
-        })
+        Ok(host)
+    }
+}
+
+impl Host {
+    fn from_device(
+        device: ID3D12Device,
+        messages: Option<ID3D12InfoQueue>,
+    ) -> windows::core::Result<Host> {
+        // SAFETY: plain D3D12 queue, fence, event and descriptor heap creation.
+        unsafe {
+            let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })?;
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+            let event = CreateEventW(None, false, false, None)?;
+            let rtvs: ID3D12DescriptorHeap =
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: RTV_RING,
+                    ..Default::default()
+                })?;
+            let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            let dsvs: ID3D12DescriptorHeap =
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                    NumDescriptors: RTV_RING,
+                    ..Default::default()
+                })?;
+            let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            Ok(Host {
+                device,
+                queue,
+                fence,
+                submitted: Mutex::new(0),
+                event,
+                rtvs,
+                rtv_size,
+                dsvs,
+                dsv_size,
+                next_dsv: AtomicU32::new(0),
+                messages,
+                next_rtv: AtomicU32::new(0),
+                presenter: Mutex::new(None),
+            })
+        }
+    }
+
+    /// Creates an isolated WARP-backed `Host` for unit tests without touching
+    /// the process-global host singleton.
+    #[cfg(test)]
+    pub(crate) fn new_warp() -> Option<Host> {
+        let adapter = warp_adapter().ok()?;
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: `adapter` is a verified software WARP adapter.
+        unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()? };
+        Host::from_device(device?, None).ok()
     }
 }
 
@@ -444,9 +468,13 @@ enum Step {
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Brings a texture's staging buffer up to date: once per submission,
+    /// Brings a texture's staging buffer up to date and, when dirty, copies
+    /// it into the host texture on the list's prelude: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    Texture(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    ),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -598,9 +626,9 @@ impl Host {
         // (again after a step that writes title memory).
         let sweep = crate::watch::Sweep::begin();
         for list in runs {
-            list.run_deferred(&mut batch);
+            let uploads = list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(&uploads) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -1158,12 +1186,50 @@ impl HostList {
         }
     }
 
-    /// At submission: the list that moves each texture this list uses from
-    /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// Records that this list starts and ends with `copy` in `wanted` state
+    /// (test helper matching `transition`'s first-use tracking).
+    #[cfg(test)]
+    pub(crate) fn expect_texture_state(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) {
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .entry(std::sync::Arc::as_ptr(copy) as usize)
+            .or_insert_with(|| (wanted, wanted, copy.clone()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_deferred_work(&self) -> bool {
+        !self.deferred().copies.is_empty()
+    }
+
+    /// At submission: the list that copies any newly dirtied textures from
+    /// their staging buffers into their host textures and moves each texture
+    /// this list uses from its real state to the one the list starts with;
+    /// the textures' real states become those the list ends with.
+    fn prelude(
+        &self,
+        uploads: &[(
+            std::sync::Arc<crate::texture::Staging>,
+            std::sync::Arc<crate::resource::HostTexture>,
+        )],
+    ) -> Option<ID3D12CommandList> {
+        const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
+        let mut pre_barriers = Vec::new();
+        for (_, copy) in uploads {
+            let real = copy.state.swap(COPY_DEST, Ordering::Relaxed);
+            if real != COPY_DEST {
+                pre_barriers.push(transition(
+                    &copy.texture,
+                    D3D12_RESOURCE_STATES(real as i32),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ));
+            }
+        }
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+        let post_barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
                 let real = copy.state.swap(*last, Ordering::Relaxed);
@@ -1176,16 +1242,24 @@ impl HostList {
                 })
             })
             .collect();
-        if barriers.is_empty() {
+        if uploads.is_empty() && post_barriers.is_empty() {
             return None;
         }
         let (allocator, list) = &self.prelude;
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for); the textures and staging buffers are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                list.ResourceBarrier(&barriers);
+                if !pre_barriers.is_empty() {
+                    list.ResourceBarrier(&pre_barriers);
+                }
+                for (staging, copy) in uploads {
+                    staging.record_copies(list, &copy.texture);
+                }
+                if !post_barriers.is_empty() {
+                    list.ResourceBarrier(&post_barriers);
+                }
                 list.Close()
             })
         };
@@ -1455,17 +1529,32 @@ impl HostList {
     }
 
     /// Brings a texture's staging buffer up to date when the list is
-    /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    /// submitted (and copies it to `texture` on the prelude only if dirty),
+    /// keeping both alive until the list is reset.
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        texture: std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        self.deferred()
+            .copies
+            .push(Step::Texture(staging, texture));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
-    /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    /// lists of a submission, through many ranges). Returns the textures
+    /// whose staging buffers changed and must be copied onto the prelude.
+    fn run_deferred(
+        &self,
+        batch: &mut Batch,
+    ) -> Vec<(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    )> {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let mut uploads = Vec::new();
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
             let copied = match step {
@@ -1515,9 +1604,9 @@ impl HostList {
                     shadow.writing(*address, *len);
                     continue;
                 }
-                Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
-                        staging.refresh();
+                Step::Texture(staging, copy) => {
+                    if batch.texture_due(staging) && staging.refresh() {
+                        uploads.push((staging.clone(), copy.clone()));
                     }
                     continue;
                 }
@@ -1525,6 +1614,7 @@ impl HostList {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        uploads
     }
 }
 
