@@ -3447,3 +3447,174 @@ fn int16_inline_float_constants_use_f32_bits() {
         assert_eq!(got, 0x0000_3118, "{backend}: v_add_f16(248, 0)");
     });
 }
+
+#[test]
+fn integer_dot_products_match_rdna2() {
+    let vop3p = |op: u32, clamp: bool, vdst: u32, s0: u16, s1: u16, s2: u16| -> [u32; 2] {
+        [
+            0xCC00_0000 | (op << 16) | (u32::from(clamp) << 15) | (vdst & 0xFF),
+            u32::from(s0 & 0x1FF) | (u32::from(s1 & 0x1FF) << 9) | (u32::from(s2 & 0x1FF) << 18),
+        ]
+    };
+    let vop2 = |op: u32, vdst: u32, src0: u16, vsrc1: u32| -> u32 {
+        (op << 25) | ((vdst & 0xFF) << 17) | ((vsrc1 & 0xFF) << 9) | u32::from(src0 & 0x1FF)
+    };
+
+    // v_dot2_i32_i16 (VOP3P 0x014), wrapping and clamped.
+    let dot2_i16 = build_valu_cs(&vop3p(0x014, false, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let dot2_i16_clamp = build_valu_cs(&vop3p(0x014, true, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let i16_cases: &[([u32; 4], u32, u32)] = &[
+        // (3 * -4) + (-5 * 6) + 100 = 58
+        ([0xFFFB_0003, 0x0006_FFFC, 100, 0], 58, 58),
+        // (-32768 * -32768) * 2 + 0 = +2^31 -> wraps to 0x8000_0000, clamps to i32::MAX
+        (
+            [0x8000_8000, 0x8000_8000, 0, 0],
+            0x8000_0000,
+            i32::MAX as u32,
+        ),
+        // (-32768 * -32768) * 2 + i32::MAX = 0xFFFF_FFFF -> wraps to -1, clamps to i32::MAX
+        (
+            [0x8000_8000, 0x8000_8000, i32::MAX as u32, 0],
+            0xFFFF_FFFF,
+            i32::MAX as u32,
+        ),
+        // (-32768 * 32767) * 2 + i32::MIN -> negative overflow, clamps to i32::MIN
+        (
+            [0x8000_8000, 0x7FFF_7FFF, i32::MIN as u32, 0],
+            ((-32768i64 * 32767 * 2 + i64::from(i32::MIN)) as i32) as u32,
+            i32::MIN as u32,
+        ),
+    ];
+    let i16_in: Vec<[u32; 4]> = i16_cases.iter().map(|c| c.0).collect();
+    run_cases(&dot2_i16, &i16_in, |backend, i, inp, got| {
+        assert_eq!(got, i16_cases[i].1, "{backend}: v_dot2_i32_i16({inp:08x?})");
+    });
+    run_cases(&dot2_i16_clamp, &i16_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, i16_cases[i].2,
+            "{backend}: v_dot2_i32_i16 clamp({inp:08x?})"
+        );
+    });
+
+    // v_dot2_u32_u16 (VOP3P 0x015), wrapping and clamped.
+    let dot2_u16 = build_valu_cs(&vop3p(0x015, false, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let dot2_u16_clamp = build_valu_cs(&vop3p(0x015, true, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let u16_cases: &[([u32; 4], u32, u32)] = &[
+        // (10 * 20) + (30 * 40) + 5 = 1405
+        ([0x001E_000A, 0x0028_0014, 5, 0], 1405, 1405),
+        // (65535^2)*2 + 10 -> overflows u32
+        (
+            [0xFFFF_FFFF, 0xFFFF_FFFF, 10, 0],
+            (65535u64 * 65535 * 2 + 10) as u32,
+            u32::MAX,
+        ),
+    ];
+    let u16_in: Vec<[u32; 4]> = u16_cases.iter().map(|c| c.0).collect();
+    run_cases(&dot2_u16, &u16_in, |backend, i, inp, got| {
+        assert_eq!(got, u16_cases[i].1, "{backend}: v_dot2_u32_u16({inp:08x?})");
+    });
+    run_cases(&dot2_u16_clamp, &u16_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, u16_cases[i].2,
+            "{backend}: v_dot2_u32_u16 clamp({inp:08x?})"
+        );
+    });
+
+    // v_dot4_i32_i8 (VOP3P 0x016) & v_dot4c_i32_i8 (VOP2 0x00d & VOP3 0x10d clamp).
+    let dot4_i8 = build_valu_cs(&vop3p(0x016, false, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let dot4_i8_clamp = build_valu_cs(&vop3p(0x016, true, 0, vgpr(1), vgpr(2), vgpr(3)));
+    // v_mov_b32 v0, v3; v_dot4c_i32_i8 v0, v1, v2 (VOP2 0x00d)
+    let dot4c_vop2 = build_valu_cs(&[vop1(0x001, 0, vgpr(3)), vop2(0x00d, 0, vgpr(1), 2)]);
+    // v_mov_b32 v0, v3; v_dot4c_i32_i8 v0, v1, v2 clamp (VOP3 0x10d)
+    let mut dot4c_vop3_code = vec![vop1(0x001, 0, vgpr(3))];
+    let mut dot4c_v3 = vop3(0x10d, 0, vgpr(1), vgpr(2), 0);
+    dot4c_v3[0] |= 1 << 15; // clamp
+    dot4c_vop3_code.extend_from_slice(&dot4c_v3);
+    let dot4c_vop3_clamp = build_valu_cs(&dot4c_vop3_code);
+
+    let i8_cases: &[([u32; 4], u32, u32)] = &[
+        // (1*-2) + (3*-4) + (-5*6) + (-128*-128) + 10 = -2 - 12 - 30 + 16384 + 10 = 16350
+        ([0x80FB_0301, 0x8006_FCFE, 10, 0], 16350, 16350),
+        // Positive overflow: 4 * (-128 * -128) + (i32::MAX - 10)
+        (
+            [0x8080_8080, 0x8080_8080, (i32::MAX - 10) as u32, 0],
+            (i32::MAX - 10).wrapping_add(65536) as u32,
+            i32::MAX as u32,
+        ),
+        // Negative overflow: 4 * (-128 * 127) + (i32::MIN + 10)
+        (
+            [0x8080_8080, 0x7F7F_7F7F, (i32::MIN + 10) as u32, 0],
+            (i32::MIN + 10).wrapping_sub(65024) as u32,
+            i32::MIN as u32,
+        ),
+    ];
+    let i8_in: Vec<[u32; 4]> = i8_cases.iter().map(|c| c.0).collect();
+    run_cases(&dot4_i8, &i8_in, |backend, i, inp, got| {
+        assert_eq!(got, i8_cases[i].1, "{backend}: v_dot4_i32_i8({inp:08x?})");
+    });
+    run_cases(&dot4_i8_clamp, &i8_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, i8_cases[i].2,
+            "{backend}: v_dot4_i32_i8 clamp({inp:08x?})"
+        );
+    });
+    run_cases(&dot4c_vop2, &i8_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, i8_cases[i].1,
+            "{backend}: v_dot4c_i32_i8 VOP2({inp:08x?})"
+        );
+    });
+    run_cases(&dot4c_vop3_clamp, &i8_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, i8_cases[i].2,
+            "{backend}: v_dot4c_i32_i8 VOP3 clamp({inp:08x?})"
+        );
+    });
+
+    // v_dot4_u32_u8 (VOP3P 0x017) & v_dot8_u32_u4 (VOP3P 0x019).
+    let dot4_u8 = build_valu_cs(&vop3p(0x017, false, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let dot4_u8_clamp = build_valu_cs(&vop3p(0x017, true, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let u8_cases: &[([u32; 4], u32, u32)] = &[
+        // 1*5 + 2*6 + 3*7 + 4*8 + 100 = 5+12+21+32+100 = 170
+        ([0x0403_0201, 0x0807_0605, 100, 0], 170, 170),
+        // Overflow: 4 * (255*255) + (u32::MAX - 10)
+        (
+            [0xFFFF_FFFF, 0xFFFF_FFFF, u32::MAX - 10, 0],
+            (u32::MAX - 10).wrapping_add(260100),
+            u32::MAX,
+        ),
+    ];
+    let u8_in: Vec<[u32; 4]> = u8_cases.iter().map(|c| c.0).collect();
+    run_cases(&dot4_u8, &u8_in, |backend, i, inp, got| {
+        assert_eq!(got, u8_cases[i].1, "{backend}: v_dot4_u32_u8({inp:08x?})");
+    });
+    run_cases(&dot4_u8_clamp, &u8_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, u8_cases[i].2,
+            "{backend}: v_dot4_u32_u8 clamp({inp:08x?})"
+        );
+    });
+
+    let dot8_u4 = build_valu_cs(&vop3p(0x019, false, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let dot8_u4_clamp = build_valu_cs(&vop3p(0x019, true, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let u4_cases: &[([u32; 4], u32, u32)] = &[
+        // 1*8 + 2*7 + 3*6 + 4*5 + 5*4 + 6*3 + 7*2 + 8*1 + 10 = 120 + 10 = 130
+        ([0x8765_4321, 0x1234_5678, 10, 0], 130, 130),
+        // Overflow: 8 * (15*15) = 1800, + (u32::MAX - 100)
+        (
+            [0xFFFF_FFFF, 0xFFFF_FFFF, u32::MAX - 100, 0],
+            (u32::MAX - 100).wrapping_add(1800),
+            u32::MAX,
+        ),
+    ];
+    let u4_in: Vec<[u32; 4]> = u4_cases.iter().map(|c| c.0).collect();
+    run_cases(&dot8_u4, &u4_in, |backend, i, inp, got| {
+        assert_eq!(got, u4_cases[i].1, "{backend}: v_dot8_u32_u4({inp:08x?})");
+    });
+    run_cases(&dot8_u4_clamp, &u4_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, u4_cases[i].2,
+            "{backend}: v_dot8_u32_u4 clamp({inp:08x?})"
+        );
+    });
+}
