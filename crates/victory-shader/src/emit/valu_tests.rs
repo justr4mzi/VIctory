@@ -3216,3 +3216,153 @@ fn v_frexp_f32_and_f16_match_rdna2() {
         assert_eq!(got, sentinel, "{backend}: v_frexp_exp_i16_f16(NaN) = {got:#010x}, want 0");
     });
 }
+
+const fn sdwa_ext(src0_vgpr: u8, dst: (u8, u8), src0: (u8, bool), src1: (u8, bool)) -> u32 {
+    src0_vgpr as u32
+        | (dst.0 as u32) << 8
+        | (dst.1 as u32) << 11
+        | (src0.0 as u32) << 16
+        | (src0.1 as u32) << 19
+        | (src1.0 as u32) << 24
+        | (src1.1 as u32) << 27
+}
+
+const fn vop1_sdwa(op: u16, vdst: u8, src0_vgpr: u8, dst: (u8, u8), src0: (u8, bool)) -> [u32; 2] {
+    [
+        0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | 0xF9,
+        sdwa_ext(src0_vgpr, dst, src0, (6, false)),
+    ]
+}
+
+const fn vop2_sdwa(
+    op: u16,
+    vdst: u8,
+    src0_vgpr: u8,
+    vsrc1_vgpr: u8,
+    dst: (u8, u8),
+    src_sel: (u8, u8),
+) -> [u32; 2] {
+    [
+        (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1_vgpr as u32) << 9 | 0xF9,
+        sdwa_ext(src0_vgpr, dst, (src_sel.0, false), (src_sel.1, false)),
+    ]
+}
+
+const fn vopc_sdwa(
+    op: u16,
+    src0_vgpr: u8,
+    vsrc1_vgpr: u8,
+    src0: (u8, bool),
+    src1: (u8, bool),
+) -> [u32; 2] {
+    [
+        0x7C00_0000 | (op as u32) << 17 | (vsrc1_vgpr as u32) << 9 | 0xF9,
+        sdwa_ext(src0_vgpr, (0, 0), src0, src1),
+    ]
+}
+
+#[test]
+fn sdwa_16bit_dst_word0_sext_and_byte_placement() {
+    // v_add_f16_sdwa v0, v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_SEXT
+    let add_sext = build_valu_cs(&vop2_sdwa(0x32, 0, 1, 2, (4, 1), (4, 4)));
+    run_cases(
+        &add_sext,
+        &[[0xBC00, 0x0000, 0, 0], [0x3C00, 0x0000, 0, 0]],
+        |backend, i, inp, got| {
+            let want = [0xFFFF_BC00, 0x0000_3C00][i];
+            assert_eq!(got, want, "{backend}: add_sext {inp:08x?}");
+        },
+    );
+
+    // v_cvt_i16_f16_sdwa v0, v1 dst_sel:WORD_0 dst_unused:UNUSED_SEXT
+    let cvt_sext = build_valu_cs(&vop1_sdwa(0x53, 0, 1, (4, 1), (4, false)));
+    run_cases(
+        &cvt_sext,
+        &[[0xC500, 0, 0, 0], [0x4500, 0, 0, 0]],
+        |backend, i, inp, got| {
+            let want = [0xFFFF_FFFB, 0x0000_0005][i];
+            assert_eq!(got, want, "{backend}: cvt_sext {inp:08x?}");
+        },
+    );
+
+    // Seed v0 = v2, then v_cvt_i16_f16_sdwa v0, v1 dst_sel:BYTE_1 dst_unused:UNUSED_PRESERVE
+    let [c0, c1] = vop1_sdwa(0x53, 0, 1, (1, 2), (4, false));
+    let byte1_preserve = build_valu_cs(&[vop1(0x001, 0, vgpr(2)), c0, c1]);
+    run_cases(
+        &byte1_preserve,
+        &[[0x5420, 0xAABB_CCDD, 0, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, 0xAABB_42DD, "{backend}: byte1_preserve");
+        },
+    );
+
+    // v_cvt_i16_f16_sdwa v0, v1 dst_sel:BYTE_1 dst_unused:UNUSED_SEXT
+    let byte1_sext = build_valu_cs(&vop1_sdwa(0x53, 0, 1, (1, 1), (4, false)));
+    run_cases(&byte1_sext, &[[0xC900, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, 0xFFFF_F600, "{backend}: byte1_sext");
+    });
+}
+
+#[test]
+fn sdwa_16bit_src_byte_select_and_sext() {
+    // v_cvt_f16_i16_sdwa v0, sext(v1) src0_sel:BYTE_1 dst_sel:WORD_0 dst_unused:UNUSED_PAD
+    let cvt_sext = build_valu_cs(&vop1_sdwa(0x51, 0, 1, (4, 0), (1, true)));
+    run_cases(
+        &cvt_sext,
+        &[[0x0000_8000, 0, 0, 0], [0x0000_7F00, 0, 0, 0]],
+        |backend, i, inp, got| {
+            let want = [0x0000_D800, 0x0000_57F0][i];
+            assert_eq!(got, want, "{backend}: cvt_f16_i16 sext byte1 {inp:08x?}");
+        },
+    );
+
+    // Same without sext: BYTE_1 0x80 is +128 (+128.0h = 0x5800).
+    let cvt_zext = build_valu_cs(&vop1_sdwa(0x51, 0, 1, (4, 0), (1, false)));
+    run_cases(
+        &cvt_zext,
+        &[[0x0000_8000, 0, 0, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, 0x0000_5800, "{backend}: cvt_f16_i16 zext byte1");
+        },
+    );
+
+    // v_cmp_lt_i16_sdwa vcc, sext(v1), v2 src0_sel:BYTE_1 src1_sel:WORD_0; v_cndmask_b32 v0, 0, 1, vcc
+    let [s0, s1] = vopc_sdwa(0x89, 1, 2, (1, true), (4, false));
+    let [m0, m1] = vop3(0x101, 0, 0x80, 0x81, sgpr(106));
+    let cmp_sext = build_valu_cs(&[s0, s1, m0, m1]);
+    run_cases(
+        &cmp_sext,
+        &[[0x0000_FE00, 0, 0, 0], [0x0000_0200, 0, 0, 0]],
+        |backend, i, inp, got| {
+            let want = [1, 0][i];
+            assert_eq!(got, want, "{backend}: cmp_lt_i16 sext byte1 {inp:08x?}");
+        },
+    );
+}
+
+#[test]
+fn int16_inline_float_constants_use_f32_bits() {
+    // GFX10 decodes inline constant 248 as f32 0x3E22_F983 for 16-bit integer
+    // ops (both low and op_sel-selected high half), and as f16 0x3118 for f16 ops.
+    let [u_lo0, u_lo1] = vop3(0x303, 0, 248, vgpr(1), 0);
+    let u_lo = build_valu_cs(&[vop1(0x001, 0, 0x80), u_lo0, u_lo1]);
+    run_cases(&u_lo, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 0x0000_F983, "{backend}: v_add_nc_u16(248, 0)");
+    });
+
+    let [mut u_hi0, u_hi1] = vop3(0x303, 0, 248, vgpr(1), 0);
+    u_hi0 |= 1 << 11; // op_sel:[1,0,0,0]
+    let u_hi = build_valu_cs(&[vop1(0x001, 0, 0x80), u_hi0, u_hi1]);
+    run_cases(&u_hi, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(
+            got, 0x0000_3E22,
+            "{backend}: v_add_nc_u16 op_sel:[1](248, 0)"
+        );
+    });
+
+    let [f_lo0, f_lo1] = vop3(0x132, 0, 248, vgpr(1), 0);
+    let f_lo = build_valu_cs(&[vop1(0x001, 0, 0x80), f_lo0, f_lo1]);
+    run_cases(&f_lo, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got, 0x0000_3118, "{backend}: v_add_f16(248, 0)");
+    });
+}
