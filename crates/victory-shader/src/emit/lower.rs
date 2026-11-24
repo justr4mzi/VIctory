@@ -1009,6 +1009,8 @@ impl<'a> Lower<'a> {
                     }
                 })
             };
+            // So does an address read from the first lane.
+            console_lanes |= x.res.scalar.iter().any(|(_, a)| a.first_lane.is_some());
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
@@ -1262,8 +1264,9 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
         };
-        let c = self.cur;
+        // (First: a first-lane term may end the block.)
         let off = self.address_offset(a)?;
+        let c = self.cur;
         let h = if a.param == CODE {
             None
         } else {
@@ -4790,8 +4793,9 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar load from the code"),
         };
-        let c = self.cur;
+        // (First: a first-lane term may end the block.)
         let addr = self.address_offset(a)?;
+        let c = self.cur;
         for k in 0..count {
             let off = self.s.m.i32(4 * k);
             let at = self.s.m.bin(c, Bin::Add, addr, off);
@@ -4949,11 +4953,62 @@ impl<'a> Lower<'a> {
         Ok(out)
     }
 
+    /// For a first-lane address ([`Address::first_lane`]), the first active
+    /// lane's value of `d` at its `v_readfirstlane_b32`, in every lane.
+    fn first_lane_value(&mut self, read: Value, d: V) -> Result<V, Why> {
+        let (b, i) = self
+            .x
+            .p
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(b, block)| {
+                let i = block
+                    .insts
+                    .iter()
+                    .position(|i| i.writes.iter().any(|w| w.1 == read))?;
+                Some((b, i))
+            })
+            .ok_or("a first-lane address")?;
+        let guard = self.guard(b, i)?;
+        self.s.flags |= flags::WAVE_OPS;
+        // Guarded code runs in every lane; the first lane the guard holds in
+        // reads the term, and the others take it from there (the largest of
+        // that one and zeros).
+        let at = self.begin_guarded(guard);
+        let i32t = self.s.t.i32;
+        let first = self.s.op(
+            self.cur,
+            "waveReadLaneFirst.i32",
+            Attr::NoUnwind,
+            i32t,
+            118,
+            &[d],
+        );
+        if at.is_none() {
+            return Ok(first);
+        }
+        let zero = self.s.m.i32(0);
+        let r = self.end_guarded(at, &[(first, zero)])[0];
+        let (k, u) = (self.s.m.i8(3), self.s.m.i8(1));
+        Ok(self.s.op(
+            self.cur,
+            "waveActiveOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            119,
+            &[r, k, u],
+        ))
+    }
+
     /// The byte offset a buffer descriptor built around a root descriptor adds
     /// (constant and computed parts); none for other descriptors.
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
         match src {
             Source::Built { address, .. } => {
+                if address.first_lane.is_some() {
+                    return Err("a descriptor built around a first-lane address");
+                }
                 if address.rel.is_some() {
                     Ok((0, Some(self.address_offset(*address)?)))
                 } else {
@@ -4970,7 +5025,6 @@ impl<'a> Lower<'a> {
 
     /// Computes the byte offset `a` adds to its root parameter (or code base).
     fn address_offset(&mut self, a: Address) -> Result<V, Why> {
-        let c = self.cur;
         if let Some(RelOffset {
             value,
             base,
@@ -4979,6 +5033,10 @@ impl<'a> Lower<'a> {
         {
             let mut local = HashMap::new();
             let mut off = self.rel_offset(value, base, &mut local)?;
+            if let Some(read) = a.first_lane {
+                off = self.first_lane_value(read, off)?;
+            }
+            let c = self.cur;
             if a.offset != 0 {
                 let k = self.s.m.i32(a.offset);
                 off = self.s.m.bin(c, Bin::Add, off, k);
@@ -4989,9 +5047,19 @@ impl<'a> Lower<'a> {
             }
             return Ok(off);
         }
+        let dyn_v = match a.dynamic {
+            Some(d) => {
+                let d = self.i32_of(d)?;
+                Some(match a.first_lane {
+                    Some(read) => self.first_lane_value(read, d)?,
+                    None => d,
+                })
+            }
+            None => None,
+        };
+        let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        if let Some(d) = dyn_v {
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
         Ok(off)

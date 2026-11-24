@@ -47,6 +47,11 @@ pub struct Address {
     pub offset: u32,
     pub dynamic: Option<Value>,
     pub rel: Option<RelOffset>,
+    /// The `v_readfirstlane_b32` result holding the low dword, when the
+    /// program reads the first active lane's address (both dwords read
+    /// from VGPRs): `dynamic` is then each lane's own term, and the access
+    /// takes the first lane's. Only for [`CODE`].
+    pub first_lane: Option<Value>,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -242,6 +247,7 @@ pub fn track(
                         Err(NOT_ROOT) if stage == HwStage::Gs => continue,
                         Err(what) => return Err(fail(what)),
                     };
+                    t.first_lane_runs(&address, site).map_err(fail)?;
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -253,6 +259,7 @@ pub fn track(
                     let address = t
                         .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
                         .map_err(fail)?;
+                    t.first_lane_runs(&address, site).map_err(fail)?;
                     out.scalar.push((site, address));
                 }
                 _ => {}
@@ -1316,7 +1323,21 @@ impl<'a> Tracer<'a> {
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
         let (lo, hi) = (self.unlaned(lo), self.unlaned(hi));
+        // `v_readfirstlane_b32` of both dwords of a VGPR address: the first
+        // lane's (the compiler's form for an index into a constant table
+        // it takes as uniform).
+        let (lo, hi, first_lane) = match (lo, hi) {
+            (Term::Value(l), Term::Value(h)) => {
+                match (self.first_lane_source(l), self.first_lane_source(h)) {
+                    (Some(a), Some(b)) => (self.vorigin(a), self.vorigin(b), Some(l)),
+                    _ => (lo, hi, None),
+                }
+            }
+            _ => (lo, hi, None),
+        };
         let s = self.sum(lo);
+        // Uniform, the first lane's address is every lane's.
+        let first_lane = first_lane.filter(|_| s.dynamic.is_some() || s.multi);
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         let use_rel = s.multi || (s.dynamic.is_some() && extra.dynamic.is_some());
         let lo_val = match lo {
@@ -1354,7 +1375,11 @@ impl<'a> Tracer<'a> {
                 offset,
                 dynamic,
                 rel,
+                first_lane,
             });
+        }
+        if first_lane.is_some() {
+            return Err("a first-lane address from a root parameter");
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
         let (param, _) = self
@@ -1387,6 +1412,7 @@ impl<'a> Tracer<'a> {
             offset,
             dynamic,
             rel,
+            first_lane: None,
         })
     }
 
@@ -1809,6 +1835,29 @@ impl<'a> Tracer<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The access at `site` runs with the lanes that read its first-lane
+    /// address ([`Address::first_lane`]), so the first of its own lanes is
+    /// that one: the read is earlier in its block, and nothing between them
+    /// writes EXEC.
+    fn first_lane_runs(&self, a: &Address, site: Site) -> Result<(), &'static str> {
+        let Some(read) = a.first_lane else {
+            return Ok(());
+        };
+        let (b, i) = self.defs[read.0 as usize].ok_or("a first-lane address")?;
+        let insts = &self.p.blocks[b].insts;
+        if b != site.0
+            || i >= site.1
+            || insts[i + 1..site.1].iter().any(|inst| {
+                inst.writes
+                    .iter()
+                    .any(|w| matches!(w.0, Reg::S(r) if r == EXEC || r == EXEC + 1))
+            })
+        {
+            return Err("a first-lane address read with other lanes");
+        }
+        Ok(())
     }
 
     /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
@@ -3216,6 +3265,7 @@ pub(crate) mod tests {
             offset,
             dynamic: None,
             rel: None,
+            first_lane: None,
         }
     }
 
@@ -3576,10 +3626,11 @@ pub(crate) mod tests {
         // s_getpc_b64 is the first instruction: its next one is at 4.
         assert_eq!(a.offset, 4 + 0xDDC);
         assert!(a.dynamic.is_some(), "the index stays a computed term");
+        assert!(a.first_lane.is_none());
     }
 
     #[test]
-    fn a_first_lane_read_of_a_per_lane_code_table_address_is_refused_by_name() {
+    fn a_first_lane_read_of_a_per_lane_code_table_address_is_traced() {
         // Same, but the index is lane 0's own input (v0 is never set).
         let words = [
             0xBE80_1F00, // s_getpc_b64 s[0:1]
@@ -3599,15 +3650,14 @@ pub(crate) mod tests {
         ];
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
-        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
-        assert_eq!(
-            err,
-            ShaderError::Unsupported {
-                // the s_load_dword, at byte 44
-                offset: 44,
-                what: "an address read from the first lane of a per-lane value"
-            }
-        );
+        let r = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap();
+        let (_, a) = r
+            .scalar
+            .iter()
+            .find(|s| s.1.param == CODE)
+            .expect("the code table load is traced");
+        assert_eq!(a.offset, 4 + 0xDDC);
+        assert!(a.dynamic.is_some() && a.first_lane.is_some(), "{a:?}");
     }
 
     /// A table in the code read in a loop whose counter (v7) the exit test
@@ -3648,25 +3698,25 @@ pub(crate) mod tests {
             .expect("the code table load is traced");
         assert_eq!(a.offset, 4 + 0xDDC);
         assert!(a.dynamic.is_some(), "the counter stays a computed term");
+        assert!(a.first_lane.is_none());
     }
 
     #[test]
-    fn a_loop_counter_with_a_per_lane_exit_is_refused_by_name() {
+    fn a_loop_counter_with_a_per_lane_exit_is_traced_via_first_lane() {
         // v_cmp_gt_u32 vcc_lo, v0, v7: lanes leave at their own count.
         let code: Vec<u8> = code_table_loop(0x7D88_0F00)
             .iter()
             .flat_map(|w| w.to_le_bytes())
             .collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
-        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
-        assert_eq!(
-            err,
-            ShaderError::Unsupported {
-                // the s_load_dword, at byte 48
-                offset: 48,
-                what: "an address read from the first lane of a per-lane value"
-            }
-        );
+        let r = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap();
+        let (_, a) = r
+            .scalar
+            .iter()
+            .find(|s| s.1.param == CODE)
+            .expect("the code table load is traced");
+        assert_eq!(a.offset, 4 + 0xDDC);
+        assert!(a.dynamic.is_some() && a.first_lane.is_some(), "{a:?}");
     }
 
     /// A waterfall loop over an image descriptor each lane loads from the
@@ -5536,6 +5586,83 @@ pub(crate) mod tests {
                 }
             ),
             "{err:?}"
+        );
+    }
+
+    /// Entries of [`first_lane_table`]'s table: entry `k` is `0x100 + k`.
+    pub(crate) const FIRST_LANE_TABLE: [u32; 8] =
+        [0x100, 0x101, 0x102, 0x103, 0x104, 0x105, 0x106, 0x107];
+
+    /// A wave32 program of 32 threads with the table of views at s0 (a raw
+    /// UAV at entry 0): lanes above 5 (`v_cmpx`) take entry (lane + 3) & 7
+    /// of a table in the code by its address, read from the first lane
+    /// (`v_readfirstlane_b32` of both dwords, as the console compiler
+    /// reads a constant array at an index it takes as uniform), and store
+    /// it at dword `lane`. With `restore`, EXEC is restored between the
+    /// reads and the load.
+    pub(crate) fn first_lane_table(restore: bool) -> Vec<u32> {
+        let mut w = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0000, // s_load_dwordx4 s[40:43], s[4:5], 0x0
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBE97_037E, // s_mov_b32 s23, exec_lo
+            0x7DA2_0085, // v_cmpx_lt_u32 exec_lo, 5, v0
+            0xBE80_1F00, // 0x20: s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0,           // s_add_u32 s0, s0, table - 0x24
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x4A02_0083, // v_add_nc_u32 v1, 3, v0
+            0x3602_0287, // v_and_b32 v1, 7, v1
+            0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xD70F_6A02,
+            0x0000_0101, // v_add_co_u32 v2, vcc_lo, v1, s0
+            0x5006_0601, // v_add_co_ci_u32 v3, vcc_lo, s1, v3, vcc_lo
+            0x7E04_0502, // v_readfirstlane_b32 s2, v2
+            0x7E06_0503, // v_readfirstlane_b32 s3, v3
+        ];
+        if restore {
+            w.push(0xBEFE_0317); // s_mov_b32 exec_lo, s23
+        }
+        w.extend([
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E18_0206, // v_mov_b32 v12, s6
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            S_ENDPGM,
+        ]);
+        w[10] = 4 * w.len() as u32 - 0x24;
+        w.extend(FIRST_LANE_TABLE);
+        w
+    }
+
+    #[test]
+    fn a_first_lane_address_of_a_code_table_is_traced() {
+        let w = first_lane_table(false);
+        let r = waterfall(&w, false).unwrap();
+        // The UAV descriptor's load, then the table's.
+        let [_, (_, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        assert_eq!(a.param, CODE);
+        // The table follows the code: `s_add_u32`'s literal from 0x24.
+        assert_eq!(a.offset, 0x24 + w[10]);
+        assert!(a.dynamic.is_some() && a.first_lane.is_some(), "{a:?}");
+    }
+
+    #[test]
+    fn a_first_lane_address_read_with_other_lanes_is_refused() {
+        let err = waterfall(&first_lane_table(true), false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("a first-lane address read with other lanes"),
+            "{err}"
         );
     }
 }

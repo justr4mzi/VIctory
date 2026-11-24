@@ -91,6 +91,8 @@ pub mod clamp;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod first_lane_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
