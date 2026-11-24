@@ -14741,7 +14741,7 @@ mod tests {
                 (0x100B, 0),    // UAV @ 0 handle (descriptor_data + load + store)
                 (0x000B, 0),    // read-only SRV @ 1 handle (descriptor_data + load)
                 (0x500B, 0),    // buffer_load_dword glc on UAV @ 0
-                (13, 0x1_0000), // s_buffer_load_dword on read-only CBV @ 2
+                (0x000B, 0),    // s_buffer_load_dword on ResourceHeap reads raw SRV (#1409)
                 (0x100B, 0),    // descriptor_data + plain s_buffer_load_dword on reloaded UAV @ 0
                 (0x500B, 0),    // s_buffer_load_dword glc on reloaded UAV @ 0
             ]
