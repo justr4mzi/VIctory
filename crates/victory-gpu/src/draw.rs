@@ -722,6 +722,13 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            // A dropped compute dispatch may have written UAVs that the next
+            // dispatch reads. Without a barrier the GPU sees stale data or a
+            // wrong resource state, which triggers device removal
+            // (0x887A0006). Emit a global UAV barrier so any subsequent
+            // dispatch starts with a clean hazard slate.
+            #[cfg(windows)]
+            uav_barrier(list);
             return;
         };
         if !p.compute {
@@ -1684,6 +1691,31 @@ fn describe(view: Option<&View>) -> String {
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
+}
+
+/// Emits a global UAV barrier on the host list.
+///
+/// A dropped compute dispatch skips `bind()`, so no `ensure_state` calls are
+/// made for the UAVs it would have written. Without an explicit barrier the
+/// next dispatch that reads those UAVs may see them in a stale resource state,
+/// causing the GPU to fault with DXGI_ERROR_DEVICE_REMOVED (0x887A0006).
+/// Emitting a null-resource UAV barrier forces all prior UAV writes (if any)
+/// to complete and resets the hazard tracker before the next dispatch runs.
+#[cfg(windows)]
+fn uav_barrier(list: &HostList) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    };
+    // SAFETY: an open list; the barrier names no specific resource (global
+    // UAV barrier), so no lifetime concern.
+    unsafe { list.list.ResourceBarrier(&[barrier]) };
 }
 
 /// The console's own primitive topologies.
