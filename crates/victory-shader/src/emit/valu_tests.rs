@@ -4133,3 +4133,256 @@ fn image_gather4_c_lz_and_offset_match_rdna2() {
         ],
     );
 }
+
+#[test]
+fn ds_add_f32_and_ds_cmpst_f32_match_rdna2() {
+    let ds = |op: u8, vdst: u8, vdata1: u8, vdata0: u8, vaddr: u8, offset: u16| -> [u32; 2] {
+        [
+            0xD800_0000 | (op as u32) << 18 | offset as u32,
+            (vdst as u32) << 24 | (vdata1 as u32) << 16 | (vdata0 as u32) << 8 | vaddr as u32,
+        ]
+    };
+    let build_lds_cs = |body: &[u32], threads: [u32; 3]| -> HostShader {
+        let mut words = vec![s_mov_b32(5, 0x80)]; // s5 = 0
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+        words.extend_from_slice(body);
+        words.push(S_ENDPGM);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 12,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                // 512 bytes LDS (1 << 15), 5 user SGPRs (s0..s4).
+                rsrc2: (1 << 15) | (5 << 1),
+                threads,
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res =
+            resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            table_views: lowered.table_views,
+            stride_table: lowered.stride_table,
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy).expect("DXIL validation failed");
+            assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+        }
+        shader
+    };
+
+    // 64-thread shader (two waves, so it needs no WaveSize(32) attribute and
+    // runs on 16-lane iGPUs and WARP too): lane 0 writes s0 to LDS[0], runs
+    // `atomic` under an EXEC guard, and stores [old_or_new, final_lds_0] to UAV[0..2].
+    let single = |atomic: [u32; 2], has_rtn: bool| -> HostShader {
+        let mut body = vec![
+            vop1(0x001, 1, 0x80),    // v1 = 0 (LDS addr)
+            vop1(0x001, 2, sgpr(0)), // v2 = init
+            vop1(0x001, 3, sgpr(1)), // v3 = data0
+            vop1(0x001, 4, sgpr(2)), // v4 = data1
+            vop1(0x001, 5, 0x80),    // v5 = 0 (default old)
+            0x7DA4_0080,             // v_cmpx_eq_u32_e32 0, v0 (lane 0 only)
+        ];
+        body.extend_from_slice(&ds(0x0D, 0, 0, 2, 1, 0)); // ds_write_b32 v1, v2
+        body.extend_from_slice(&atomic);
+        body.extend_from_slice(&ds(0x36, 6, 0, 0, 1, 0)); // ds_read_b32 v6, v1
+        body.extend_from_slice(&buffer_store_dword(if has_rtn { 5 } else { 6 }, 8, 0));
+        body.extend_from_slice(&buffer_store_dword(6, 8, 4));
+        build_lds_cs(&body, [64, 1, 1])
+    };
+
+    let add_no_rtn = single(ds(0x15, 0, 0, 3, 1, 0), false); // ds_add_f32 v1, v3
+    let add_rtn = single(ds(0x55, 5, 0, 3, 1, 0), true); // ds_add_rtn_f32 v5, v1, v3
+    let cmpst_no_rtn = single(ds(0x11, 0, 4, 3, 1, 0), false); // ds_cmpst_f32 v1, v3, v4
+    let cmpst_rtn = single(ds(0x31, 5, 4, 3, 1, 0), true); // ds_cmpst_rtn_f32 v5, v1, v3, v4
+
+    // 64-lane contended ds_add_f32 to the same LDS dword: sum(1..=64) = 2080.0.
+    let mut contend_body = vec![
+        vop1(0x001, 1, 0x80), // v1 = 0 (LDS addr)
+        vop1(0x001, 2, 0x80), // v2 = 0.0f
+    ];
+    contend_body.extend_from_slice(&ds(0x0D, 0, 0, 2, 1, 0)); // ds_write_b32 v1, v2
+    contend_body.push(0xBF8A_0000); // s_barrier
+    contend_body.extend_from_slice(&vop3(0x125, 3, 0x81, vgpr(0), 0)); // v_add_nc_u32 v3, 1, v0
+    contend_body.push(vop1(0x06, 3, vgpr(3))); // v_cvt_f32_u32 v3, v3
+    contend_body.extend_from_slice(&ds(0x15, 0, 0, 3, 1, 0)); // ds_add_f32 v1, v3
+    contend_body.push(0xBF8A_0000); // s_barrier
+    contend_body.extend_from_slice(&ds(0x36, 4, 0, 0, 1, 0)); // ds_read_b32 v4, v1
+    contend_body.extend_from_slice(&buffer_store_dword(4, 8, 0));
+    let contend = build_lds_cs(&contend_body, [64, 1, 1]);
+
+    fn run_pairs(
+        shader: &HostShader,
+        cases: &[[u32; 4]],
+        mut check: impl FnMut(&str, usize, [u32; 4], [u32; 2]),
+    ) {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(shader).expect("compute_pipeline");
+            for (i, &constants) in cases.iter().enumerate() {
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            groups: [1, 1, 1],
+                            roots: vec![(
+                                0,
+                                Root::Constants(vec![
+                                    constants[0],
+                                    constants[1],
+                                    constants[2],
+                                    constants[3],
+                                    0,
+                                ]),
+                            )],
+                            views: &[View::RawUav(2)],
+                            samplers: &[],
+                        },
+                    )
+                    .expect("dispatch");
+                check(label, i, constants, [out[0][0], out[0][1]]);
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "neither hardware nor WARP host ran");
+    }
+
+    let f = f32::to_bits;
+    let add_cases: &[(u32, u32, u32)] = &[
+        (f(1.5), f(2.25), f(3.75)),
+        (f(-3.5), f(3.5), f(0.0)),
+        (0x8000_0000, 0x8000_0000, 0x8000_0000),
+    ];
+    let add_in: Vec<[u32; 4]> = add_cases.iter().map(|&(a, b, _)| [a, b, 0, 0]).collect();
+    run_pairs(&add_no_rtn, &add_in, |label, i, inp, got| {
+        let want = add_cases[i].2;
+        assert_eq!(
+            got[1], want,
+            "{label}: ds_add_f32({:#010x}, {:#010x}) mem={:#010x}, want {want:#010x}",
+            inp[0], inp[1], got[1]
+        );
+    });
+    run_pairs(&add_rtn, &add_in, |label, i, inp, got| {
+        let want = add_cases[i].2;
+        assert_eq!(
+            got,
+            [inp[0], want],
+            "{label}: ds_add_rtn_f32({:#010x}, {:#010x}) got={got:#010x?}",
+            inp[0],
+            inp[1]
+        );
+    });
+    // NaN in memory or operand terminates without spinning and yields NaN.
+    let nan_in = [
+        [0x7FC0_0001u32, f(1.0), 0, 0],
+        [f(1.0), 0x7FC0_0001u32, 0, 0],
+    ];
+    run_pairs(&add_rtn, &nan_in, |label, _, inp, got| {
+        assert_eq!(got[0], inp[0], "{label}: ds_add_rtn_f32 NaN old value");
+        assert!(
+            f32::from_bits(got[1]).is_nan(),
+            "{label}: ds_add_rtn_f32 NaN result={:#010x}",
+            got[1]
+        );
+    });
+
+    let cmpst_cases: &[(u32, u32, u32, u32)] = &[
+        (f(1.5), f(1.5), f(9.0), f(9.0)),                // match
+        (f(1.5), f(2.0), f(9.0), f(1.5)),                // mismatch
+        (0x0000_0000, 0x8000_0000, f(7.0), f(7.0)),      // +0.0 == -0.0
+        (0x8000_0000, 0x0000_0000, f(7.0), f(7.0)),      // -0.0 == +0.0
+        (0x7FC0_0001, 0x7FC0_0001, f(7.0), 0x7FC0_0001), // NaN != NaN
+    ];
+    let cmpst_in: Vec<[u32; 4]> = cmpst_cases
+        .iter()
+        .map(|&(a, b, c, _)| [a, b, c, 0])
+        .collect();
+    run_pairs(&cmpst_no_rtn, &cmpst_in, |label, i, inp, got| {
+        let want = cmpst_cases[i].3;
+        assert_eq!(
+            got[1], want,
+            "{label}: ds_cmpst_f32(init={:#010x}, cmp={:#010x}) mem={:#010x}, want {want:#010x}",
+            inp[0], inp[1], got[1]
+        );
+    });
+    run_pairs(&cmpst_rtn, &cmpst_in, |label, i, inp, got| {
+        let want = cmpst_cases[i].3;
+        assert_eq!(
+            got,
+            [inp[0], want],
+            "{label}: ds_cmpst_rtn_f32(init={:#010x}, cmp={:#010x}) got={got:#010x?}",
+            inp[0],
+            inp[1]
+        );
+    });
+
+    run_pairs(&contend, &[[0; 4]], |label, _, _, got| {
+        assert_eq!(
+            got[0],
+            f(2080.0),
+            "{label}: 64-lane contended ds_add_f32 = {} ({:#010x}), want 2080.0",
+            f32::from_bits(got[0]),
+            got[0]
+        );
+    });
+}
