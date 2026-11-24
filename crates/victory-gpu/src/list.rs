@@ -1531,21 +1531,41 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// its instance descriptions there (and wrote through our old
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
-    let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
-        return std::ptr::null_mut();
-    };
-    if this.is_null() || !align.is_power_of_two() {
+    if this.is_null() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
+    let Ok(raw_align) = usize::try_from(alignment) else {
+        return std::ptr::null_mut();
+    };
+    if raw_align != 0 && !raw_align.is_power_of_two() {
+        return std::ptr::null_mut();
+    }
+    let align = raw_align.max(16);
+    let Some(len) = usize::try_from(size)
+        .ok()
+        .and_then(|s| s.checked_add(align))
+    else {
+        return std::ptr::null_mut();
+    };
+    let mut block = Vec::new();
+    if block.try_reserve_exact(len).is_err() {
+        return std::ptr::null_mut();
+    }
+    block.resize(len, 0);
     let start = block.as_mut_ptr();
-    // SAFETY: the offset is below `align`, so `size` bytes fit after it.
-    let at = unsafe { start.add(start.align_offset(align)) };
+    let offset = start.align_offset(align);
+    if offset >= align {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `offset < align` and `len == size + align`, so `size` bytes fit after `offset`.
+    let at = unsafe { start.add(offset) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    uploads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(block);
     at
 }
 
@@ -3140,6 +3160,64 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
 
         assert_eq!(reset(list, allocator, null), S_OK);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn allocate_upload_validates_alignments_and_handles_oversized_requests() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        assert!(allocate_upload(null, 16, 16).is_null());
+        for bad in [3u64, 5, 6, 7, 9, 10, 12, 14, 15, 24, 0x30, u64::MAX] {
+            assert!(
+                allocate_upload(list, 8, bad).is_null(),
+                "invalid alignment {bad} must return null"
+            );
+        }
+
+        assert!(allocate_upload(list, 16, 1u64 << 63).is_null());
+        assert!(allocate_upload(list, isize::MAX as u64, 16).is_null());
+        assert!(allocate_upload(list, (isize::MAX as u64) + 1, 16).is_null());
+        assert!(allocate_upload(list, u64::MAX, 16).is_null());
+        #[cfg(all(windows, target_pointer_width = "64"))]
+        assert!(allocate_upload(list, 1u64 << 50, 16).is_null());
+
+        // SAFETY: `list` was allocated by `create_list` and remains live until released below.
+        let uploads = unsafe { &(*list.cast::<List>()).uploads };
+        assert!(uploads.lock().unwrap().is_empty());
+
+        for align in [0u64, 1, 2, 4, 8, 16, 32, 64, 256, 4096] {
+            let p = allocate_upload(list, 24, align);
+            let want = align.max(16) as usize;
+            assert!(
+                !p.is_null() && (p as usize).is_multiple_of(want),
+                "valid alignment {align} must succeed"
+            );
+            // SAFETY: `allocate_upload` handed out 24 zeroed writable bytes at `p`.
+            let zeroed = unsafe { std::slice::from_raw_parts(p, 24) };
+            assert_eq!(zeroed, &[0u8; 24]);
+            // SAFETY: 24 writable bytes at `p`.
+            unsafe { p.write_bytes(0x5a, 24) };
+        }
+        let zero_len = allocate_upload(list, 0, 64);
+        assert!(!zero_len.is_null() && (zero_len as usize).is_multiple_of(64));
+
+        assert_eq!(close(list), S_OK);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(uploads.lock().unwrap().is_empty());
+
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
