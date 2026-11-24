@@ -74,8 +74,8 @@ impl Op {
 pub(crate) enum Sym {
     Unknown,
     K(u32),
-    /// The lane's own value of a VGPR value from before the section.
-    Own(Value),
+    /// Lane `u8`'s value of a VGPR value from before the section.
+    Own(Value, u8),
     /// A uniform value from before the section.
     Uni(Value),
     /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane).
@@ -299,7 +299,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     Some(x) => vec
                         .get(&x)
                         .cloned()
-                        .unwrap_or_else(|| (0..wave).map(|_| Sym::Own(x)).collect()),
+                        .unwrap_or_else(|| (0..wave).map(|l| Sym::Own(x, l as u8)).collect()),
                     None => one(Sym::Unknown),
                 },
                 Operand::Scalar { code, .. } if code != NULL => match inst.read(Reg::S(code)) {
@@ -396,7 +396,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 let b = src(1).unwrap_or_default();
                 (0..wave as usize)
                     .map(|l| match (a[l], b.get(l).copied(), mask) {
-                        (Sym::K(ident), Some(Sym::Own(x)), Some(m)) if masked.contains(&m) => {
+                        (Sym::K(ident), Some(Sym::Own(x, from)), Some(m))
+                            if masked.contains(&m) && usize::from(from) == l =>
+                        {
                             Sym::Red {
                                 op: None,
                                 src: x,
@@ -523,7 +525,7 @@ fn shapes(
     let mut out = HashMap::new();
     let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
-        Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
+        Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
             op: Some(op),
             src,
@@ -563,10 +565,18 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     {
         return Some(Shape::Masked(m.0, m.1, m.2));
     }
+    if let Sym::Own(x, 0) = first
+        && lanes
+            .iter()
+            .enumerate()
+            .all(|(l, &s)| s == Sym::Own(x, l as u8))
+    {
+        return Some(Shape::Value(x));
+    }
     if lanes.iter().all(|&s| s == first) {
         return match first {
             Sym::K(k) => Some(Shape::K(k)),
-            Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
+            Sym::Uni(x) => Some(Shape::Value(x)),
             Sym::Red {
                 op: Some(op),
                 src,
@@ -676,5 +686,95 @@ mod tests {
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
         );
+    }
+
+    #[test]
+    fn cross_lane_ops_on_pre_section_vgpr_do_not_collapse_to_identity() {
+        let sop1 = |op: u32, sdst: u32, ssrc0: u32| 0xBE80_0000 | sdst << 16 | op << 8 | ssrc0;
+        let vop1 = |op: u32, vdst: u32, src0: u32| 0x7E00_0000 | vdst << 17 | op << 9 | src0;
+        let vop3 = |op: u32, dst: u32, s0: u32, s1: u32, s2: u32| -> [u32; 2] {
+            [0xD400_0000 | op << 16 | dst, s0 | s1 << 9 | s2 << 18]
+        };
+        let mut words = Vec::new();
+        // Whole-wave section: s_or_saveexec_b32 s4, -1
+        words.push(sop1(0x3D, 4, 193));
+        // 1. v_readlane_b32 s5, v0, 7 (reads lane 7 of pre-section v0)
+        //    and v_mov_b32 v7, s5 (broadcasts lane 7 of v0 across all lanes)
+        words.extend(vop3(0x360, 5, 256, 128 + 7, 0));
+        words.push(vop1(0x01, 7, 5));
+        // 2. v_mov_b32_dpp v1, v0 row_mirror (0x140, row_mask=0xF, bank_mask=0xF)
+        words.push(vop1(0x01, 1, 0xFA));
+        words.push(0xFF00_0000 | (0x140 << 8));
+        // 3. v_cndmask_b32_e64 v2, 0, v1, s4 (masked select over shuffled v1)
+        words.extend(vop3(0x101, 2, 128, 257, 4));
+        // 4. v_permlanex16_b32 v3, v0, 0, 0
+        words.extend(vop3(0x378, 3, 256, 128, 128));
+        // 5. Positive controls: plain copy, unshuffled masked select, uniform readlane
+        words.push(vop1(0x01, 4, 256)); // v_mov_b32 v4, v0
+        words.extend(vop3(0x101, 5, 128, 256, 4)); // v_cndmask_b32_e64 v5, 0, v0, s4
+        words.push(vop1(0x01, 6, 0)); // v_mov_b32 v6, s0
+        words.extend(vop3(0x360, 6, 262, 128 + 7, 0)); // v_readlane_b32 s6, v6, 7
+        // Restore EXEC: s_mov_b32 exec_lo, s4
+        words.push(sop1(0x03, 126, 4));
+        // Keep outputs live after the section:
+        words.push(vop1(0x01, 10, 5)); // v_mov_b32 v10, s5
+        words.push(vop1(0x01, 11, 257)); // v_mov_b32 v11, v1
+        words.push(vop1(0x01, 12, 258)); // v_mov_b32 v12, v2
+        words.push(vop1(0x01, 13, 259)); // v_mov_b32 v13, v3
+        words.push(vop1(0x01, 14, 260)); // v_mov_b32 v14, v4
+        words.push(vop1(0x01, 15, 261)); // v_mov_b32 v15, v5
+        words.push(vop1(0x01, 16, 6)); // v_mov_b32 v16, s6
+        words.push(vop1(0x01, 17, 263)); // v_mov_b32 v17, v7
+        words.push(0xBF81_0000); // s_endpgm
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 32).unwrap();
+        let secs = sections(&p, 0);
+        let sec = &secs[&0];
+        let insts = &p.blocks[0].insts;
+
+        let v0_in = p.inputs.iter().find(|i| i.0 == Reg::V(0)).unwrap().1;
+        let s0_in = p.inputs.iter().find(|i| i.0 == Reg::S(0)).unwrap().1;
+        let s4 = insts[0].write(Reg::S(4)).unwrap();
+
+        let s5 = insts[1].write(Reg::S(5)).unwrap();
+        let v7 = insts[2].write(Reg::V(7)).unwrap();
+        let v1 = insts[3].write(Reg::V(1)).unwrap();
+        let v2 = insts[4].write(Reg::V(2)).unwrap();
+        let v3 = insts[5].write(Reg::V(3)).unwrap();
+        let v4 = insts[6].write(Reg::V(4)).unwrap();
+        let v5 = insts[7].write(Reg::V(5)).unwrap();
+        let v6 = insts[8].write(Reg::V(6)).unwrap();
+        let s6 = insts[9].write(Reg::S(6)).unwrap();
+
+        assert_eq!(
+            sec.shapes.get(&s5),
+            None,
+            "v_readlane_b32 of pre-section VGPR must not collapse to Shape::Value"
+        );
+        assert_eq!(
+            sec.shapes.get(&v7),
+            None,
+            "broadcast of one lane's pre-section VGPR must not collapse to Shape::Value"
+        );
+        assert_eq!(
+            sec.shapes.get(&v1),
+            None,
+            "DPP row_mirror of pre-section VGPR must not collapse to Shape::Value"
+        );
+        assert_eq!(
+            sec.shapes.get(&v2),
+            None,
+            "v_cndmask_b32 over shuffled pre-section VGPR must not become Shape::Masked"
+        );
+        assert_eq!(
+            sec.shapes.get(&v3),
+            None,
+            "v_permlanex16_b32 of pre-section VGPR must not collapse to Shape::Value"
+        );
+        assert_eq!(sec.shapes.get(&v4), Some(&Shape::Value(v0_in)));
+        assert_eq!(sec.shapes.get(&v5), Some(&Shape::Masked(v0_in, s4, 0)));
+        assert_eq!(sec.shapes.get(&v6), Some(&Shape::Value(s0_in)));
+        assert_eq!(sec.shapes.get(&s6), Some(&Shape::Value(s0_in)));
     }
 }
