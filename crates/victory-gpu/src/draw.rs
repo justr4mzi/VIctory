@@ -303,6 +303,16 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
+    /// Sets depth bounds on the host command list.
+    pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList1;
+        if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+            // SAFETY: a valid open command list.
+            unsafe { list1.OMSetDepthBounds(min, max) };
+        }
+    }
+
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         let Some(host) = crate::host::host() else {

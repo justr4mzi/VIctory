@@ -1575,6 +1575,10 @@ mod state {
             crate::draw::scissors(list, items(rects, count));
         }
     }
+    pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+        with_state(this, |list, s| s.set_depth_bounds(list, min, max));
+    }
+
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
         if let Some(list) = host_list(this) {
             // SAFETY: the title passes four floats or null.
@@ -1791,6 +1795,7 @@ mod state {
     pub(super) use super::ignored_state as compute_constants;
     pub(super) use super::ignored_state as compute_table;
     pub(super) use super::ignored_state as compute_view;
+    pub(super) use super::ignored_state as depth_bounds;
     pub(super) use super::ignored_state as graphics_constant;
     pub(super) use super::ignored_state as graphics_constants;
     pub(super) use super::ignored_state as graphics_table;
@@ -1995,7 +2000,7 @@ const METHODS: [(usize, *const ()); 54] = [
     (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
@@ -2668,6 +2673,8 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        // Depth bounds at slot 68 (0x220) accepts min and max bounds.
+        slot::<extern "system" fn(This, f32, f32)>(list, 0x220)(list, 0.0, 1.0);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
