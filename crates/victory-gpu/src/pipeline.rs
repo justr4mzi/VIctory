@@ -674,3 +674,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod placed_uav_tests;
