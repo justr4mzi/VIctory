@@ -1749,6 +1749,7 @@ fn vs_rt_and_viewport_index_exports_validate_and_create_pso() {
         Vec::new(),
         StageIo::Ps {
             inputs: Vec::new(),
+            rsrc2: 0,
             input_addr: 0,
             db_shader_control: 0,
             patches: Vec::new(),

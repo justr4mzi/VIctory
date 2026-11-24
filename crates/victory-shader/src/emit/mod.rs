@@ -503,6 +503,7 @@ mod tests {
             used: vec![],
             io: StageIo::Ps {
                 inputs: vec![],
+                rsrc2: 0,
                 input_addr: 0,
                 db_shader_control: 0,
                 patches: vec![],
@@ -553,6 +554,7 @@ mod tests {
             used: vec![],
             io: StageIo::Ps {
                 inputs: vec![],
+                rsrc2: 0,
                 input_addr: 0,
                 db_shader_control: 0,
                 patches: vec![],
@@ -802,6 +804,7 @@ mod tests {
                         pack2: false,
                         row2: 0,
                     }],
+                    rsrc2: 0,
                     input_addr,
                     db_shader_control: 0,
                     patches: vec![],
@@ -873,6 +876,7 @@ mod tests {
                     pack2: false,
                     row2: 0,
                 }],
+                rsrc2: 0,
                 input_addr: 0,
                 db_shader_control: 0,
                 patches: vec![],
@@ -922,6 +926,7 @@ mod tests {
             used: vec![],
             io: crate::native::StageIo::Ps {
                 inputs: vec![],
+                rsrc2: 0,
                 input_addr: 1 << 8,
                 db_shader_control: 0,
                 patches: vec![],
@@ -1550,6 +1555,7 @@ mod barycentric_tests {
                     pack2: false,
                     row2: 0,
                 }],
+                rsrc2: 0,
                 input_addr,
                 db_shader_control: 0,
                 patches: vec![],
@@ -1789,5 +1795,85 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    #[test]
+    fn pixel_reads_of_uninitialized_sgprs_read_as_zero() {
+        let try_emit = |rsrc2: u32, sgpr: u32| {
+            // v_mov_b32 v0, s<sgpr>; exp mrt0, v0, v0, v0, v0 done vm; s_endpgm
+            let words = [0x7E00_0200u32 | sgpr, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
+            let native = super::NativeProgram {
+                stage: super::HwStage::Ps,
+                wave64: false,
+                vgprs: 2,
+                layout: vec![],
+                used: vec![],
+                io: crate::native::StageIo::Ps {
+                    inputs: vec![],
+                    rsrc2,
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let osg1 = super::container::signature(
+                &[SigElement {
+                    name: "SV_Target".into(),
+                    index: 0,
+                    kind: 16,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(0),
+                    col: 0,
+                    cols: 4,
+                    usage: 15,
+                    half: false,
+                }],
+                false,
+            );
+            let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            super::emit(&c, &native, &p, &st, &io, &res)
+        };
+
+        // 2 user SGPRs (s0..=s1) + prim_mask (s2) -> initialized_sgprs = 3.
+        let rsrc2 = 2 << 1;
+        // s2 is hardware-initialized (prim_mask) and must still be refused.
+        assert!(matches!(
+            try_emit(rsrc2, 2),
+            Err(crate::ShaderError::Unsupported {
+                what: "a hardware SGPR input",
+                ..
+            })
+        ));
+        // s3 is uninitialized on entry and reads as zero, passing DXIL validation.
+        let out = try_emit(rsrc2, 3).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        // Enabling SCRATCH_EN (bit 0) initializes s3 (scratch wave offset), so
+        // s3 is refused again while s4 reads as zero.
+        assert!(matches!(
+            try_emit(rsrc2 | 1, 3),
+            Err(crate::ShaderError::Unsupported {
+                what: "a hardware SGPR input",
+                ..
+            })
+        ));
+        let out = try_emit(rsrc2 | 1, 4).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
     }
 }

@@ -9347,6 +9347,7 @@ mod tests {
         // own (6). Unnamed 16-bit rows: 1, 4, 6, 7.
         let io = StageIo::Ps {
             inputs: vec![entry(0, 0, true), entry(3, 3, true), entry(5, 6, true)],
+            rsrc2: 0,
             input_addr: 0,
             db_shader_control: 0,
             patches: vec![],
