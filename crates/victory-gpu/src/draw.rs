@@ -1453,6 +1453,15 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         } else {
             shadow.ensure_state(list, SHADER_RESOURCE);
         }
+        // A shader view off its buffer copy's elements reads its own copy of
+        // just its bytes: that one is a host copy like any other, so its own
+        // refresh brings it up to date from title memory (which the last
+        // submission's copy-back already wrote).
+        if u.kind == ResourceType::Srv
+            && let Some(aligned) = crate::shadow::aligned_existing(address, len)
+        {
+            crate::shadow::defer_align(&aligned, list, address, len);
+        }
     }
     match (view, u.kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {

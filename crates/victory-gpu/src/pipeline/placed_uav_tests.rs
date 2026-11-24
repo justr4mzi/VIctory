@@ -79,10 +79,14 @@ fn store_shader() -> Arc<Shader> {
         stage: "compute",
         hash: blake3::hash(&native.code).to_hex()[..16].to_owned(),
         container,
-        translated: OnceLock::from(Some(Translated {
-            host,
-            used: native.used,
-        })),
+        translated: [
+            OnceLock::from(Some(Translated {
+                host,
+                used: native.used,
+            })),
+            OnceLock::new(),
+            OnceLock::new(),
+        ],
     })
 }
 

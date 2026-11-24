@@ -121,10 +121,19 @@ impl Shadow {
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
-    /// and keeps the copy alive until the list is reset.
+    /// and keeps the copy alive until the list is reset. Cut to the copy.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
-        let len = len.min(self.start + self.len - address);
-        list.defer_refresh(self, address as usize, len as usize);
+        let from = address.max(self.start);
+        let len = inside(
+            from,
+            len.saturating_sub(from - address),
+            self.start,
+            self.len,
+        );
+        if len == 0 {
+            return;
+        }
+        list.defer_refresh(self, from as usize, len as usize);
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
@@ -496,6 +505,91 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Copies of just one view's bytes, by (start, length): for a view whose
+/// start is not on an element of its host copy (`aligned`). The heap slot
+/// holds the copy; this map only finds it again, so it holds weak references
+/// and the copy goes when the slot is remade.
+static ALIGNED: Mutex<BTreeMap<(u64, u64), std::sync::Weak<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// A copy of `[address, address + len)` that starts at `address` itself, so a
+/// structured view of it can have its elements where the title put them.
+///
+/// A title aligns a resource; the host copy of a buffer starts where the
+/// buffer does, so a view of memory the title placed inside another object
+/// (`View::Placed`) starts at an offset that need not be a multiple of the
+/// view's stride. This copy starts at the view, and the slot that made it
+/// keeps it alive.
+pub(crate) fn aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if len == 0 {
+        return None;
+    }
+    let key = (address, len);
+    if let Some(copy) = ALIGNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .and_then(std::sync::Weak::upgrade)
+    {
+        return Some(copy);
+    }
+    // Views hold hundreds of megabytes in the world, and the copy is readable
+    // by shaders and written by the CPU only, so system memory the CPU maps is
+    // enough.
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(64))?;
+    crate::host::name(&buffer, || format!("aligned view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let copy = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    ALIGNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, Arc::downgrade(&copy));
+    tracing::debug!(
+        address = format_args!("{address:#x}"),
+        len,
+        "aligned view copy made"
+    );
+    Some(copy)
+}
+
+/// The copy `aligned` made for this range, if one is still alive.
+pub(crate) fn aligned_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    ALIGNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(address, len))
+        .and_then(std::sync::Weak::upgrade)
+}
+
+/// `[address, address + len)` of the title is brought into the view's own copy
+/// by a refresh of that copy itself.
+///
+/// The copy is a host copy like any other, so its own refresh copies the 64
+/// KiB pages the title wrote since they were last copied, straight from title
+/// memory. The submission's copy-back runs before its lists are reset and
+/// before the next submission prepares (`Host::execute` waits for the GPU
+/// before copying back), so by then title memory holds what the GPU wrote and
+/// the aligned copy sees it. Copying from the buffer's copy instead would copy
+/// the view's whole range again on every submission.
+pub(crate) fn defer_align(aligned: &Arc<Shadow>, list: &HostList, address: u64, len: u64) {
+    // shortcut: the copy is made at submission preparation, from title memory,
+    // so it does not see what a shader of the same submission wrote in that
+    // range before this read. Getting that right needs every host buffer's
+    // state tracked across the submission (PR #334), so that the bytes can be
+    // copied on the GPU inside the list instead.
+    aligned.refresh(list, address, len);
+}
+
+/// How many bytes of `[address, address + len)` lie inside the copy that
+/// starts at `start` of `size` bytes: what a refresh of that copy can bring up
+/// to date. `0` when the range is not inside it at all.
+fn inside(address: u64, len: u64, start: u64, size: u64) -> u64 {
+    let end = start.saturating_add(size);
+    let from = address.max(start);
+    let to = address.saturating_add(len).min(end);
+    to.saturating_sub(from)
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
@@ -578,5 +672,24 @@ mod tests {
         // Same state does nothing
         shadow.ensure_state(&list, 0x1);
         assert_eq!(shadow.state.load(Ordering::Relaxed), 0x1);
+    }
+
+    /// A refresh of the aligned copy brings up to date the bytes of the view
+    /// that lie inside it, cut at both ends, and nothing when the range is
+    /// outside it.
+    #[test]
+    fn a_refresh_covers_the_views_bytes_inside_its_copy() {
+        // The hit-detection view: 3136 bytes of 56-byte elements, 48 bytes
+        // into its buffer, in a copy that starts at the view.
+        assert_eq!(inside(0x3000_0030, 3136, 0x3000_0030, 3136), 3136);
+        // A view reaching past its copy is cut to it.
+        assert_eq!(inside(0x4000_0100, 900, 0x4000_0100, 0x100), 0x100);
+        // A view starting before its copy loses the part before it.
+        assert_eq!(inside(0x0ff8, 0x40, 0x1000, 0x1000), 0x38);
+        // Outside the copy at either end: nothing to refresh.
+        assert_eq!(inside(0x1000, 0x10, 0x2000, 0x100), 0);
+        assert_eq!(inside(0x20f0, 0x20, 0x1000, 0x100), 0);
+        // A size that would overflow does not.
+        assert_eq!(inside(u64::MAX - 8, 16, 0, 16), 0);
     }
 }

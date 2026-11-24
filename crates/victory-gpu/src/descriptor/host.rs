@@ -62,6 +62,11 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// The copy of just its view's bytes each slot reads instead of its
+    /// buffer's copy, held while the slot does (the map only finds it):
+    /// dropping it would leave the descriptor reading a copy nothing
+    /// refreshes. `None` for a slot that reads its buffer's copy.
+    kept_copy: Mutex<Vec<Option<std::sync::Arc<crate::shadow::Shadow>>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -277,6 +282,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![SlotState::Null; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept_copy: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             strides,
             alias_base: count + extra,
@@ -449,7 +455,10 @@ impl HostHeap {
             }
         }
         self.note_view(index, view, kept.as_ref());
-        self.keep(index, kept.flatten());
+        match kept {
+            Some(Kept::Nothing) | None => self.keep(index, None, None),
+            Some(Kept::Resource { resource, copy }) => self.keep(index, Some(resource), copy),
+        }
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -459,7 +468,7 @@ impl HostHeap {
         } else {
             null_view(self.cpu(index));
         }
-        self.keep(index, None);
+        self.keep(index, None, None);
         self.forget_view(index);
     }
 
@@ -471,11 +480,17 @@ impl HostHeap {
         } else {
             write_null(desc, self.cpu(index));
         }
-        self.keep(index, None);
+        self.keep(index, None, None);
     }
 
-    /// Slot `index` now views `resource` (or nothing of the host's).
-    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+    /// Slot `index` now views `resource` (or nothing of the host's) and, if
+    /// it reads a copy of just its view's bytes, keeps `copy` alive.
+    fn keep(
+        &self,
+        index: u32,
+        resource: Option<ID3D12Resource>,
+        copy: Option<std::sync::Arc<crate::shadow::Shadow>>,
+    ) {
         let previous = {
             let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             let Some(slot) = kept.get_mut(index as usize) else {
@@ -485,6 +500,10 @@ impl HostHeap {
         };
         if let Some(previous) = previous {
             crate::host::release_late(previous);
+        }
+        let mut held = self.kept_copy.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = held.get_mut(index as usize) {
+            *slot = copy;
         }
     }
 
@@ -511,7 +530,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.keep(index, None);
+        self.keep(index, None, None);
         self.forget_view(index);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
@@ -550,13 +569,13 @@ impl HostHeap {
             host.device
                 .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
         };
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, Some(buffer.clone()), None);
     }
 
     /// Makes slot `index` a raw buffer view that reads zeros.
     pub(crate) fn null_raw_at(&self, index: u32) {
         null_buffer_view(self.cpu(index));
-        self.keep(index, None);
+        self.keep(index, None, None);
     }
 
     /// Whether this is a sampler heap.
@@ -663,7 +682,10 @@ impl HostHeap {
                 }
             }
             self.note_view(index, &view, kept.as_ref());
-            self.keep(index, kept.flatten());
+            match kept {
+                Some(Kept::Nothing) | None => self.keep(index, None, None),
+                Some(Kept::Resource { resource, copy }) => self.keep(index, Some(resource), copy),
+            }
         }
         Some(view)
     }
@@ -762,13 +784,7 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         _ => return None,
     };
     let desc = srv_desc(words);
-    let element = element_size(&desc);
-    // SAFETY: a buffer view's union member.
-    let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    Some(view_range_of(base, &desc))
 }
 
 fn uav_element_size(desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> Option<u64> {
@@ -796,7 +812,7 @@ impl HostHeap {
             return self.forget_view(index);
         };
         let stride = view_stride(view);
-        let entry = match viewed_bytes(view, kept.as_ref()) {
+        let entry = match viewed_bytes(view, kept.resource()) {
             // Not a buffer view, or a raw one: the slot's own view.
             Viewed::Own => {
                 self.unalias(index);
@@ -1078,8 +1094,142 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
-/// The host resource a slot made by [`make`] views, if any.
-type Kept = Option<ID3D12Resource>;
+/// What a slot made by [`make`] views keeps alive.
+pub(crate) enum Kept {
+    /// Made, and keeps nothing alive (a sampler slot).
+    Nothing,
+    /// Made, viewing `resource`; `copy` is the copy of just the view's bytes
+    /// it reads instead of its buffer's copy, if it made one.
+    Resource {
+        resource: ID3D12Resource,
+        copy: Option<std::sync::Arc<crate::shadow::Shadow>>,
+    },
+}
+
+impl Kept {
+    fn resource(&self) -> Option<&ID3D12Resource> {
+        match self {
+            Self::Nothing => None,
+            Self::Resource { resource, .. } => Some(resource),
+        }
+    }
+}
+
+/// The title memory a buffer shader view reads, from where its descriptor puts
+/// it in the resource at `address`: its first element and the bytes its
+/// elements take.
+fn view_range_of(address: u64, desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> (u64, u64) {
+    let element = element_size(desc);
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    (
+        address.saturating_add(buffer.FirstElement * element),
+        u64::from(buffer.NumElements) * element,
+    )
+}
+
+/// The host copy a buffer shader view reads, the element its start is, and
+/// whether that copy holds only the view's bytes.
+///
+/// [`Copy::OwnBytes`] is for a view of memory the title placed inside another
+/// object (`View::Placed`: methods 0x230 and 0x238), whose start need not be a
+/// multiple of its stride. Its copy is a host copy like any other, so its own
+/// refresh brings it up to date from title memory, and a shader sees what the
+/// rest of the pipeline sees.
+fn shader_copy(
+    address: u64,
+    len: u64,
+    desc: &D3D12_SHADER_RESOURCE_VIEW_DESC,
+) -> Result<(std::sync::Arc<crate::shadow::Shadow>, u64, bool), &'static str> {
+    // The view's own range, which is also the key `aligned` caches it by (the
+    // one `buffer_range` gives `readable`).
+    let (from, bytes) = view_range_of(address, desc);
+    let buffer = crate::shadow::find(address, len).ok_or("no host copy of its buffer")?;
+    match plan(bytes, element_size(desc), buffer.offset(from)) {
+        Copy::Element { first } => Ok((buffer, first, false)),
+        Copy::OwnBytes => {
+            let copy = crate::shadow::aligned(from, bytes).ok_or("no copy of the view")?;
+            Ok((copy, 0, true))
+        }
+        Copy::None { why } => Err(why),
+    }
+}
+
+/// What a buffer shader view reads.
+enum Copy {
+    /// The buffer's copy, at this element.
+    Element { first: u64 },
+    /// A copy of just the view's bytes, starting at the view.
+    OwnBytes,
+    /// Nothing, for the reason given.
+    None { why: &'static str },
+}
+
+/// Where a buffer shader view's bytes come from: the buffer's copy when the
+/// view starts on one of its elements (`element` bytes each, at `offset` in
+/// the copy), else a copy of the view's own bytes.
+fn plan(len: u64, element: u64, offset: u64) -> Copy {
+    // Elements of a format whose size is not known: left null, as before.
+    if element == 0 {
+        return Copy::None {
+            why: "elements of unknown size",
+        };
+    }
+    if offset.is_multiple_of(element) {
+        return Copy::Element {
+            first: offset / element,
+        };
+    }
+    if len == 0 {
+        return Copy::None {
+            why: "a view of no bytes",
+        };
+    }
+    Copy::OwnBytes
+}
+
+/// Strides from `VICTORY_NULL_VIEW_STRIDES`: decimal or `0x` hex, comma
+/// separated; anything else is named and skipped.
+#[cfg(feature = "diagnostics")]
+fn parsed_strides(value: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    for part in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match part
+            .strip_prefix("0x")
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .or_else(|| part.parse().ok())
+        {
+            Some(n) => out.push(n),
+            None => tracing::warn!(
+                part,
+                "VICTORY_NULL_VIEW_STRIDES expects strides in decimal or 0x hex"
+            ),
+        }
+    }
+    out
+}
+
+/// With `VICTORY_NULL_VIEW_STRIDES` (diagnostics): buffer views of these
+/// strides are left null, to confirm in the game which ones a pass needs.
+/// Decimal or `0x` hex strides, comma separated.
+fn nulled_stride(stride: u32) -> bool {
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = stride;
+        false
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        if stride == 0 {
+            return false;
+        }
+        static NULLED: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+        let nulled = NULLED.get_or_init(|| {
+            parsed_strides(&std::env::var("VICTORY_NULL_VIEW_STRIDES").unwrap_or_default())
+        });
+        nulled.contains(&stride)
+    }
+}
 
 /// A structured view's bytes as a raw view of its host copy: the first
 /// dword and the dword count, for a view `offset` bytes into the copy whose
@@ -1111,34 +1261,54 @@ fn buffer_srv(
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    placed: bool,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
-    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let initial = unsafe { desc.Anonymous.Buffer };
+    let stride = initial.StructureByteStride;
     // D3D12 refuses a buffer view of no elements (it removes the device);
     // the console reads nothing through one, as a null view does.
-    if buffer.NumElements == 0 {
+    if initial.NumElements == 0 {
         once!("buffer view of no elements made null");
         return None;
     }
-    let offset = shadow.offset(address);
-    if element != 0 && offset % element == 0 {
-        buffer.FirstElement += offset / element;
-        let remaining = shadow.left(address) / element;
-        buffer.NumElements = if buffer.NumElements == 0 {
-            remaining as u32
-        } else {
-            buffer.NumElements.min(remaining as u32)
-        };
-        if buffer.NumElements == 0 {
+    if nulled_stride(stride) {
+        once!(
+            stride,
+            "a buffer shader view left null (VICTORY_NULL_VIEW_STRIDES)"
+        );
+        return None;
+    }
+    let Some(shared) = crate::shadow::find(address, len) else {
+        once!(
+            view = kind(placed),
+            address = format_args!("{address:#x}"),
+            len,
+            element,
+            stride,
+            why = "no host copy of its buffer",
+            "a buffer shader view left null"
+        );
+        return None;
+    };
+    let offset = shared.offset(address);
+    let (shadow, own) = if element != 0 && offset % element == 0 {
+        let remaining = shared.left(address) / element;
+        let num = initial.NumElements.min(remaining as u32);
+        if num == 0 {
             return None;
         }
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
+        buffer.FirstElement += offset / element;
+        buffer.NumElements = num;
+        (shared, false)
     } else if let Some((first, count)) = raw_window(
         offset,
-        buffer.FirstElement,
-        buffer.NumElements,
-        buffer.StructureByteStride,
+        initial.FirstElement,
+        initial.NumElements,
+        initial.StructureByteStride,
     ) {
         // shortcut: a shader that indexes the view declares it structured,
         // and D3D12 leaves structured reads of a raw view undefined (NVIDIA
@@ -1148,11 +1318,13 @@ fn buffer_srv(
             element,
             "structured buffer view off its host copy's elements made raw"
         );
-        let remaining = (shadow.left(address) / 4) as u32;
-        let count = if count == 0 { remaining } else { count.min(remaining) };
+        let remaining = (shared.left(address) / 4) as u32;
+        let count = count.min(remaining);
         if count == 0 {
             return None;
         }
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
         *buffer = D3D12_BUFFER_SRV {
             FirstElement: first,
             NumElements: count,
@@ -1160,21 +1332,49 @@ fn buffer_srv(
             Flags: D3D12_BUFFER_SRV_FLAG_RAW,
         };
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        (shared, false)
     } else {
-        once!(
-            offset,
-            element,
-            "buffer view not on an element of its host copy"
-        );
-        return None;
-    }
+        let (shadow, first, own) = shader_copy(address, len, &desc)
+            .map_err(|why| {
+                once!(
+                    view = kind(placed),
+                    address = format_args!("{address:#x}"),
+                    len,
+                    element,
+                    stride,
+                    why,
+                    "a buffer shader view left null"
+                );
+            })
+            .ok()?;
+        // A view reading its own copy has no record to keep for a submission's
+        // writes: see the shortcut in `shadow::aligned`.
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
+        // `first` is the element the view's own start is from the copy's start,
+        // so it replaces the title's first element rather than adding to it: on a
+        // copy of just the view's bytes that is 0, since the copy starts there.
+        buffer.FirstElement = if own { 0 } else { first };
+        (shadow, own)
+    };
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Kept::Resource {
+        resource: shadow.buffer.clone(),
+        copy: own.then(|| shadow.clone()),
+    })
+}
+
+/// How a buffer view was placed, as its warning names it: a registered
+/// resource's views start at the resource and so on an element; the title
+/// places a view of its own memory, which names its own start and can land off
+/// an element.
+fn kind(placed: bool) -> &'static str {
+    if placed { "placed" } else { "registered" }
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -1266,7 +1466,10 @@ fn buffer_uav(
             at,
         )
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Kept::Resource {
+        resource: shadow.buffer.clone(),
+        copy: None,
+    })
 }
 
 /// Adapts the requested view format to a format compatible with host D3D12.
@@ -1436,7 +1639,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Some(shadow.buffer.clone()))
+            Some(Kept::Resource {
+                resource: shadow.buffer.clone(),
+                copy: None,
+            })
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -1455,11 +1661,16 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
-                Some(Some(texture.clone()))
+                Some(Kept::Resource {
+                    resource: texture.clone(),
+                    copy: None,
+                })
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(data as u64, len, srv_desc(desc), at)
+                // A registered resource's copy starts at the resource, so its
+                // views always start on an element.
+                buffer_srv(data as u64, len, srv_desc(desc), at, false)
             } else {
                 None
             }
@@ -1501,7 +1712,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            Some(Kept::Resource {
+                resource: texture.clone(),
+                copy: None,
+            })
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -1512,13 +1726,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some(Kept::Nothing)
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some(Kept::Nothing)
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
@@ -1540,7 +1754,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if *unordered {
                 buffer_uav(address, len, uav_desc(words), at)
             } else {
-                buffer_srv(address, len, srv_desc(words), at)
+                // The view names its own start: it can land off an element.
+                buffer_srv(address, len, srv_desc(words), at, true)
             }
         }
     }
@@ -2589,7 +2804,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Views the host refuses are left null, as `HostHeap::mirror` leaves them.
         let mut placed = [0; 14];
         placed[0] = 1; // a buffer
-        if buffer_srv(start + 16, 128, srv, at(0)).is_none() {
+        if buffer_srv(start + 16, 128, srv, at(0), true).is_none() {
             null_for(&View::Placed(false, placed, [0; 16]), at(0));
         }
         if buffer_uav(start + 272, 128, uav(written), at(1)).is_none() {
@@ -2690,5 +2905,64 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut fmt = DXGI_FORMAT(29);
         assert!(adapt_view_format(27, Some(&mut fmt), true));
         assert_eq!(fmt.0, 28);
+    }
+
+    /// A view on an element of its buffer's copy reads that copy; one off its
+    /// elements reads a copy of just its bytes, which starts at the view.
+    #[test]
+    fn a_view_on_its_copy_reads_it_and_one_off_it_gets_its_own() {
+        // 56-byte elements at offset 0: the first and third elements.
+        assert!(matches!(
+            plan(56, 56, 0),
+            Copy::Element { first } if first == 0
+        ));
+        assert!(matches!(
+            plan(56, 56, 112),
+            Copy::Element { first } if first == 2
+        ));
+        // The hit-detection SRV: 56-byte elements, 48 bytes in (offset % 56).
+        assert!(matches!(plan(3136, 56, 48), Copy::OwnBytes));
+        // PreSkinSimNodes: 336-byte elements, 32 bytes in.
+        assert!(matches!(plan(18_289_152, 336, 32), Copy::OwnBytes));
+        // A raw view (4-byte elements) off by 2 bytes.
+        assert!(matches!(plan(64, 4, 2), Copy::OwnBytes));
+        // Elements of a format the host has no size for: as before, nothing.
+        assert!(matches!(plan(64, 0, 0), Copy::None { .. }));
+        // A view of no bytes has nothing to copy.
+        assert!(matches!(plan(0, 56, 48), Copy::None { .. }));
+    }
+
+    /// A nulled-stride list parses decimal and hex, and ignores junk.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn nulled_strides_parse_decimal_and_hex() {
+        assert_eq!(parsed_strides("56, 336,0x20"), vec![56, 336, 32]);
+        assert_eq!(parsed_strides(" nope , 56"), vec![56]);
+        assert!(parsed_strides("").is_empty());
+    }
+
+    /// A view's range is its own elements where its descriptor puts them, and
+    /// `buffer_range` (what `readable` refreshes) gives the same one, so the
+    /// copy `buffer_srv` makes is found again for the refresh.
+    #[test]
+    fn a_views_range_is_the_one_its_copy_is_keyed_by() {
+        // Whatever the words mean, both paths read them the same way: the
+        // copy's key and the range `readable` refreshes cannot diverge.
+        for words in [
+            [0u32, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0u32, 4, 2, 0, 1, 56, 0, 0, 0, 0],
+            [0u32, 4, 0, 0, 64, 336, 0, 0, 0, 0],
+        ] {
+            let mut resource = [0u32; 14];
+            resource[0] = 1; // a buffer
+            let mut placed = [0u32; 16];
+            placed[..10].copy_from_slice(&words);
+            placed[10] = 0x1000;
+            let view = View::Placed(false, resource, placed);
+            assert_eq!(
+                buffer_range(&view),
+                Some(view_range_of(0x1000, &srv_desc(&words)))
+            );
+        }
     }
 }
