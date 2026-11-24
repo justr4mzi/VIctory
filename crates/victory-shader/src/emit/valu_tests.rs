@@ -2588,3 +2588,176 @@ fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
         "expected both hardware GPU and WARP to run, got {ran}"
     );
 }
+
+#[test]
+fn structured_buffer_flat_byte_offset_loads_reach_elements_past_the_first() {
+    use super::host::Stride;
+
+    // 1-thread compute shader:
+    //   s0: flat byte offset (root constant)
+    //   s4: table holding raw UAV at +0 dwords and StructuredBuffer<56> SRV at +8 dwords
+    // Reads the dword at `s0` via both `s_buffer_load_dword` and flat `buffer_load_dword offen`
+    // (no `idxen`), storing both results to UAV[0] and UAV[1].
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80)); // s5 = 0
+    words.extend_from_slice(&s_load_dwordx4(8, 4)); // s[8:11] = UAV at table+0
+    // s_load_dwordx4 s[12:15], s[4:5], 32 (table+8 dwords = slot 1)
+    words.extend_from_slice(&[
+        0x3D << 26 | 0x02 << 18 | (12 << 6) | (4 >> 1),
+        125 << 25 | 32,
+    ]);
+    // s_buffer_load_dword s16, s[12:15], s0
+    words.extend_from_slice(&[0x3D << 26 | 0x08 << 18 | (16 << 6) | (12 >> 1), 0]);
+    words.push(vop1(0x001, 1, sgpr(0))); // v1 = s0 (flat byte offset)
+    // buffer_load_dword v2, v1, s[12:15], 0 offen
+    words.extend_from_slice(&[
+        0x38 << 26 | 0x0C << 18 | 0x1000,
+        0x80 << 24 | ((12 >> 2) << 16) | (2 << 8) | 1,
+    ]);
+    words.push(vop1(0x001, 0, sgpr(16))); // v0 = s16
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.extend_from_slice(&buffer_store_dword(2, 8, 4));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 56,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        table_views: lowered.table_views,
+        stride_table: lowered.stride_table,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+
+    // 3 elements * 56 bytes = 42 distinct dwords.
+    let data: Vec<u32> = (0..42u32).map(|i| 0xA000_0000 | (i * 0x101 + 7)).collect();
+    let views = [
+        View::RawUav(2),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Structured(56),
+        },
+    ];
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for &byte_off in &[0u32, 24, 52, 56, 80, 108, 112, 136, 164] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => byte_off,
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            let want = data[(byte_off / 4) as usize];
+            assert_eq!(
+                out[0][0], want,
+                "{label}: s_buffer_load_dword at byte {byte_off} = {:#x}, want {want:#x}",
+                out[0][0]
+            );
+            assert_eq!(
+                out[0][1], want,
+                "{label}: buffer_load_dword offen at byte {byte_off} = {:#x}, want {want:#x}",
+                out[0][1]
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
