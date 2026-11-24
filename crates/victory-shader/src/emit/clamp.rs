@@ -31,7 +31,8 @@ const LIST: u32 = 1 << 27;
 
 /// The clamp as a DXIL container. Its user data is four dwords: the kind
 /// of record (0 and 1 draws, 2 dispatches, else mesh dispatches), the
-/// records' stride in bytes, their count, and one unused.
+/// records' stride in bytes, their count, and the byte offset of the
+/// draw/dispatch argument inside each record.
 pub fn argument_clamp() -> Vec<u8> {
     let mut s = Shader::new(false);
     s.threads = Some([GROUP, 1, 1]);
@@ -52,6 +53,7 @@ pub fn argument_clamp() -> Vec<u8> {
     let kind = s.m.extract(entry, row, 0);
     let stride = s.m.extract(entry, row, 1);
     let records = s.m.extract(entry, row, 2);
+    let arg_offset = s.m.extract(entry, row, 3);
     let args = s.root_uav_handle(ARGUMENTS);
     let budget = s.root_uav_handle(BUDGET);
     let id = s.op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[zero]);
@@ -61,7 +63,8 @@ pub fn argument_clamp() -> Vec<u8> {
     let live = s.m.cmp(entry, pred::IULT, id, records);
     s.m.terminate(entry, Term::CondBr(live, body, exit));
 
-    let at = s.m.bin(body, Bin::Mul, id, stride);
+    let scaled = s.m.bin(body, Bin::Mul, id, stride);
+    let at = s.m.bin(body, Bin::Add, scaled, arg_offset);
     let one = s.m.i32(1);
     let is_draw = s.m.cmp(body, pred::IULE, kind, one);
     s.m.terminate(body, Term::CondBr(is_draw, draw, other));

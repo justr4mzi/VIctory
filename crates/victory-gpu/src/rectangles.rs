@@ -821,7 +821,7 @@ pub(crate) fn expand(
     }
 
     let src_args_gpu = args.gpu(arguments);
-    if !crate::indirect::clamp_uav(list, src_args_gpu, (0, stride, max)) {
+    if !crate::indirect::clamp_uav(list, src_args_gpu, (0, stride, max, 0)) {
         return Err("rectangle clamp unavailable");
     }
 
