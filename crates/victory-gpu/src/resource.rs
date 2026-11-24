@@ -286,6 +286,8 @@ pub(crate) fn first_concrete(format: u32) -> u32 {
     match format {
         90 => 87, // DXGI_FORMAT_B8G8R8A8_TYPELESS -> DXGI_FORMAT_B8G8R8A8_UNORM
         92 => 88, // DXGI_FORMAT_B8G8R8X8_TYPELESS -> DXGI_FORMAT_B8G8R8X8_UNORM
+        19 => 21, // DXGI_FORMAT_R32G8X24_TYPELESS -> DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS (skip 20: D32_FLOAT_S8X24_UINT)
+        44 => 46, // DXGI_FORMAT_R24G8_TYPELESS -> DXGI_FORMAT_R24_UNORM_X8_TYPELESS (skip 45: D24_UNORM_S8_UINT)
         39 => 41, // DXGI_FORMAT_R32_TYPELESS -> DXGI_FORMAT_R32_FLOAT (skip 40: D32_FLOAT)
         f if is_typeless(f) => f + 1,
         f => f,
@@ -1874,6 +1876,12 @@ mod tests {
 
         assert!(is_typeless(39));
         assert_eq!(first_concrete(39), 41);
+
+        assert!(is_typeless(44));
+        assert_eq!(first_concrete(44), 46);
+
+        assert!(is_typeless(19));
+        assert_eq!(first_concrete(19), 21);
 
         assert!(!is_typeless(28));
         assert_eq!(first_concrete(28), 28);

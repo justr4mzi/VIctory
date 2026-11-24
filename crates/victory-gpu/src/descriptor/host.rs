@@ -1016,6 +1016,16 @@ mod tests {
         assert!(adapt_view_format(39, Some(&mut fmt), false));
         assert_eq!(fmt.0, 41);
 
+        // R24G8_TYPELESS (44) with R24G8_TYPELESS view (44) -> R24_UNORM_X8_TYPELESS (46)
+        let mut fmt = DXGI_FORMAT(44);
+        assert!(adapt_view_format(44, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 46);
+
+        // R32G8X24_TYPELESS (19) with R32G8X24_TYPELESS view (19) -> R32_FLOAT_X8X24_TYPELESS (21)
+        let mut fmt = DXGI_FORMAT(19);
+        assert!(adapt_view_format(19, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 21);
+
         // UNKNOWN view (0) on typeless texture -> first concrete format
         let mut fmt = DXGI_FORMAT(0);
         assert!(adapt_view_format(27, Some(&mut fmt), false));
