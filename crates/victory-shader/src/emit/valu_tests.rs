@@ -1032,11 +1032,6 @@ fn bfe_signed_and_unsigned_match_rdna2() {
     });
 }
 
-/// SOPC `op src0, src1`.
-const fn sopc(op: u8, src0: u8, src1: u8) -> u32 {
-    0xBF00_0000 | (op as u32) << 16 | (src1 as u32) << 8 | src0 as u32
-}
-
 /// `s_cselect_b32 s12, 1, 0; v_mov_b32 v0, s12`: SCC as 0 or 1 in v0.
 fn scc_to_v0() -> [u32; 2] {
     [sop2(0x0A, 12, 129, 128), vop1(0x001, 0, sgpr(12))]
