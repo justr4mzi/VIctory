@@ -171,12 +171,11 @@ fn queue(p: Arc<Pending>) {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
+                    // At the title's own priority: below it, the world's
+                    // busy threads starved the workers (236 pipelines a
+                    // minute at the start screen, 7 a minute in the world on
+                    // a 16-thread laptop), and draws stay dropped until
+                    // their pipelines exist.
                     loop {
                         let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
                         let Ok(p) = next else { return };
