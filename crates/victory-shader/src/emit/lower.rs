@@ -9151,11 +9151,15 @@ impl<'a> Lower<'a> {
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let grads = if op == 63 { 2 * spatial } else { 0 };
+            // Gradients per direction: a cube's are in face space (s, t).
+            let gspatial = if matches!(kind, 5 | 9) { 2 } else { spatial };
+            let grads = if op == 63 { 2 * gspatial } else { 0 };
             // Where the coordinates start, in address components: with a16
             // two per VGPR, after `first` whole VGPRs.
             let base = if *a16 { 2 * first } else { first };
             let mut cs = vec![fu; 4];
+            // A cube sample's face coordinates (s, t, face), for gradients.
+            let mut face_coords = None;
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
                 if *a16 {
@@ -9172,10 +9176,11 @@ impl<'a> Lower<'a> {
                 *slot = to_float(self, x);
             }
             if matches!(kind, 5 | 9) {
-                if *unorm || op == 63 || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
+                if *unorm || op == 81 {
+                    return Err("a cube sample with texel coordinates or a level query");
                 }
                 let (dir, slice) = self.cube_direction(cs[0], cs[1], cs[2], kind == 9);
+                face_coords = Some((cs[0], cs[1], cs[2]));
                 cs[..3].copy_from_slice(&dir);
                 if let Some(slice) = slice {
                     cs[3] = slice;
@@ -9309,13 +9314,33 @@ impl<'a> Lower<'a> {
                 }
                 63 => {
                     let mut g = vec![fu; 6];
-                    for k in 0..spatial {
-                        let x = addr_val(self, base + k)?;
-                        g[k] = to_float(self, x);
-                        let y = addr_val(self, base + spatial + k)?;
-                        g[3 + k] = to_float(self, y);
+                    if let Some((s0, t0, face)) = face_coords {
+                        // Face-space gradients: the direction is affine in s
+                        // and t on one face, so a step's direction less the
+                        // sample's is its gradient (the constants cancel).
+                        for (k, at) in [(0, 0), (1, 2)] {
+                            let ds = addr_val(self, base + at)?;
+                            let ds = to_float(self, ds);
+                            let dt = addr_val(self, base + at + 1)?;
+                            let dt = to_float(self, dt);
+                            let s1 = self.s.m.bin(c, Bin::Add, s0, ds);
+                            let t1 = self.s.m.bin(c, Bin::Add, t0, dt);
+                            let (stepped, _) = self.cube_direction(s1, t1, face, kind == 9);
+                            for (n, &d) in stepped.iter().enumerate() {
+                                g[3 * k + n] = self.s.m.bin(c, Bin::Sub, d, cs[n]);
+                            }
+                        }
+                    } else {
+                        for k in 0..spatial {
+                            let x = addr_val(self, base + k)?;
+                            g[k] = to_float(self, x);
+                            let y = addr_val(self, base + spatial + k)?;
+                            g[3 + k] = to_float(self, y);
+                        }
                     }
-                    let clamp = if name == "image_sample_d_cl" {
+                    // `_cl`: the level-of-detail clamp follows the
+                    // coordinates (and the array slice).
+                    let clamp = if name.ends_with("_cl") {
                         let x = addr_val(self, base + grads + coords)?;
                         to_float(self, x)
                     } else {
@@ -11594,6 +11619,70 @@ mod tests {
             0x7E06_0280, // v_mov_b32 v3, 0
             0xF094_0108,
             0x4082_0102, // image_sample_b v1, v[2:3], s[8:15], s[16:19] dmask:0x1 dim:2D a16
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_tables();
+        lower_with(&words, layout, used).unwrap();
+    }
+
+    #[test]
+    fn a_gradient_sample_with_a_level_clamp_reads_the_clamp_after_the_coordinates() {
+        // image_sample_d_cl on a 2D texture: x gradients, y gradients,
+        // coordinates (two each), then the clamp (1.0) in v8.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+            0xF408_0403,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], null
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_0280, // v_mov_b32 v4, 0
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7E0C_0280, // v_mov_b32 v6, 0
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0x7E10_02F2, // v_mov_b32 v8, 1.0
+            0xF08C_0108,
+            0x0082_0102, // image_sample_d_cl v1, v[2:8], s[8:15], s[16:19] dmask:0x1 dim:2D
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_tables();
+        lower_with(&words, layout, used).unwrap();
+    }
+
+    #[test]
+    fn a_cube_gradient_sample_takes_face_space_gradients() {
+        // image_sample_d_cl on a cube: two face-space gradients per
+        // direction (v2..v5), face coordinates s, t (1.5) and face 0
+        // (v6..v8), then the clamp (1.0) in v9.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+            0xF408_0403,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], null
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_0280, // v_mov_b32 v4, 0
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7E0C_02FF,
+            0x3FC0_0000, // v_mov_b32 v6, 1.5
+            0x7E0E_02FF,
+            0x3FC0_0000, // v_mov_b32 v7, 1.5
+            0x7E10_0280, // v_mov_b32 v8, 0
+            0x7E12_02F2, // v_mov_b32 v9, 1.0
+            0xF08C_0118,
+            0x0082_0102, // image_sample_d_cl v1, v[2:9], s[8:15], s[16:19] dmask:0x1 dim:CUBE
             0xD834_0000,
             0x0000_0100, // ds_write_b32 v0, v1
             S_ENDPGM,
