@@ -83,6 +83,13 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+#[cfg(windows)]
+impl Drop for Shadow {
+    fn drop(&mut self) {
+        crate::host::release_late(self.buffer.clone());
+    }
+}
+
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
@@ -155,7 +162,8 @@ impl Shadow {
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let host =
+            |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (start, end) = match &*before {
             Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),

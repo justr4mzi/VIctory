@@ -63,6 +63,13 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
+#[cfg(windows)]
+impl Drop for Staging {
+    fn drop(&mut self) {
+        crate::host::release_late(self.buffer.clone());
+    }
+}
+
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
