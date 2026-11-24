@@ -1655,3 +1655,242 @@ fn image_store_partial_dmask_writes_expected_channels() {
     }
     assert!(ran > 0, "neither hardware nor WARP supports SM 6.6");
 }
+
+/// EXP `exp target, v0, v1, v2, v3 [done] [vm]` (`en`: 4-bit channel mask).
+const fn exp_inst(
+    target: u8,
+    en: u8,
+    v: [u8; 4],
+    done: bool,
+    vm: bool,
+) -> [u32; 2] {
+    let w0 = 0x3E << 26
+        | (vm as u32) << 12
+        | (done as u32) << 11
+        | (target as u32 & 0x3F) << 4
+        | (en as u32 & 0xF);
+    let w1 = (v[3] as u32) << 24 | (v[2] as u32) << 16 | (v[1] as u32) << 8 | (v[0] as u32);
+    [w0, w1]
+}
+
+#[test]
+fn vs_rt_and_viewport_index_exports_validate_and_create_pso() {
+    use super::container::SigElement;
+    use crate::dxbc::{Container, FourCC};
+
+    let build_stage = |stage: HwStage,
+                       words: &[u32],
+                       layout: Vec<RootParam>,
+                       stage_io: StageIo,
+                       outputs: Vec<SigElement>|
+     -> HostShader {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage,
+            wave64: false,
+            vgprs: 8,
+            layout,
+            used: Vec::new(),
+            io: stage_io,
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res =
+            resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs,
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        let shader = HostShader {
+            stage,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            table_views: Vec::new(),
+            stride_table: false,
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy).expect("DXIL validation failed");
+            assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+        }
+        shader
+    };
+
+    // Minimal pixel shader writing SV_Target0 = (1, 0, 0, 1).
+    let ps_words = [
+        vop1(0x001, 0, 0xF2), // v0 = 1.0
+        vop1(0x001, 1, 0x80), // v1 = 0.0
+        vop1(0x001, 2, 0x80), // v2 = 0.0
+        vop1(0x001, 3, 0xF2), // v3 = 1.0
+        exp_inst(0, 0xF, [0, 1, 2, 3], true, true)[0],
+        exp_inst(0, 0xF, [0, 1, 2, 3], true, true)[1],
+        S_ENDPGM,
+    ];
+    let ps = build_stage(
+        HwStage::Ps,
+        &ps_words,
+        Vec::new(),
+        StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        vec![SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }],
+    );
+
+    // Three VS variants: RT index only, viewport index only, and both + clip distance in pos2.
+    let configs = [
+        (true, false, false),
+        (false, true, false),
+        (true, true, true),
+    ];
+    let mut vs_shaders = Vec::new();
+    for (has_rt, has_vp, has_clip) in configs {
+        let mut words = vec![
+            vop1(0x001, 0, 0x80),    // pos.x = 0.0
+            vop1(0x001, 1, 0x80),    // pos.y = 0.0
+            vop1(0x001, 2, 0x80),    // pos.z = 0.0
+            vop1(0x001, 3, 0xF2),    // pos.w = 1.0
+            vop1(0x001, 4, sgpr(0)), // pos1.z = packed (viewport << 16) | rt
+            vop1(0x001, 5, sgpr(1)), // pos2.x = clip distance
+        ];
+        words.extend_from_slice(&exp_inst(12, 0xF, [0, 1, 2, 3], false, false)); // pos0
+        words.extend_from_slice(&exp_inst(13, 0x4, [0, 0, 4, 0], !has_clip, false)); // pos1.z
+        if has_clip {
+            words.extend_from_slice(&exp_inst(14, 0x1, [5, 0, 0, 0], true, false)); // pos2.x
+        }
+        words.push(S_ENDPGM);
+
+        let mut outputs = vec![SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }];
+        let mut next_row = 1u32;
+        if has_rt {
+            outputs.push(SigElement {
+                name: "SV_RenderTargetArrayIndex".into(),
+                index: 0,
+                kind: 4,
+                comp: 5,
+                interp: 1,
+                row: Some(next_row),
+                col: 0,
+                cols: 1,
+                usage: 0,
+                half: false,
+            });
+            next_row += 1;
+        }
+        if has_vp {
+            outputs.push(SigElement {
+                name: "SV_ViewportArrayIndex".into(),
+                index: 0,
+                kind: 5,
+                comp: 5,
+                interp: 1,
+                row: Some(next_row),
+                col: 0,
+                cols: 1,
+                usage: 0,
+                half: false,
+            });
+            next_row += 1;
+        }
+        if has_clip {
+            outputs.push(SigElement {
+                name: "SV_ClipDistance".into(),
+                index: 0,
+                kind: 6,
+                comp: 9,
+                interp: 2,
+                row: Some(next_row),
+                col: 0,
+                cols: 1,
+                usage: 0,
+                half: false,
+            });
+        }
+
+        let vs = build_stage(
+            HwStage::Vs,
+            &words,
+            vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            StageIo::Vs {
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+            },
+            outputs,
+        );
+        let c = Container::parse(&vs.dxil).expect("parse emitted VS DXIL");
+        let sfi0 = u64::from_le_bytes(
+            c.part(FourCC::SFI0).expect("SFI0").data[..8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(
+            sfi0 & 0x2000,
+            0,
+            "SFI0 should set ViewPortAndRTArrayIndexFromAnyShaderFeedingRasterizer"
+        );
+        vs_shaders.push(vs);
+    }
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (i, vs) in vs_shaders.iter().enumerate() {
+            host.pipeline(vs, &ps)
+                .unwrap_or_else(|e| panic!("{label}: graphics pipeline case {i} failed: {e}"));
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP supports SM 6.6");
+}

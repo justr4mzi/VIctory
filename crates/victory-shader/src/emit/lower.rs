@@ -8244,9 +8244,16 @@ impl<'a> Lower<'a> {
             Usage::Other(0) if mesh => self.unnamed_row(),
             _ => Some(row),
         };
-        // (output element, channel) per exported channel; per-primitive
-        // outputs are elements of `prims`.
-        let mut stores = Vec::new();
+        #[derive(Clone, Copy)]
+        enum Extract {
+            Full,
+            Half(bool),
+            Low16,
+            High16,
+        }
+        // (output element, channel, value, extraction) per exported channel;
+        // per-primitive outputs are elements of `prims`.
+        let mut stores: Vec<(usize, u8, Value, Extract)> = Vec::new();
         let primitive = matches!(e.target, Target::PrimitiveParam { .. });
         let outputs = if primitive {
             &self.s.prims
@@ -8254,6 +8261,8 @@ impl<'a> Lower<'a> {
             &self.s.outputs
         };
         let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
+        let has_misc = !primitive && outputs.iter().any(|o| matches!(o.kind, 4 | 5));
+        let first_clip: u8 = if has_misc { 2 } else { 1 };
         // 16-bit vertex outputs: the halves each dword carries, as (output
         // element, channel, high half) per channel.
         let halves = match e.target {
@@ -8281,7 +8290,7 @@ impl<'a> Lower<'a> {
                     });
                     if let Some(id) = found {
                         let col = src.expect("found").1 - outputs[id].col;
-                        stores.push((id, col, value, Some(high)));
+                        stores.push((id, col, value, Extract::Half(high)));
                     }
                 }
             }
@@ -8292,6 +8301,19 @@ impl<'a> Lower<'a> {
             };
             if halves.is_some() {
                 break;
+            }
+            if has_misc && e.target == Target::Position(1) {
+                // GFX9+/RDNA2 packs SV_RenderTargetArrayIndex in the low 16
+                // bits and SV_ViewportArrayIndex in the high 16 bits of pos1.z.
+                if ch == 2 {
+                    if let Some(id) = by_kind(4) {
+                        stores.push((id, 0, value, Extract::Low16));
+                    }
+                    if let Some(id) = by_kind(5) {
+                        stores.push((id, 0, value, Extract::High16));
+                    }
+                }
+                continue;
             }
             let found = match e.target {
                 Target::Color(n) => outputs
@@ -8320,13 +8342,9 @@ impl<'a> Lower<'a> {
                         .map(|id| (id, ch - outputs[id].col))
                 }
                 Target::Null | Target::Unread => None,
-                Target::Position(n @ 1..=2) => {
-                    // shortcut: without the misc vector (point size, render
-                    // target or viewport index) pos1 and pos2 carry the clip
-                    // then cull distances, in semantic order.
-                    if outputs.iter().any(|o| matches!(o.kind, 4 | 5)) {
-                        return Err("render-target or viewport index exports");
-                    }
+                Target::Position(n) if n >= first_clip && n <= first_clip + 1 => {
+                    // Clip then cull distances in semantic order; shifted to
+                    // pos2..=pos3 when pos1 carries the misc vector.
                     let mut dists: Vec<usize> = (0..outputs.len())
                         .filter(|&i| matches!(outputs[i].kind, 6 | 7))
                         .collect();
@@ -8337,14 +8355,14 @@ impl<'a> Lower<'a> {
                         .collect();
                     // Channels past the distances the signature declares are
                     // ones the clipper does not enable (`PA_CL_VS_OUT_CNTL`).
-                    let k = usize::from(n - 1) * 4 + usize::from(ch);
+                    let k = usize::from(n - first_clip) * 4 + usize::from(ch);
                     flat.get(k).copied()
                 }
                 Target::Position(_) => return Err("clip, cull or point-size exports"),
                 Target::Primitive => return Err("a primitive export"),
             };
             if let Some((id, col)) = found {
-                stores.push((id, col, value, None));
+                stores.push((id, col, value, Extract::Full));
             }
         }
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {
@@ -8356,7 +8374,7 @@ impl<'a> Lower<'a> {
         }
         if stores
             .iter()
-            .any(|s| s.3.is_none() && elements(self, primitive)[s.0].half)
+            .any(|s| matches!(s.3, Extract::Full) && elements(self, primitive)[s.0].half)
         {
             return Err("a 16-bit output the stage data does not mark");
         }
@@ -8373,25 +8391,43 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
-        for (id, col, value, half) in stores {
+        for (id, col, value, extract) in stores {
             let mut x = self.i32_of(value)?;
-            if let Some(high) = half {
-                // An f16 half, declared a 32-bit float on the host.
-                let c = self.cur;
-                if high {
-                    let k16 = self.s.m.i32(16);
-                    x = self.s.m.bin(c, Bin::LShr, x, k16);
+            let is_half = matches!(extract, Extract::Half(_));
+            match extract {
+                Extract::Full => {}
+                Extract::Half(high) => {
+                    // An f16 half, declared a 32-bit float on the host.
+                    let c = self.cur;
+                    if high {
+                        let k16 = self.s.m.i32(16);
+                        x = self.s.m.bin(c, Bin::LShr, x, k16);
+                    }
+                    let f32t = self.s.t.f32;
+                    let f = self
+                        .s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                    x = self.as_int(f);
                 }
-                let f32t = self.s.t.f32;
-                let f = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                x = self.as_int(f);
+                Extract::Low16 => {
+                    let mask = self.s.m.i32(0xFFFF);
+                    x = self.s.m.bin(self.cur, Bin::And, x, mask);
+                }
+                Extract::High16 => {
+                    let k16 = self.s.m.i32(16);
+                    x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
+                }
             }
-            let el = &mut elements(self, primitive)[id];
-            el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+            let (kind, comp) = {
+                let el = &mut elements(self, primitive)[id];
+                el.usage |= 1 << col;
+                (el.kind, el.comp)
+            };
+            if !mesh && !primitive && matches!(kind, 4 | 5) {
+                self.s.flags |= flags::VIEWPORT_RT_INDEX;
+            }
+            let (suffix, x) = match comp {
+                9 if is_half => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,
