@@ -1854,7 +1854,7 @@ impl HostList {
                 }
                 Step::GpuWrite(shadow, address, len, _) => {
                     // The shaders start from the title's data.
-                    batch.flush();
+                    batch.flush_gpu_write(shadow, *address, *len);
                     shadow.writing(*address, *len);
                     continue;
                 }
@@ -1915,15 +1915,44 @@ impl Batch {
         crate::watch::Sweep::title_written();
     }
 
+    fn flush_one(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, us, 0);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    }
+
+    /// Before a GPU-write step on `shadow` across `[address, address + len)`:
+    /// flushes only pending refreshes of `shadow` overlapping that byte range,
+    /// leaving disjoint ranges and other buffer copies queued to coalesce.
+    fn flush_gpu_write(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        if len == 0 {
+            return;
+        }
+        let end = address.saturating_add(len);
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            let (s, from, to) = &self.refreshes[i];
+            if std::sync::Arc::ptr_eq(s, shadow) && *from < end && *to > address {
+                let (s, from, to) = self.refreshes.remove(i);
+                Self::flush_one(&s, from, to);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     fn flush(&mut self) {
         for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            Self::flush_one(&shadow, from, to);
         }
     }
 }
@@ -3262,6 +3291,91 @@ mod batch {
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn gpu_write_flushes_only_overlapping_shadow_refreshes() {
+        use crate::watch::PAGE;
+
+        let Some(host) = super::host() else {
+            return;
+        };
+        let read_host = |res: &super::ID3D12Resource, offset: usize, len: usize| -> Vec<u8> {
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: CPU-visible shared buffer; paired `Map`/`Unmap` leaves `Shadow`'s map alive.
+            unsafe {
+                res.Map(0, None, Some(&mut ptr)).unwrap();
+                let out = std::slice::from_raw_parts(ptr.cast::<u8>().add(offset), len).to_vec();
+                res.Unmap(0, None);
+                out
+            }
+        };
+
+        // Use plain heap buffers (not `MEM_WRITE_WATCH`) so this test never leaves
+        // write-watch journal state at freed virtual addresses for later tests.
+        let mut mem_a = vec![0u8; 2 * PAGE];
+        let mut mem_b = vec![0u8; 2 * PAGE];
+        mem_a[..256].fill(0xAA);
+        mem_b[..256].fill(0xBB);
+        mem_b[PAGE..PAGE + 256].fill(0xCC);
+        let addr_a = mem_a.as_ptr() as u64;
+        let addr_b = mem_b.as_ptr() as u64;
+        let res_a = addr_a as usize ^ 0x5500_0001;
+        let res_b = addr_b as usize ^ 0x5500_0002;
+        crate::shadow::register(res_a, addr_a, (2 * PAGE) as u64);
+        crate::shadow::register(res_b, addr_b, (2 * PAGE) as u64);
+        let shadow_a = crate::shadow::find(addr_a, (2 * PAGE) as u64).expect("shadow_a");
+        let shadow_b = crate::shadow::find(addr_b, (2 * PAGE) as u64).expect("shadow_b");
+
+        let list1 = host.new_list().unwrap();
+        shadow_a.refresh(&list1, addr_a, 256);
+        // Zero-length and disjoint `Step::GpuWrite` on `shadow_a` keep its refresh queued.
+        shadow_a.gpu_writes(&list1, addr_a, 0);
+        shadow_a.gpu_writes(&list1, addr_a + PAGE as u64, 256);
+        list1.close();
+
+        let mut batch = Batch::default();
+        list1.run_deferred(&mut batch);
+        assert_eq!(batch.refreshes.len(), 1);
+        assert!(Arc::ptr_eq(&batch.refreshes[0].0, &shadow_a));
+
+        // Overlapping `Step::GpuWrite` on `shadow_a` flushes ONLY `shadow_a` immediately,
+        // leaving `shadow_b` queued so later refreshes coalesce across it.
+        let list2 = host.new_list().unwrap();
+        shadow_b.refresh(&list2, addr_b, 256);
+        shadow_a.gpu_writes(&list2, addr_a, 256);
+        shadow_b.refresh(&list2, addr_b + PAGE as u64, 256);
+        list2.close();
+
+        list2.run_deferred(&mut batch);
+        assert_eq!(read_host(&shadow_a.buffer, 0, 256), vec![0xAAu8; 256]);
+        assert_eq!(batch.refreshes.len(), 1);
+        assert!(Arc::ptr_eq(&batch.refreshes[0].0, &shadow_b));
+        assert_eq!(
+            (batch.refreshes[0].1, batch.refreshes[0].2),
+            (addr_b as usize, addr_b as usize + PAGE + 256)
+        );
+
+        // Non-overlapping `Step::GpuWrite` on `shadow_b` leaves `shadow_b` queued too.
+        let list3 = host.new_list().unwrap();
+        shadow_b.gpu_writes(&list3, addr_b + PAGE as u64 + 512, 64);
+        list3.close();
+        list3.run_deferred(&mut batch);
+        assert_eq!(batch.refreshes.len(), 1);
+
+        batch.flush();
+        assert!(batch.refreshes.is_empty());
+        assert_eq!(read_host(&shadow_b.buffer, 0, 256), vec![0xBBu8; 256]);
+        assert_eq!(read_host(&shadow_b.buffer, PAGE, 256), vec![0xCCu8; 256]);
+
+        assert_eq!(shadow_a.copy_back(addr_a as usize, 0), 0);
+        assert_eq!(shadow_a.copy_back(addr_a as usize, 256), 0);
+        assert_eq!(shadow_a.copy_back(addr_a as usize + PAGE, 256), 0);
+        assert_eq!(shadow_b.copy_back(addr_b as usize + PAGE + 512, 64), 0);
+        drop(shadow_a);
+        drop(shadow_b);
+        crate::shadow::unregister(res_a, addr_a);
+        crate::shadow::unregister(res_b, addr_b);
     }
 }
 
