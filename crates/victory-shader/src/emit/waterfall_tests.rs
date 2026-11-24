@@ -16,6 +16,12 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_with(words, buffers, 1)
+}
+
+/// [`build`] of a program that takes `handles` handles with each lane's own
+/// heap index.
+fn build_with(words: &[u32], buffers: bool, handles: u32) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -71,8 +77,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
+    // Accesses with each lane's own heap index, no wave operation.
+    assert_eq!(lowered.nonuniform_handles, handles);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -98,6 +104,15 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 /// hardware GPU and on WARP (each skipped without a device) and returns,
 /// per one that ran, the UAV's 32 dwords.
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
+    run_on(shader, views, &[("hardware", false), ("warp", true)])
+}
+
+/// [`run`] on the given adapters (label, WARP).
+fn run_on(
+    shader: &HostShader,
+    views: &[View],
+    adapters: &[(&'static str, bool)],
+) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -114,7 +129,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for &(label, warp) in adapters {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -231,6 +246,29 @@ fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
     for (label, red) in results {
         // Even lanes hold entry 0's offset, odd lanes entry 1's.
         let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
+        assert_eq!(red, want, "{label}");
+    }
+}
+
+#[test]
+fn lanes_size_the_entry_their_offset_names_in_the_console_waterfall() {
+    use crate::resource::tests::WATERFALL_SIZED_WAVE32;
+    let shader = build_with(WATERFALL_SIZED_WAVE32, false, 2);
+    let first = [[1.0f32, 0.0, 0.0, 1.0]];
+    let second = [[2.0f32, 0.0, 0.0, 1.0]; 3];
+    let views = [
+        View::Texture(1, 1, &first),
+        View::Texture(1, 3, &second),
+        View::RawUav(32),
+    ];
+    // Hardware only: the WARP in Windows (10.0.26100.9818) returns lane 0's
+    // size to every lane of a non-uniform getDimensions, also for a shader
+    // compiled from HLSL; the packaged WARP 1.0.22 gives each lane its own.
+    for (label, words) in run_on(&shader, &views, &[("hardware", false)]) {
+        // Even lanes sample entry 0 (red 1.0, height 1), odd lanes entry 1
+        // (red 2.0, height 3): red plus the height - 1.
+        let red: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
+        let want: Vec<f32> = (0..32).map(|l| [1.0, 4.0][l & 1]).collect();
         assert_eq!(red, want, "{label}");
     }
 }

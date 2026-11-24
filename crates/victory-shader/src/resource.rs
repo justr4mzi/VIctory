@@ -150,6 +150,10 @@ pub struct Waterfall {
     /// Descriptor loads at a table offset among `reads` (the console
     /// compiler's form): each lane loads its own entry.
     pub loads: Vec<Site>,
+    /// Loads among `loads` that only feed the code's own size arithmetic
+    /// (a loop with no access), each with a load of the same entry in
+    /// `loads` whose access tells the view's kind.
+    pub sizes: Vec<(Site, Site)>,
 }
 
 const NOT_ROOT: &str = "an address in an SGPR that is no root parameter";
@@ -199,8 +203,7 @@ pub fn track(
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
                     && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
-                    && let Some(Term::Value(v)) = a.dynamic.map(|d| t.origin(d))
-                    && t.first_lane_source(v).is_some()
+                    && let Some(v) = t.offset_read(load, a)
                 {
                     offset.push((v, load));
                 }
@@ -290,6 +293,58 @@ pub fn track(
             out.waterfall.compares.extend(proof.compares);
             out.waterfall.reads.extend(proof.reads);
             out.waterfall.loads.extend(loads);
+        }
+    }
+    // The console compiler also loops to compute a per-lane descriptor's
+    // size from its bits, with no access in the loop: the per-lane writes
+    // that take the size stand in for the access. Such a load needs a load
+    // of the same entry (same table address, same lane offset) that an
+    // access uses, which tells the view's kind; otherwise it stays the
+    // first lane's.
+    for &(site, address) in &out.scalar {
+        let Some(read) = t.offset_read(site, &address) else {
+            continue;
+        };
+        if out.waterfall.loads.contains(&site)
+            || out.descriptors.iter().any(|d| {
+                d.source
+                    .leaves()
+                    .iter()
+                    .any(|l| matches!(l, Source::Loaded { load, .. } if *load == site))
+            })
+        {
+            continue;
+        }
+        let lane = |v: Value| t.first_lane_source(v).map(|s| t.lane_term(Term::Value(s)));
+        let Some(twin) = out.waterfall.loads.iter().copied().find(|&other| {
+            out.scalar.iter().any(|&(at, a)| {
+                at == other
+                    && a.param == address.param
+                    && a.offset == address.offset
+                    && t.offset_read(at, &a).and_then(lane) == lane(read)
+            })
+        }) else {
+            continue;
+        };
+        let (b, i) = site;
+        let writes: Vec<usize> = t.p.blocks[b].insts[i + 1..]
+            .iter()
+            .enumerate()
+            .filter(|(_, inst)| {
+                matches!(inst.fields, Fields::Valu(_))
+                    && inst.read(Reg::S(EXEC)).is_some()
+                    && inst.writes.iter().any(|w| matches!(w.0, Reg::V(_)))
+            })
+            .map(|(k, _)| i + 1 + k)
+            .collect();
+        if writes.is_empty() {
+            continue;
+        }
+        if let Ok(proof) = t.waterfall(b, &writes, &[read]) {
+            out.waterfall.compares.extend(proof.compares);
+            out.waterfall.reads.extend(proof.reads);
+            out.waterfall.loads.push(site);
+            out.waterfall.sizes.push((site, twin));
         }
     }
     Ok(out)
@@ -1702,6 +1757,18 @@ impl<'a> Tracer<'a> {
         inst.read(Reg::V(reg))
     }
 
+    /// For a scalar load at `site` of `address`: the `v_readfirstlane_b32`
+    /// result its offset is (the console compiler's table offset).
+    fn offset_read(&self, site: Site, address: &Address) -> Option<Value> {
+        if !self.inst(site).name().starts_with("s_load_") {
+            return None;
+        }
+        let Term::Value(v) = self.origin(address.dynamic?) else {
+            return None;
+        };
+        self.first_lane_source(v).map(|_| v)
+    }
+
     /// The `v_readfirstlane_b32` results the descriptor operand `op` of
     /// `inst` is, when every dword is one.
     fn first_lane_words(&self, inst: &Inst, op: &Operand) -> Option<Vec<Value>> {
@@ -3100,6 +3167,95 @@ pub(crate) mod tests {
         0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
     ];
+
+    /// [`WATERFALL_INDEXED_WAVE32`] after a loop of the same form that only
+    /// sizes each lane's entry: it loads the entry at the first lane's
+    /// offset, takes the height - 1 from bits 14-29 of dword 2
+    /// (`s_bfe_u32`) into v20 for the matching lanes and drops them. The
+    /// sampling loop then loads the same entry; red plus v20 is stored.
+    pub(crate) const WATERFALL_SIZED_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        0x7E28_0507, // 0x40: v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0xF40C_0602,
+        0x2800_0000, // s_load_dwordx8 s[24:31], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x9396_FF1A,
+        0x0010_000E, // s_bfe_u32 s22, s26, 0x10000e
+        0x7E28_0216, // v_mov_b32 v20, s22
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF6, // s_cbranch_execnz -> 0x40
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        0x7E28_0507, // 0x70: v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0xF40C_0302,
+        0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF6, // s_cbranch_execnz -> 0x70
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0x7E28_0D14, // v_cvt_f32_u32 v20, v20
+        0x0618_290C, // v_add_f32 v12, v12, v20
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn a_console_waterfall_that_only_sizes_takes_the_kind_of_the_same_entrys_load() {
+        let r = waterfall(WATERFALL_SIZED_WAVE32, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load: sampled, .. } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        // The sizing loop's load, first in the program, has no access.
+        let (sized, _) = *r
+            .scalar
+            .iter()
+            .find(|s| s.0 != sampled && s.1.dynamic.is_some())
+            .unwrap();
+        assert_eq!(r.waterfall.loads, [sampled, sized]);
+        assert_eq!(r.waterfall.sizes, [(sized, sampled)]);
+        assert_eq!(r.waterfall.compares.len(), 2);
+        assert_eq!(r.waterfall.reads.len(), 2);
+    }
+
+    #[test]
+    fn a_console_waterfall_that_only_sizes_with_no_access_to_its_entry_is_none() {
+        // The sizing loop alone: nothing tells the view's kind.
+        let mut words = WATERFALL_SIZED_WAVE32[..27].to_vec();
+        words.extend([
+            0x7E28_0D14, // v_cvt_f32_u32 v20, v20
+            0xE070_1000,
+            0x800A_1410, // buffer_store_dword v20, v16, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
+        ]);
+        let r = waterfall(&words, false).unwrap();
+        assert_eq!(r.waterfall, Waterfall::default());
+    }
 
     #[test]
     fn the_console_waterfall_over_a_first_lane_offset_is_one() {

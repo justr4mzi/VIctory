@@ -3509,31 +3509,40 @@ impl<'a> Lower<'a> {
         };
         // How the program uses the descriptor tells the view's kind.
         // Prefer an image or vector-buffer use over `s_buffer_load_dword*`,
-        // since those encode typed/structured properties directly.
-        let mut uses = self
-            .x
-            .res
-            .descriptors
-            .iter()
-            .filter(|d| d.role == Role::Resource)
-            .filter_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
-                })
-            });
-        let mut fallback = None;
-        let use_at = loop {
-            let Some((at, first)) = uses.next() else {
-                break fallback;
-            };
-            match &self.x.p.blocks[at.0].insts[at.1].fields {
-                Fields::Image { .. } | Fields::Buffer { .. } => break Some((at, first)),
-                _ => {
-                    fallback.get_or_insert((at, first));
+        // since those encode typed/structured properties directly; a
+        // waterfall loop that only sizes a lane's entry falls back to a
+        // load of the same entry that an access uses (see `resource::Waterfall`).
+        let use_of = |of: Site| {
+            let mut uses = self
+                .x
+                .res
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .filter_map(|d| {
+                    d.source.leaves().into_iter().find_map(|l| match *l {
+                        Source::Loaded { load, first } if load == of => Some((d.site, first)),
+                        _ => None,
+                    })
+                });
+            let mut fallback = None;
+            loop {
+                let Some((at, first)) = uses.next() else {
+                    break fallback;
+                };
+                match &self.x.p.blocks[at.0].insts[at.1].fields {
+                    Fields::Image { .. } | Fields::Buffer { .. } => break Some((at, first)),
+                    _ => {
+                        fallback.get_or_insert((at, first));
+                    }
                 }
             }
         };
+        let use_at = use_of(site).or_else(|| {
+            let w = &self.x.res.waterfall;
+            let &(_, twin) = w.sizes.iter().find(|s| s.0 == site)?;
+            use_of(twin)
+        });
         let (src, uav, props, image) = if let Some((at, first)) = use_at {
             let src = Source::Loaded { load: site, first };
             let used = self.used_kind(&src);
@@ -9495,6 +9504,17 @@ mod tests {
             l.heap_props.iter().map(|p| p.1).collect::<Vec<_>>(),
             [0x409, 0x105]
         );
+    }
+
+    #[test]
+    fn a_console_waterfall_that_only_sizes_reads_each_lanes_own_dimensions() {
+        use crate::resource::tests::WATERFALL_SIZED_WAVE32;
+        let (layout, used) = texture_and_uav_tables();
+        let l = lower_wave(WATERFALL_SIZED_WAVE32, layout, used, false).unwrap();
+        // The sizing loop's and the sampling loop's handles, both each
+        // lane's own entry.
+        assert_eq!(l.nonuniform_handles, 2);
+        assert!(!l.wave_ops);
     }
 
     /// [`texture_tables`] with a raw buffer UAV at dword 16 of the first.
