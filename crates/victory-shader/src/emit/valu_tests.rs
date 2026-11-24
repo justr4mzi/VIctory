@@ -8,6 +8,7 @@
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
+use crate::ShaderError;
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -3831,4 +3832,304 @@ fn fma_k_f16_cvt_pk_16_and_lerp_u8_match_rdna2() {
     run_cases(&lerp, &lerp_in, |b, i, _, g| {
         assert_eq!(g, lerp_cases[i].1, "{b}: v_lerp_u8 case {i}");
     });
+}
+
+#[test]
+fn image_gather4_c_lz_and_offset_match_rdna2() {
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    // SMEM s_load_dwordx{4,8} s[dst..], s[base:base+1], offset (soffset = null).
+    let s_load = |op: u32, dst: u8, base: u8, offset: u32| -> [u32; 2] {
+        [
+            0x3D << 26 | op << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+            125 << 25 | (offset & 0x1F_FFFF),
+        ]
+    };
+    // MIMG: unorm=0, a16=0, d16=0.
+    let mimg =
+        |op: u32, dim: u8, dmask: u8, vdata: u8, vaddr: u8, srsrc: u8, ssamp: u8| -> [u32; 2] {
+            [
+                0x3C << 26
+                    | (op & 0x7F) << 18
+                    | (dmask as u32) << 8
+                    | ((dim as u32 & 7) << 3)
+                    | (op >> 7 & 1),
+                ((ssamp as u32 >> 2) & 0x1F) << 21
+                    | ((srsrc as u32 >> 2) & 0x1F) << 16
+                    | (vdata as u32) << 8
+                    | vaddr as u32,
+            ]
+        };
+    let lower_gather_cs =
+        |gather_inst: [u32; 2], addr_regs: &[u8]| -> Result<HostShader, ShaderError> {
+            let mut words = vec![
+                s_mov_b32(5, 0x80), // s5 = 0 (high dword of view table)
+                s_mov_b32(7, 0x80), // s7 = 0 (high dword of sampler table)
+            ];
+            words.extend_from_slice(&s_load(0x03, 16, 4, 0)); // s[16:23] = SRV (entry 0)
+            words.extend_from_slice(&s_load(0x02, 8, 4, 32)); // s[8:11] = raw UAV (entry 1)
+            words.extend_from_slice(&s_load(0x02, 12, 6, 0)); // s[12:15] = cmp sampler (entry 0)
+            for (idx, &src_s) in addr_regs.iter().enumerate() {
+                words.push(vop1(0x001, idx as u8, sgpr(src_s)));
+            }
+            words.extend_from_slice(&gather_inst);
+            for k in 0..4u8 {
+                words.extend_from_slice(&buffer_store_dword(4 + k, 8, u16::from(k) * 4));
+            }
+            words.push(S_ENDPGM);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 12,
+                layout: vec![
+                    RootParam {
+                        root: RootType::Constants,
+                        table_offset_dwords: 0,
+                        sgprs: 4,
+                        base_register: 0,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                    RootParam {
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 4,
+                        slot: 1,
+                    },
+                    RootParam {
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 6,
+                        slot: 2,
+                    },
+                ],
+                used: vec![
+                    UsedResource {
+                        kind: ResourceType::Srv,
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 8,
+                        user_data: 4,
+                        slot: 1,
+                    },
+                    UsedResource {
+                        kind: ResourceType::Uav,
+                        root: RootType::Table,
+                        table_offset_dwords: 8,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 4,
+                        user_data: 4,
+                        slot: 1,
+                    },
+                    UsedResource {
+                        kind: ResourceType::Sampler,
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 4,
+                        user_data: 6,
+                        slot: 2,
+                    },
+                ],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 7 << 1, // 7 user SGPRs: s0..s6
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+            let st = structure::structure(&p).expect("structure");
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st))
+                .expect("resource::track");
+            let io = io::raise(&p, &native).expect("io::raise");
+            let lowered = lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })?;
+            let shader = HostShader {
+                stage: HwStage::Cs,
+                dxil: lowered.dxil,
+                user_data: lowered.user_data,
+                samplers: lowered.samplers,
+                static_samplers: Vec::new(),
+                root_cbvs: lowered.root_cbvs,
+                root_srvs: lowered.root_srvs,
+                table_views: lowered.table_views,
+                stride_table: lowered.stride_table,
+            };
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                let mut copy = shader.dxil.clone();
+                let ours = copy[4..20].to_vec();
+                v.validate(&mut copy).expect("DXIL validation failed");
+                assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+            }
+            Ok(shader)
+        };
+
+    // image_gather4_c_lz (0x4f) on 2D (dim=1): v[0]=ref, v[1]=u, v[2]=v -> v[4..8]
+    let gather_r = lower_gather_cs(mimg(0x4F, 1, 0x1, 4, 0, 16, 12), &[0, 1, 2]).expect("gather_r");
+    // image_gather4_c_lz_o (0x5f) on 2D (dim=1): v[0]=offsets, v[1]=ref, v[2]=u, v[3]=v -> v[4..8]
+    let gather_o =
+        lower_gather_cs(mimg(0x5F, 1, 0x1, 4, 0, 16, 12), &[0, 1, 2, 3]).expect("gather_o");
+    // image_gather4_c_lz on Cube (dim=3): v[0]=ref, v[1]=s, v[2]=t, v[3]=face -> DXIL validates.
+    let _gather_cube =
+        lower_gather_cs(mimg(0x4F, 3, 0x1, 4, 0, 16, 12), &[0, 1, 2, 3]).expect("gather_cube");
+    // Unsupported forms must reject cleanly rather than miscompiling.
+    assert!(
+        matches!(
+            lower_gather_cs(mimg(0x4F, 1, 0x2, 4, 0, 16, 12), &[0, 1, 2]),
+            Err(ShaderError::Unsupported {
+                what: "a comparison gather of a non-red channel",
+                ..
+            })
+        ),
+        "non-red comparison gather must be rejected",
+    );
+    assert!(
+        matches!(
+            lower_gather_cs(mimg(0x5F, 3, 0x1, 4, 0, 16, 12), &[0, 1, 2, 3, 0]),
+            Err(ShaderError::Unsupported {
+                what: "a cube gather with texel offsets",
+                ..
+            })
+        ),
+        "cube gather with texel offsets must be rejected",
+    );
+    assert!(
+        matches!(
+            lower_gather_cs(mimg(0x4F, 0, 0x1, 4, 0, 16, 12), &[0, 1]),
+            Err(ShaderError::Unsupported {
+                what: "a gather on a 1D or 3D image",
+                ..
+            })
+        ),
+        "1D comparison gather must be rejected",
+    );
+
+    let mut texels = [[0.0f32; 4]; 16];
+    for y in 0..4usize {
+        for x in 0..4usize {
+            let v = (y * 4 + x) as f32;
+            texels[y * 4 + x] = [v, 0.0, 0.0, 1.0];
+        }
+    }
+    let cmp_sampler = [D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    }];
+    let views = [View::Texture(4, 4, &texels), View::RawUav(4)];
+
+    fn run_gather(
+        shader: &HostShader,
+        views: &[View],
+        samplers: &[D3D12_SAMPLER_DESC],
+        cases: &[([u32; 4], [f32; 4])],
+    ) {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            // `View::Texture` uses `R32G32B32A32_FLOAT`; skip adapters where
+            // RGBA32F does not support `SHADER_GATHER_COMPARISON`.
+            let mut fmt = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT,
+                ..Default::default()
+            };
+            let gather_cmp_supported = unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_FORMAT_SUPPORT,
+                        (&raw mut fmt).cast(),
+                        size_of_val(&fmt) as u32,
+                    )
+                    .is_ok()
+            } && (fmt.Support1.0 & D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON.0) != 0;
+            if !warp && !gather_cmp_supported {
+                eprintln!("{label}: RGBA32F lacks SHADER_GATHER_COMPARISON; skipped");
+                continue;
+            }
+            let (root, pso) = host.compute_pipeline(shader).expect("compute_pipeline");
+            for &(c, want) in cases {
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            groups: [1, 1, 1],
+                            roots: vec![(
+                                0,
+                                Root::Constants(vec![c[0], c[1], c[2], c[3], 0, 0, 0]),
+                            )],
+                            views,
+                            samplers,
+                        },
+                    )
+                    .expect("dispatch");
+                let got = [
+                    f32::from_bits(out[0][0]),
+                    f32::from_bits(out[0][1]),
+                    f32::from_bits(out[0][2]),
+                    f32::from_bits(out[0][3]),
+                ];
+                assert_eq!(got, want, "{label}: constants={c:#010x?}");
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "neither hardware nor WARP host ran");
+    }
+
+    let f = f32::to_bits;
+    let half = f(0.5);
+    // At (0.5, 0.5): R footprint is (1,2)=9, (2,2)=10, (2,1)=6, (1,1)=5.
+    run_gather(
+        &gather_r,
+        &views,
+        &cmp_sampler,
+        &[
+            ([f(7.5), half, half, 0], [1.0, 1.0, 0.0, 0.0]),
+            ([f(5.5), half, half, 0], [1.0, 1.0, 1.0, 0.0]),
+            ([f(9.5), half, half, 0], [0.0, 1.0, 0.0, 0.0]),
+        ],
+    );
+    let pack_off = |ox: i32, oy: i32| ((ox & 0x3F) as u32) | (((oy & 0x3F) as u32) << 8);
+    // Offset (-1, +1) -> footprint (0,3)=12, (1,3)=13, (1,2)=9, (0,2)=8.
+    let off_m1_p1 = pack_off(-1, 1);
+    // Offset (+1, -1) -> footprint (2,1)=6, (3,1)=7, (3,0)=3, (2,0)=2.
+    let off_p1_m1 = pack_off(1, -1);
+    run_gather(
+        &gather_o,
+        &views,
+        &cmp_sampler,
+        &[
+            ([off_m1_p1, f(10.5), half, half], [1.0, 1.0, 0.0, 0.0]),
+            ([off_m1_p1, f(8.5), half, half], [1.0, 1.0, 1.0, 0.0]),
+            ([off_p1_m1, f(4.5), half, half], [1.0, 1.0, 0.0, 0.0]),
+        ],
+    );
 }
