@@ -1,100 +1,93 @@
 # Fork: ultimate-rx6700xt (AI-assisted)
 
-Personal fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory). Branch `ultimate-rx6700xt` (mirrored to `main`) stacks community PRs and contributor fork fixes on top of upstream `main` (`ffe310e`) with merge conflicts resolved for Windows 11 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM). Nothing here is upstream-approved; please send reviews and feedback to the original PRs/issues. Zero game data or assets are included (`cargo xtask policy` verified).
+Personal fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory). Branch `ultimate-rx6700xt` (mirrored to `main`) documents and stacks community PRs, fork fixes, and local adaptations from upstream base `02f404e` (`#685`) through **`v6`**, targeting Windows 11 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64). Nothing here is upstream-approved; please send reviews and feedback to the original PRs/issues. Zero game data or assets are included (`cargo xtask policy` verified). This fork and its conflict resolutions are **AI-assisted**.
 
 ## Status & Live Testing History (RX 6700 XT, Windows 11)
 
-- **v2 live test:** Boot, settings, audio, HUD, subtitles, and opening sequences rendered; distant emissive lights appeared in-world (~1.0–1.4 FPS), then ended with `DXGI_ERROR_DEVICE_HUNG`.
-- **v3 + 3 session fixes (`e67bb3d`) live test:** Held cleanly in-world with **0 `ERROR` lines** in logs, `1,892` host pipelines compiled, GPU ~74–94 ms/frame (~0.6–1.0 FPS overall, CPU prep/readback ~1,000 ms/frame). Sky tone, bloom/glare, subtitles, audio, and controller camera input worked; remaining 3D geometry still incomplete (`236` live shader refusals, typeless depth/view mapping gaps, and high readback overhead). Closed cleanly by user without GPU hang/reset.
-- **v4 (current HEAD):** Built, unit-tested, policy-checked, and offline shader-validated (**23,356** primary shaders + **195** ES halves). **Not yet tested live in-game.**
+- **Base upstream (`02f404e` -> `8e79c80` -> `ffe310e`):** Boot, menus at 30 fps, intro video, saves, and initial world entry; **`21,678`** primary shaders validated offline on `02f404e`.
+- **v2 live test:** Boot, settings, audio, HUD, subtitles, and opening sequences rendered; distant emissive lights appeared in-world (`~1.0–1.4 FPS`, peak `4,587 draws/frame`, `1,433+` host pipelines), ended with `DXGI_ERROR_DEVICE_HUNG` at frame `19200`.
+- **v3 + 3 session fixes (`e67bb3d`) live test:** Held cleanly in-world with **`0` `ERROR` lines** (`6,634` log lines), `1,892` host pipelines compiled, GPU `~74–94 ms/frame` (`~0.6–1.0 FPS`, CPU prep/readback `~1,000 ms/frame`). Sky tone, bloom, subtitles, audio, and controller camera worked; closed cleanly without GPU hang/reset.
+- **v4 live logs:** Ran cleanly (`21,174` lines in `session.log`, `0` `ERROR`, `0` `WARN`); offline validated **`23,356`** primary + **`195`** ES halves.
+- **v5 live test:** Menus ran at `27.1–29.9 FPS` (`11,840` log lines, `0` `ERROR`, `0` `WARN`); stalled / black-screened after profile/save load with no new shaders logged. Offline validated **`24,410`** primary + **`195`** ES halves (`729` DXIL validator rejections, incl. `658` CS stage errors).
+- **v6 (current HEAD):** Verified offline with **`610` workspace tests passing (`0` failed)**, **`142` GPU diagnostics tests passing (`0` failed)**, `cargo xtask policy` OK (**`174` files**), Thin LTO release build OK, and **`24,519`** primary shaders + **`195`** ES halves validated (`2,494 / 2,494` compute validated, DXIL validator rejections cut from `729` down to **`71`**). **Not yet tested live in-game.**
 
-## What's New in v4
+## Progression & Verification History (`02f404e` -> `v6`)
 
-### Intermediate Session Fixes (on top of v3)
-| Source | Ref / Link | Description |
-|---|---|---|
-| `Slaktarn700` | [issue #844](https://github.com/Marvisak/VIctory/issues/844) (`c4f0f19`) | Mirror title-written descriptor heap slots before submission (`resync_title_writes`) |
-| `Slaktarn700` | [issue #855](https://github.com/Marvisak/VIctory/issues/855) (`243d6d4`) | Emit a single shared returning block per shader program |
-| `Chuantao717` | [issue #855](https://github.com/Marvisak/VIctory/issues/855) (`e67bb3d`) | Omit array slices from DXIL `CalculateLOD` queries |
-
-### Group 1 — GPU Runtime, Render Targets & Memory (v4)
-| # | Link | Description |
-|---|---|---|
-| 876 / 882 | [fork Xvania7](https://github.com/Xvania7/VIctory/tree/fix/issue-850-typeless-view) ([issue #876](https://github.com/Marvisak/VIctory/issues/876), [issue #882](https://github.com/Marvisak/VIctory/issues/882)) | Remap typeless views on typeless resources to aspect-aware concrete formats (incl. `53 => 56`, keeping `#492`) |
-| 651 | [PR #651](https://github.com/Marvisak/VIctory/pull/651) | Depth/stencil SRV aspect selection and `PlaneSlice` propagation |
-| 450 | [PR #450](https://github.com/Marvisak/VIctory/pull/450) | Typed null RTV descriptors (`capture` test gated on `diagnostics`) |
-| 780 / 352 | [fork LAKSHYA-cmd-tech](https://github.com/LAKSHYA-cmd-tech/VIctory/tree/feature/pipeline-library-mesh-topology-and-clean-desc) ([issue #780](https://github.com/Marvisak/VIctory/issues/780)) | `"mesh triangles"` pipeline library key with topology + clean `RTVFormats` |
-| 796 | [fork LAKSHYA-cmd-tech](https://github.com/LAKSHYA-cmd-tech/VIctory/tree/feature/om-set-render-targets-bounds) ([issue #796](https://github.com/Marvisak/VIctory/issues/796)) | Guard empty, null, and overflowing `OMSetRenderTargets` single-range bindings |
-| 790 | [fork LAKSHYA-cmd-tech](https://github.com/LAKSHYA-cmd-tech/VIctory/tree/feature/xmem-guard-32bit-window) ([issue #790](https://github.com/Marvisak/VIctory/issues/790)) | Protect `< 4 GiB` low address ranges for title 32-bit `xmem` allocations |
-
-### Group 2 — Shader Compiler & Live Refusal Fixes (v4)
-| # | Link | Description |
-|---|---|---|
-| 585 | [PR #585](https://github.com/Marvisak/VIctory/pull/585) | Lower descriptor-only `GetDimensions`, plus `NULL` and constant root descriptors |
-| 645 | [PR #645](https://github.com/Marvisak/VIctory/pull/645) | Trace SGPR root-argument addresses spilled through VGPRs (`v_readlane`) |
-| 489 | [PR #489](https://github.com/Marvisak/VIctory/pull/489) | Trace root spill table reads in resource tracking |
-| 704 / 193 | [PR #704](https://github.com/Marvisak/VIctory/pull/704), [PR #193](https://github.com/Marvisak/VIctory/pull/193) | Runtime stride table + raw views for structured buffers with unknown stride |
-| 453 | [PR #453](https://github.com/Marvisak/VIctory/pull/453) | Lower pixel `SV_Barycentrics` values and computed barycentric interpolation |
-| 878 | [fork permadiego](https://github.com/permadiego/VIctory/tree/shader/mask-dword-joins) ([issue #878](https://github.com/Marvisak/VIctory/issues/878)) | Mask dwords at data joins (`undef`) and per-lane `s_bcnt1` SCC tracking |
-| 877 | [fork permadiego](https://github.com/permadiego/VIctory/tree/shader/geometry-shaders) ([issue #877](https://github.com/Marvisak/VIctory/issues/877)) | Translate legacy ES-GS geometry programs to DXIL + build VS+GS+PS host pipelines |
-| 852 | [fork NicolaiVdS](https://github.com/NicolaiVdS/VIctory/tree/shader/atomic-handle-type) ([issue #852](https://github.com/Marvisak/VIctory/issues/852)) | Key heap handle cache on both property dwords so `u32` image atomics don't reuse `f32` query handles |
-| 853 | [fork FabianDU](https://github.com/FabianDU/VIctory/tree/claude/elegant-newton-vly8mr) ([issue #853](https://github.com/Marvisak/VIctory/issues/853)) | Track waterfall loops that only query per-lane descriptor dimensions |
-
-### Group 3 — Performance & CPU Overhead (v4)
-| # | Link | Description |
-|---|---|---|
-| 703 | [PR #703](https://github.com/Marvisak/VIctory/pull/703) | Eliminate BCPack per-call allocations (`Workspace`) + streaming `lanes_stream` + LUTs (combined with `bucket_of` window table) |
-| 464 | [PR #464](https://github.com/Marvisak/VIctory/pull/464) | Remember unmapped guarded view blocks (`absent`) until `title_memory_remapped`, preserving `#776` overflow guards |
-
-## Skipped PRs (with reasons)
-- **v4:** [#785](https://github.com/Marvisak/VIctory/issues/785) (depends on skipped `#334` / `BUFFER_READ`), [#757](https://github.com/Marvisak/VIctory/issues/757) (deep conflicts with `#346`/`#190`/`#24`), [#699](https://github.com/Marvisak/VIctory/pull/699) (superseded by scoped `#736` already in HEAD), [#710](https://github.com/Marvisak/VIctory/pull/710) (deep conflicts across 8 files with `#645`/`#493`/`#568`/`#728`).
-- **v3:** [#436](https://github.com/Marvisak/VIctory/pull/436), [#515](https://github.com/Marvisak/VIctory/pull/515), [#393](https://github.com/Marvisak/VIctory/pull/393).
-- **v2:** [#459](https://github.com/Marvisak/VIctory/pull/459), [#334](https://github.com/Marvisak/VIctory/pull/334), [#582](https://github.com/Marvisak/VIctory/pull/582), [#159](https://github.com/Marvisak/VIctory/pull/159), [#587](https://github.com/Marvisak/VIctory/pull/587).
-
-## Already Integrated from v1 / v2 / v3
-
-### Added in v3 (16 items)
-| # | Link | Description |
-|---|---|---|
-| 454 | [PR #454](https://github.com/Marvisak/VIctory/pull/454) | loader watchdog opt-out (`VICTORY_NO_WATCHDOG=1`) |
-| 190 | [PR #190](https://github.com/Marvisak/VIctory/pull/190) | indirect-argument clamp in DXIL |
-| 493 | [PR #493](https://github.com/Marvisak/VIctory/pull/493) | bounded root SRVs |
-| 568 | [PR #568](https://github.com/Marvisak/VIctory/pull/568) | typed null descriptors |
-| 469 | [PR #469](https://github.com/Marvisak/VIctory/pull/469) | UAV twin for depth resources |
-| 211 | [PR #211](https://github.com/Marvisak/VIctory/pull/211) | PresentX multi-plans |
-| 779 | [fork BlueCatsz](https://github.com/BlueCatsz/VIctory/tree/fix/gpu-getdesc-return-ptr) ([issue #779](https://github.com/Marvisak/VIctory/issues/779)) | GetDesc return pointer |
-| 782 | [fork AndyLatimer](https://github.com/AndyLatimer/VIctory/tree/fix/gpu-allocation-info-alignment) ([issue #782](https://github.com/Marvisak/VIctory/issues/782)) | allocation-info alignment |
-| 24 | [PR #24](https://github.com/Marvisak/VIctory/pull/24) | ExecuteIndirect DispatchMeshX |
-| 206 | [PR #206](https://github.com/Marvisak/VIctory/pull/206) | unaligned structured views -> raw view |
-| 492 | [PR #492](https://github.com/Marvisak/VIctory/pull/492) | `R9G9B9E5_SHAREDEXP` -> `R16G16B16A16_FLOAT` |
-| 776 | [fork schmiticle](https://github.com/schmiticle/VIctory/tree/gpu/write-watch-once-per-submission) ([issue #776](https://github.com/Marvisak/VIctory/issues/776)) | write-watch once per submission |
-| 783 | [gist rocobalt1](https://gist.github.com/rocobalt1/1edb3c0dad03f54c05f972b95475b14c) ([issue #783](https://github.com/Marvisak/VIctory/issues/783)) | per-region VirtualQuery fallback |
-| 230 | [PR #230](https://github.com/Marvisak/VIctory/pull/230) | skip clean texture uploads |
-| 775 | [fork talakasse](https://github.com/talakasse/VIctory/tree/shader/swaprel) ([issue #775](https://github.com/Marvisak/VIctory/issues/775)) | shader: swaprel |
-| 728 | [fork Wasler](https://github.com/Wasler/VIctory/tree/fix/shader-top5) ([issue #728](https://github.com/Marvisak/VIctory/issues/728)) | shader: SMEM reads, spilled lane mask |
-
-### Base v1 / v2
-- Shaders: [#539](https://github.com/Marvisak/VIctory/pull/539) [#592](https://github.com/Marvisak/VIctory/pull/592) [#569](https://github.com/Marvisak/VIctory/pull/569) [#694](https://github.com/Marvisak/VIctory/pull/694) [#554](https://github.com/Marvisak/VIctory/pull/554) [#571](https://github.com/Marvisak/VIctory/pull/571) [#655](https://github.com/Marvisak/VIctory/pull/655) [#628](https://github.com/Marvisak/VIctory/pull/628) [#617](https://github.com/Marvisak/VIctory/pull/617)
-- GPU / build: [#688](https://github.com/Marvisak/VIctory/pull/688) [#609](https://github.com/Marvisak/VIctory/pull/609) [#652](https://github.com/Marvisak/VIctory/pull/652) [#346](https://github.com/Marvisak/VIctory/pull/346) [#472](https://github.com/Marvisak/VIctory/pull/472) [#677](https://github.com/Marvisak/VIctory/pull/677) [#588](https://github.com/Marvisak/VIctory/pull/588)
-- Audio / input: [#240](https://github.com/Marvisak/VIctory/pull/240) [#536](https://github.com/Marvisak/VIctory/pull/536) [#620](https://github.com/Marvisak/VIctory/pull/620)
-- Upstream base: [#566](https://github.com/Marvisak/VIctory/pull/566) (`ffe310e`) + scoped `#736` fix
-
-## Verification (v4 — Offline)
-
-Host: Windows 11, x86_64 AVX2, AMD Radeon RX 6700 XT, `dxil.dll` `10.0.26100.0`.
-
-- `cargo test --workspace -- --test-threads=1`: **447 passed, 0 failed, 6 ignored** (`victory` 1, `victory-core` 11, `victory-formats` 26 + 4 ignored, `victory-game` 2, `victory-gpu` 93 + 1 ignored, `victory-hle` 105 + 1 integration, `victory-loader` 22 + 3 integration, `victory-pe` 7, `victory-pipeline` 4, `victory-shader` 168 + 1 ignored, `xtask` 4).
-- `cargo test -p victory-gpu --features diagnostics -- --test-threads=1`: **97 passed, 0 failed, 1 ignored**.
-- `cargo xtask policy`: **`asset policy: 162 files ok`**.
-- `cargo build --release -p victory` (Thin LTO): **ok** (`54.22 s`).
-- `translate --validate` across all shipped title shader containers (`26,599` containers / `26,148` programs):
+Host: Windows 11 x64 AVX2, AMD Radeon RX 6700 XT, `dxil.dll` `10.0.26100.0` (corpus: `26,599` containers / `26,148` programs).
 
 | Build | VS/PS Validated (Emitted) | CS Validated (Emitted) | MS Validated (Emitted) | GS Validated (Emitted) | Total Primary Validated | Rejected by DXIL Validator |
 |---|---|---|---|---|---|---|
-| Upstream `02f404e` | – | – | – | – | 21,678 | – |
-| v2 (`ultimate-rx6700xt-v2`) | 12,890 (12,932) | 1,451 (1,475) | 8,153 (8,214) | 0 (0) | 22,494 | 127 |
-| v3 | 12,977 (13,020) | 1,471 (1,505) | 8,319 (8,380) | 0 (0) | 22,767 | 138 |
-| **v4 (current)** | **13,248** (13,292) | **1,539** (1,573) | **8,374** (8,455) | **195** (195) + **195** ES halves | **23,356** | **159** |
+| Upstream base `02f404e` (`#685`) | `12,160` (`12,236`) | `1,417` (`1,440`) | `8,101` (`8,163`) | `0` (`0`) | **21,678** | `161` |
+| **v1** (`8e79c80` + 13 PRs) | `12,883` (`12,925`) | `1,451` (`1,474`) | `8,102` (`8,163`) | `0` (`0`) | **22,436** | – |
+| **v2** (`ffe310e` + 19 PRs + `#736`) | `12,890` (`12,932`) | `1,451` (`1,475`) | `8,153` (`8,214`) | `0` (`0`) | **22,494** | `127` |
+| **v3** (+16 items) | `12,977` (`13,020`) | `1,471` (`1,505`) | `8,319` (`8,380`) | `0` (`0`) | **22,767** | `138` |
+| **v4** (+3 fixes + 17 items) | `13,248` (`13,292`) | `1,539` (`1,573`) | `8,374` (`8,455`) | `195` (`195`) + `195` ES | **23,356** | `159` |
+| **v5** (+22 merges + `#981` + `f64`) | `13,769` (`13,769`) | `1,847` (`2,505`) | `8,599` (`8,670`) | `195` (`195`) + `195` ES | **24,410** | `729` (`658` CS + `71` MS) |
+| **v6 (current)** (+64 PR merges + local fixes) | `13,425` (`13,425`) | **`2,494` (`2,494`)** | `8,405` (`8,476`) | **`195` (`195`) + `195` ES** | **24,519** | **`71`** (`0` CS + `71` MS) |
 
-- Delta v3 → v4: **+589** primary validated shaders (plus **195/195** ES halves); **+1,678** over upstream `02f404e`.
-- Not yet tested in-game.
+- **v6 Verification Results:**
+  - `cargo test --workspace -- --test-threads=1`: **610 passed, 0 failed, 6 ignored** (`victory` 1, `victory-core` 11, `victory-formats` 27 + 4 ign, `victory-game` 2, `victory-gpu` 136 + 1 ign, `victory-hle` 105 + 1, `victory-loader` 22 + 2 + 1, `victory-pe` 7, `victory-pipeline` 5, `victory-shader` 287 + 1 ign, `xtask` 4).
+  - `cargo test -p victory-gpu --features diagnostics -- --test-threads=1`: **142 passed, 0 failed, 1 ignored**.
+  - `cargo xtask policy`: **`asset policy: 174 files ok`**.
+  - `cargo build --release -p victory` (Thin LTO): **ok** (`1m 38s`).
+  - Note on `v6` shader corpus delta vs `v5`: Compute validation rose by **`+647`** (`1,847 -> 2,494`, `100%` of emitted CS!) and DXIL validator rejections plunged **`-90.3%`** (`729 -> 71`), pushing total primary validated to **`24,519`** (`+2,841` over `02f404e`). Top remaining refusal in `v6` is `emit: a descriptor's address or format read as data` (`840`), making it the primary target for future work.
+
+---
+
+## Complete Chronological Change Inventory (`02f404e` -> `v6`)
+
+### Base Upstream Commits Synced
+- Starting point: **`02f404e`** (`PR #685`), followed by **`8e79c80`** (`#696`, `#706`, `#88`, `#93`, CI), then **`ffe310e`** (`PR #566` waterfall loops over first-lane table offsets, `61299b9` signature adaptations).
+
+### v1 — Initial Optimized Stack (13 PRs on `8e79c80`)
+- **Shaders (7):** [#539](https://github.com/Marvisak/VIctory/pull/539) (64-bit image atomics), [#592](https://github.com/Marvisak/VIctory/pull/592) (packed 16-bit pixel inputs 2nd rows), [#569](https://github.com/Marvisak/VIctory/pull/569) (biased image samples with 16-bit coords), [#694](https://github.com/Marvisak/VIctory/pull/694) (`image_sample_d_cl` / `image_gather4_l`), [#554](https://github.com/Marvisak/VIctory/pull/554) (one interpolation mode per signature row), [#571](https://github.com/Marvisak/VIctory/pull/571) (LDS byte/half ops), [#655](https://github.com/Marvisak/VIctory/pull/655) (guard conditional exports).
+- **GPU & Build (6):** [#688](https://github.com/Marvisak/VIctory/pull/688) (reclaim dynamic descriptor slots), [#609](https://github.com/Marvisak/VIctory/pull/609) (defer retirement of GPU resources), [#652](https://github.com/Marvisak/VIctory/pull/652) (MSAA resolve mip extents), [#346](https://github.com/Marvisak/VIctory/pull/346) (expand indirect rectangle-list draws on GPU), [#472](https://github.com/Marvisak/VIctory/pull/472) (grow write snapshot in place & cap idle pool memory), [#677](https://github.com/Marvisak/VIctory/pull/677) (Thin LTO for release/diag builds).
+
+### v2 — Rebase to `ffe310e` (`#566`) + 6 PRs + `#736` Fix
+- Rebased/merged upstream `ffe310e` ([#566](https://github.com/Marvisak/VIctory/pull/566) waterfall loops + local `#736` fix `bfff38b`).
+- **Merged (6):** [#588](https://github.com/Marvisak/VIctory/pull/588) (shadow buffer UAV <-> VB/IB/CBV transitions), [#628](https://github.com/Marvisak/VIctory/pull/628) (`ds_min_f32` / `ds_max_f32` RDNA2), [#617](https://github.com/Marvisak/VIctory/pull/617) (reuse lane guards), [#240](https://github.com/Marvisak/VIctory/pull/240) (DSP reverb convolution), [#536](https://github.com/Marvisak/VIctory/pull/536) (XMA ring wrap), [#620](https://github.com/Marvisak/VIctory/pull/620) (trigger rumble).
+
+### v3 — Stability & Rendering Expansion (16 items)
+- **GPU / Loader / Formats:** [#454](https://github.com/Marvisak/VIctory/pull/454) (`VICTORY_NO_WATCHDOG=1`), [#190](https://github.com/Marvisak/VIctory/pull/190) (indirect-arg DXIL clamp), [#493](https://github.com/Marvisak/VIctory/pull/493) (bounded root SRVs), [#568](https://github.com/Marvisak/VIctory/pull/568) (typed null descriptors), [#469](https://github.com/Marvisak/VIctory/pull/469) (depth UAV twin), [#211](https://github.com/Marvisak/VIctory/pull/211) (PresentX multi-planes), [#779](https://github.com/Marvisak/VIctory/issues/779) (GetDesc return pointer), [#782](https://github.com/Marvisak/VIctory/issues/782) (allocation-info alignment), [#24](https://github.com/Marvisak/VIctory/pull/24) (`ExecuteIndirect DispatchMeshX`), [#206](https://github.com/Marvisak/VIctory/pull/206) (unaligned structured views -> raw), [#492](https://github.com/Marvisak/VIctory/pull/492) (`R9G9B9E5_SHAREDEXP` -> `R16G16B16A16_FLOAT`), [#776](https://github.com/Marvisak/VIctory/issues/776) (write-watch once per submission), [#783](https://github.com/Marvisak/VIctory/issues/783) (`VirtualQuery` per-region fallback), [#230](https://github.com/Marvisak/VIctory/pull/230) (skip unchanged texture uploads).
+- **Shaders:** [#775](https://github.com/Marvisak/VIctory/issues/775) (`v_swaprel_b32` / `v_movrelsd_2_b32`), [#728](https://github.com/Marvisak/VIctory/issues/728) (SMEM descriptor reads, spilled lane mask).
+
+### v4 — Geometry, Stride Table & Session Fixes (3 session fixes + 17 items)
+- **Session fixes:** [#844](https://github.com/Marvisak/VIctory/issues/844) (`resync_title_writes`), [#855](https://github.com/Marvisak/VIctory/issues/855) (`243d6d4` single shared returning block, `e67bb3d` omit array slices in `CalculateLOD`).
+- **GPU & Memory:** [#876](https://github.com/Marvisak/VIctory/issues/876)/[#882](https://github.com/Marvisak/VIctory/issues/882) (aspect-aware typeless view remapping), [#651](https://github.com/Marvisak/VIctory/pull/651) (depth/stencil SRV aspect & `PlaneSlice`), [#450](https://github.com/Marvisak/VIctory/pull/450) (typed null RTVs), [#780](https://github.com/Marvisak/VIctory/issues/780)/#352 (`mesh triangles` library key & clean `RTVFormats`), [#796](https://github.com/Marvisak/VIctory/issues/796) (`OMSetRenderTargets` single-range guards), [#790](https://github.com/Marvisak/VIctory/issues/790) (`< 4 GiB` `xmem` 32-bit guard), [#464](https://github.com/Marvisak/VIctory/pull/464) (cache unmapped `absent` blocks), [#703](https://github.com/Marvisak/VIctory/pull/703) (`BCPack` `Workspace` reuse & LUTs).
+- **Shaders:** [#585](https://github.com/Marvisak/VIctory/pull/585) (descriptor-only `GetDimensions`, null/const root descriptors), [#645](https://github.com/Marvisak/VIctory/pull/645) (root args spilled through VGPRs), [#489](https://github.com/Marvisak/VIctory/pull/489) (root spill table reads), [#704](https://github.com/Marvisak/VIctory/pull/704)+[#193](https://github.com/Marvisak/VIctory/pull/193) (runtime stride table for unknown-stride buffers), [#453](https://github.com/Marvisak/VIctory/pull/453) (`SV_Barycentrics`), [#878](https://github.com/Marvisak/VIctory/issues/878) (mask dwords & `s_bcnt1`), [#877](https://github.com/Marvisak/VIctory/issues/877) (legacy ES-GS geometry pipelines), [#852](https://github.com/Marvisak/VIctory/issues/852) (2-dword heap handle key), [#853](https://github.com/Marvisak/VIctory/issues/853) (waterfall dimension-only queries).
+
+### v5 — Shader & GPU Expansion (22 merges + local test/adaptation fixes)
+- **GPU / Indirect / Views:** `v5-921` (resolve placed texture UAVs to host resources), `v5-912` (zero-element buffer views as null descriptors), `v5-981` (align buffer view on host copy element), [#956](https://github.com/Marvisak/VIctory/pull/956) (clear overwritten guest root constants after `ExecuteIndirect`), `pr-67` (skip texture-to-buffer readback when texel size differs), [#1162](https://github.com/Marvisak/VIctory/pull/1162) (`ClearUnorderedAccessViewUint`/`Float` for buffers & textures), [#1126](https://github.com/Marvisak/VIctory/pull/1126) (release descriptor tables after rejected bind, keeping `Lease` reclamation).
+- **Shaders / DXIL:** `fix/dxil-f64-conversion` (`v_cvt_f32_f64` & DXIL f64 flags), `v5-920` (`image_store` partial channel masks), `v5-914` (`SV_RenderTargetArrayIndex` / `SV_ViewportArrayIndex` initial exports), `v5-908` (helper lane `v_readfirstlane`), [#1130](https://github.com/Marvisak/VIctory/pull/1130) (descriptor read as data takes entry use kind), [#1056](https://github.com/Marvisak/VIctory/pull/1056) (scalar loads from root view address), [#1073](https://github.com/Marvisak/VIctory/pull/1073) (scalar joining lane mask and number), [#1074](https://github.com/Marvisak/VIctory/pull/1074) (lane mask spilled to VGPR lane), [#1012](https://github.com/Marvisak/VIctory/pull/1012) (descriptors joined by nested control flow), [#1022](https://github.com/Marvisak/VIctory/pull/1022) (validator signature row order), [#1134](https://github.com/Marvisak/VIctory/pull/1134) (`v_permlanex16_b32`), [#1176](https://github.com/Marvisak/VIctory/pull/1176) (uninitialized pixel SGPRs read zero), [#1008](https://github.com/Marvisak/VIctory/pull/1008) (immediate samplers chosen by control flow), [#978](https://github.com/Marvisak/VIctory/pull/978) (f64 immediate decode / double-precision checks), [#1182](https://github.com/Marvisak/VIctory/pull/1182) (prior per-lane descriptor word across redundant masked moves, issue #750).
+
+### v6 — Ultimate Merge Stack (64 merges across Batch A, Batch B/B+, Batch B++, and Fast Sweep)
+- **v6 Batch A — GPU 3D & Stability (10 merges):** [#1228](https://github.com/Marvisak/VIctory/pull/1228) (order shader writes on pipeline syncs, #732), [#1210](https://github.com/Marvisak/VIctory/pull/1210) (re-upload host textures after title write), [#1150](https://github.com/Marvisak/VIctory/pull/1150) (`OMSetDepthBounds`), [#1267](https://github.com/Marvisak/VIctory/pull/1267) (keep only writable shader byte ranges once/submission), [#1215](https://github.com/Marvisak/VIctory/pull/1215) (`NtWriteVirtualMemory` copy-back & `VICTORY_PROFILE`), [#1265](https://github.com/Marvisak/VIctory/pull/1265) (`VICTORY_WIDE_SCISSOR` diagnostic), [#1277](https://github.com/Marvisak/VIctory/pull/1277) (track view memory until remapped), [#1298](https://github.com/Marvisak/VIctory/pull/1298) (replace stale descriptors on null CBV writes), [#1311](https://github.com/Marvisak/VIctory/pull/1311) (normalized rect corners & NaN half conversion), [#1040](https://github.com/Marvisak/VIctory/pull/1040) (drop unsupported UAV/RT flags & guard RTV, adapted).
+- **v6 Batch B + B+ — Shaders & VALU (27 active merges, `#1099` reverted):**
+  - Control flow, descriptors, images & LDS: [#1230](https://github.com/Marvisak/VIctory/pull/1230) (path-sensitive missing phi reachability, #736), [#1237](https://github.com/Marvisak/VIctory/pull/1237) (compute implicit samples via quad gradients), [#1256](https://github.com/Marvisak/VIctory/pull/1256) (cube-array slice/face decode, #720), [#1253](https://github.com/Marvisak/VIctory/pull/1253) (scalar index arithmetic in waterfall offsets), [#1271](https://github.com/Marvisak/VIctory/pull/1271) (heap UAV inference & `glc` coherence), [#1231](https://github.com/Marvisak/VIctory/pull/1231) (uniform phis under `v_readfirstlane`), [#1245](https://github.com/Marvisak/VIctory/pull/1245) (biased 16-bit sample reads own bias VGPR), [#1148](https://github.com/Marvisak/VIctory/pull/1148) (`image_atomic_{inc,dec,fcmpswap,fmin,fmax}`), [#984](https://github.com/Marvisak/VIctory/pull/984) (split flat byte-offset structured loads), [#1145](https://github.com/Marvisak/VIctory/pull/1145) (duplicate latch folding & bitcode `replace_const` fix), [#1202](https://github.com/Marvisak/VIctory/pull/1202) (4 DXIL validator fixes + `SV_RenderTargetArrayIndex`/`SV_ViewportArrayIndex`), [#1276](https://github.com/Marvisak/VIctory/pull/1276) (first-lane scalar load from code table), [#1280](https://github.com/Marvisak/VIctory/pull/1280) (gradient samples with level clamp & face-space cube grads), [#1288](https://github.com/Marvisak/VIctory/pull/1288) (typed fetch aligned pair), [#1291](https://github.com/Marvisak/VIctory/pull/1291) (zero padding halves in f16 pixel interpolation), [#1293](https://github.com/Marvisak/VIctory/pull/1293) (`v_mov_b32` copies in interpolation pairing), [#1313](https://github.com/Marvisak/VIctory/pull/1313) (zero for unused image query extents).
+  - VALU & Wave instructions: [#1223](https://github.com/Marvisak/VIctory/pull/1223) (`v_ldexp_f16`), [#1136](https://github.com/Marvisak/VIctory/pull/1136) (`v_pk_fmac_f16`), [#1149](https://github.com/Marvisak/VIctory/pull/1149) (`v_div_fixup_{f32,f16}`), [#1197](https://github.com/Marvisak/VIctory/pull/1197) (`v_sad_*` / `v_msad_u8`), [#1190](https://github.com/Marvisak/VIctory/pull/1190) (`v_frexp_{mant,exp}_*`), [#1285](https://github.com/Marvisak/VIctory/pull/1285) (16-bit VALU SDWA placement & inline float consts), [#1295](https://github.com/Marvisak/VIctory/pull/1295) (16-bit int inline float consts), [#1312](https://github.com/Marvisak/VIctory/pull/1312) (`v_readlane`/`v_writelane` lane masking & EXEC bypass), [#1292](https://github.com/Marvisak/VIctory/pull/1292) (`v_dot2`/`dot4`/`dot4c`/`dot8`), [#1300](https://github.com/Marvisak/VIctory/pull/1300) (`v_{min3,max3,med3}_{i16,u16}` & `v_mad_{u32_u16,i32_i16}`), [#1314](https://github.com/Marvisak/VIctory/pull/1314) (`v_{fmaak,fmamk}_f16`, `v_cvt_pk_*16_*32`, `v_lerp_u8`).
+- **v6 Batch B++ — New Upstream Shaders Sub-group 1 (11 merges):** [#1409](https://github.com/Marvisak/VIctory/pull/1409) (heap-loaded `s_buffer_load` as raw SRV + compute `image_sample` LOD 0 fallback), [#1385](https://github.com/Marvisak/VIctory/pull/1385) (`GS_ALLOC_REQ` M0 bounds & mesh export constant guards), [#1489](https://github.com/Marvisak/VIctory/pull/1489) (`image_gather4_c_lz` / `_o`), [#1488](https://github.com/Marvisak/VIctory/pull/1488) (`ds_add{_rtn}_f32` & `ds_cmpst{_rtn}_f32`), [#1493](https://github.com/Marvisak/VIctory/pull/1493) (key immediate samplers by comparison mode), [#1473](https://github.com/Marvisak/VIctory/pull/1473) (per-lane pixel export state across mixed joins), [#1484](https://github.com/Marvisak/VIctory/pull/1484) (prune unreachable blocks before SSA), [#1474](https://github.com/Marvisak/VIctory/pull/1474) (`WAVE_OPS` flag on `waveGetLaneIndex`), [#1460](https://github.com/Marvisak/VIctory/pull/1460) (distinct critical-edge blocks for duplicate branch targets), [#1471](https://github.com/Marvisak/VIctory/pull/1471) (fold empty loop latches with dead phis), [#1501](https://github.com/Marvisak/VIctory/pull/1501) (DS ops without LDS read 0 / drop writes, extended for HEAD's byte/half and float LDS ops).
+- **v6 Clean Auto-Merge Sweep (16 merges across B++ / A++):**
+  - **Shaders:** [#1404](https://github.com/Marvisak/VIctory/pull/1404) (structure assert support set of vcc branch), [#1443](https://github.com/Marvisak/VIctory/pull/1443) (D3D12 scalar quadmask tests), [#1486](https://github.com/Marvisak/VIctory/pull/1486) (`Sym::Own` source lane tracking for shuffles), [#1328](https://github.com/Marvisak/VIctory/pull/1328) (bitwise `WaveMultiPrefixOp`), [#1366](https://github.com/Marvisak/VIctory/pull/1366) (skip VS inputs on mesh stage I/O), [#1395](https://github.com/Marvisak/VIctory/pull/1395) (`s_bfe_u64`/`s_bfe_i64`/`s_bfm_b64`).
+  - **GPU / Formats / Pipeline:** [#1446](https://github.com/Marvisak/VIctory/pull/1446) (bind initial PSO in `create_list`/`create_list_x`), [#1392](https://github.com/Marvisak/VIctory/pull/1392) (UAV barrier after dropped compute dispatch), [#1390](https://github.com/Marvisak/VIctory/pull/1390) (keep `A8_UNORM` out of `R8` typeless family), [#1424](https://github.com/Marvisak/VIctory/pull/1424) (skip empty host submissions), [#1346](https://github.com/Marvisak/VIctory/pull/1346) (validate `allocate_upload` alignments & oversized requests), [#1324](https://github.com/Marvisak/VIctory/pull/1324) (blocked Windows cache publication test), [#1472](https://github.com/Marvisak/VIctory/pull/1472) (flush only overlapping shadow refreshes before `Step::GpuWrite`), [#1463](https://github.com/Marvisak/VIctory/pull/1463) (`VICTORY_SUBMIT_MAX_RUNS` cap), [#1505](https://github.com/Marvisak/VIctory/pull/1505) (pipeline workers at title priority), [#1499](https://github.com/Marvisak/VIctory/pull/1499) (keep deep 3D mips out of thick mip tail, `VIC-BT-014`).
+
+## Local Fixes & Test Adaptations (`ultimate-rx6700xt`)
+- `ca9ea87`: Allowed `CubeArray` (`kind == 9`) gathers past `pr-1489`'s `2 | 5 | 7` guard (fixing `cube_array_gather_and_resinfo_match_rdna2`), and split `crates/victory-shader/src/emit/lower.rs` (`619,692` B > `512 KiB` policy limit) cleanly into `lower.rs` (`516,776` B) + `lower_mesh.rs` + `lower_tests.rs` so `cargo xtask policy` passes untouched.
+- `f472bff`: Removed duplicate `sopc` helper in `valu_tests.rs` after `#1443` / `#1395` sweep.
+- `ef54a9e`: Updated `heap_uav_inference_and_glc_coherence_set_handle_properties` expectation for `s_buffer_load_dword` from `ResourceHeap` (`(13, 0x1_0000)` -> `(0x000B, 0)` per `#1409`).
+- `aa719f1` / `77bcae5`: Skipped non-WARP adapters in synthetic `image_gather4_c_lz` / `immediate_sampler` `View::Texture` (`RGBA32F`) tests when `D3D12_FEATURE_FORMAT_SUPPORT` lacks `SHADER_GATHER_COMPARISON` / `SHADER_SAMPLE_COMPARISON` (AMD RDNA2 strictly enforces D3D12 single-component format support on comparison sampling).
+- `92f1773` / `8681d1f` / `177764b` / `203ad44`: Reconciled Batch A unit tests (`placed_uav_tests`, `shadow::tests`, `texture::tests`, `host_texture` feature queries) and `rectangles` `Snorm8`/`Snorm16` support with `#1040`/`#1210`/`#1265`.
+- `92300ad` / `4cf3636` / `7f37f05` / `09b99b5`: Adapted Validator 1.6 signature sort test (`container.rs`), `half_int_src` usage in `#1300`, `HostShader` `table_views`/`stride_table` test literals, and `#1276` `first_lane` code-table test assertions.
+
+## Reverted & Skipped PRs (with exact reasons)
+- **v2:** [#459](https://github.com/Marvisak/VIctory/pull/459), [#334](https://github.com/Marvisak/VIctory/pull/334), [#582](https://github.com/Marvisak/VIctory/pull/582), [#159](https://github.com/Marvisak/VIctory/pull/159), [#587](https://github.com/Marvisak/VIctory/pull/587) (merge conflicts).
+- **v3:** [#436](https://github.com/Marvisak/VIctory/pull/436), [#515](https://github.com/Marvisak/VIctory/pull/515), [#393](https://github.com/Marvisak/VIctory/pull/393) (merge conflicts).
+- **v4:** [#785](https://github.com/Marvisak/VIctory/issues/785) (needs skipped `#334`), [#757](https://github.com/Marvisak/VIctory/issues/757) (conflicts `#346`/`#190`/`#24`), [#699](https://github.com/Marvisak/VIctory/pull/699) (superseded by scoped `#736`), [#710](https://github.com/Marvisak/VIctory/pull/710) (deep conflicts across 8 files).
+- **v6 Batch A/B/B+:**
+  - `#1260`: superseded by HEAD `v5-981` (`shadow::aligned`).
+  - `#1099` (merged `ec245ff`, reverted `a00313b`): broke soundness test `first_half_of_interpolation_stays_missing_when_live_and_lowers_when_overwritten`; superseded by `#1230` `BoolSet`.
+  - `#1270` (aborted): failed `!l.wave_ops` (`selects_on_masks_the_same_in_every_lane_need_no_lane_index`) and WARP `WaveSize(64)`.
+  - `#1310`: shader diff already 100% present in HEAD (generalized by `#1253`).
+- **v6 Batch B++ / A++ / Batch C Skipped (62 PRs total across manual/dedup/sweep):**
+  - Dedup / already covered (7): `#1417` (superseded by `#1202` + 9 `lower.rs` conflicts), `#1451` (overlaps `#1293` across 4 files), `#1480` (covered by `#1245`+`#1280`), `#1467` (`HandleKey` in HEAD), `#1477` (chose `#1493`), `#1400` (chose cleaner `#1414`), `#1494` (chose safer `VIC-BT-014` `#1499`), `#1354`, `#1336`.
+  - Fast-track auto-sweep merge conflicts (50 PRs in B++/A++): `#1407`, `#1420`, `#1412`, `#1416`, `#1423`, `#1408`, `#1491`, `#1485`, `#1441`, `#1437`, `#1478`, `#1469`, `#1342`, `#1341`, `#1340`, `#1339`, `#1338`, `#1337`, `#1334`, `#1333`, `#1327`, `#1326`, `#1370`, `#1391`, `#1398`, `#1387`, `#1371`, `#1433` (Wave32-only multi-wave flow; RX 6700 XT runs wave64 natively), `#1448`, `#1444`, `#1428` (partial overlap `#796`), `#1427` (partial overlap `#568`), `#1422`, `#1406` (partial overlap `#876`), `#1414`, `#1388`, `#1374`, `#1352`, `#1349` (partial overlap `#688`/`#1126`), `#1322`, `#1453`, `#1351`/`#1350`/`#1332` (overlap `#776`/`#783`), `#1466`, `#1461`, `#1510`, `#1507`, `#1503`, `#1500`.
+  - Batch C large architectural PRs skipped due to conflicts (4): `#1315`, `#1399` (merged ES+GS; HEAD already has `#877` `pr-1202` ES-GS), `#1198` (`+2335` lines address map/descriptors), `#1175` (spilled root UAV writes).

@@ -1,6 +1,6 @@
 # VIctory
 
-> **Personal fork (`AI-assisted`):** [`justr4mzi/VIctory`](https://github.com/justr4mzi/VIctory) (branch `ultimate-rx6700xt`, synced to `main`). Stacks community PRs and contributor fixes on top of upstream [`Marvisak/VIctory`](https://github.com/Marvisak/VIctory) (`ffe310e`) targeting Windows 11 + AMD Radeon RX 6700 XT. Upstream reviews belong on the original PRs/issues. See [FORK.md](FORK.md) for the complete list of integrated patches, skipped PRs, and offline verification results.
+> **Personal fork (`AI-assisted`):** [`justr4mzi/VIctory`](https://github.com/justr4mzi/VIctory) (branch `ultimate-rx6700xt`, mirrored to `main`). Stacks community PRs, fork fixes, and local adaptations from upstream [`Marvisak/VIctory`](https://github.com/Marvisak/VIctory) (`02f404e` -> `8e79c80` -> `ffe310e`) through **`v6`** targeting Windows 11 + AMD Radeon RX 6700 XT (**24,519** primary shaders validated offline, incl. **2,494** compute shaders with `0` CS validator rejections). Upstream reviews belong on the original PRs/issues. See [FORK.md](FORK.md) for the complete history (`v1`–`v6`), merged/skipped PRs, local fixes, and verification results.
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
