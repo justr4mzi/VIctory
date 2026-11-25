@@ -4002,8 +4002,23 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
 /// bytes), each with the asking that last took it; and the askings so far.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> =
+static EXACT: Mutex<(u64, u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64, u64)>)> =
     Mutex::new((0, 0, BTreeMap::new()));
+
+/// Recycled `shadow::exact` upload buffers keyed by bucketed byte capacity.
+#[allow(clippy::type_complexity)]
+static EXACT_POOL: Mutex<(usize, BTreeMap<u64, Vec<(ID3D12Resource, usize, u64)>>)> =
+    Mutex::new((0, BTreeMap::new()));
+
+fn exact_cap(len: u64) -> u64 {
+    if len <= 256 {
+        256
+    } else if len <= 65_536 {
+        len.next_power_of_two()
+    } else {
+        len.next_multiple_of(256)
+    }
+}
 
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -4023,39 +4038,88 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// refreshes the copy its view's slot shows, `buffer_copy`). Kept by
 /// (start, bytes) for as long as a list or a slot holds it; of the others,
 /// those not asked for lately go once there are many (ring positions
-/// change every frame).
+/// change every frame), recycling their host buffers by capacity bucket.
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for, and the askings an
     /// idle one stays for.
     const MANY: usize = 256;
     const LATELY: u64 = 512;
+    const POOL_BUCKET_CAP: usize = 128;
+    const POOL_TOTAL_CAP: usize = 1024;
     if len == 0 {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, last_prune, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
+    let mut idle: Vec<(u64, ID3D12Resource, usize, u64)> = Vec::new();
+    {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, last_prune, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((shadow, used, _)) = map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+        if map.len() >= MANY && now.saturating_sub(*last_prune) >= LATELY {
+            *last_prune = now;
+            // Held by the map alone (no list), its buffer by the copy alone (no
+            // slot shows it), and not asked for lately.
+            map.retain(|_, (shadow, used, cap)| {
+                if Arc::strong_count(shadow) == 1
+                    && crate::host::references(&shadow.buffer) == 1
+                    && *used + LATELY <= now
+                {
+                    idle.push((*cap, shadow.buffer.clone(), shadow.data as usize, shadow.gpu));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
     }
-    if map.len() >= MANY && now.saturating_sub(*last_prune) >= LATELY {
-        *last_prune = now;
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
+    if !idle.is_empty() {
+        let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let (total, buckets) = &mut *pool;
+        for (cap, buffer, data, gpu) in idle {
+            if *total < POOL_TOTAL_CAP {
+                let bucket = buckets.entry(cap).or_default();
+                if bucket.len() < POOL_BUCKET_CAP {
+                    bucket.push((buffer, data, gpu));
+                    *total += 1;
+                }
+            }
+        }
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let cap = exact_cap(len);
+    let recycled = {
+        let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let (total, buckets) = &mut *pool;
+        buckets.get_mut(&cap).and_then(|bucket| {
+            let item = bucket.pop()?;
+            *total -= 1;
+            Some(item)
+        })
+    };
+    let (buffer, data, gpu) = match recycled {
+        Some((buffer, data, gpu)) => (buffer, data as *mut u8, gpu),
+        None => {
+            let (buffer, data) = host()?.shared_buffer(cap)?;
+            crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            (buffer, data, gpu)
+        }
+    };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let (tick, _, map) = &mut *guard;
+    let now = *tick;
+    if let Some((existing, used, _)) = map.get_mut(&(address, len)) {
+        *used = now;
+        return Some(existing.clone());
+    }
+    map.insert((address, len), (shadow.clone(), now, cap));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     Some(shadow)
 }
@@ -4277,6 +4341,17 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    #[test]
+    fn exact_cap_buckets_small_and_aligns_large() {
+        assert_eq!(super::exact_cap(1), 256);
+        assert_eq!(super::exact_cap(256), 256);
+        assert_eq!(super::exact_cap(257), 512);
+        assert_eq!(super::exact_cap(4096), 4096);
+        assert_eq!(super::exact_cap(4097), 8192);
+        assert_eq!(super::exact_cap(65_536), 65_536);
+        assert_eq!(super::exact_cap(65_537), 65_792);
     }
 }
 

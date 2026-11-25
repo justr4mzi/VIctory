@@ -1934,6 +1934,20 @@ mod tests {
             sync_heaps();
             assert_eq!(SYNCED[2].swap(0, std::sync::atomic::Ordering::Relaxed), 1);
             assert_eq!(host.buffer_changes(), vec![4]);
+
+            // Draw-side `mirror(slot, handle, true)` does not invalidate `copied` (`take_forgotten_copied` stays empty),
+            // whereas API-side `mirror(slot, handle, false)` and zeroing a made slot still do.
+            let _ = host.take_forgotten_copied();
+            let h4 = heap(h).handle(4).unwrap();
+            assert!(host.mirror(4, h4, true).is_some());
+            assert!(host.take_forgotten_copied().is_empty());
+
+            // Zero out slot 4 and draw-mirror -> `force_forget` still invalidates `copied`.
+            unsafe {
+                std::ptr::write_bytes(memory.cast::<u8>().add(4 * 32), 0, 32);
+            }
+            assert!(host.mirror(4, h4, true).is_none());
+            assert_eq!(host.take_forgotten_copied(), vec![4]);
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
