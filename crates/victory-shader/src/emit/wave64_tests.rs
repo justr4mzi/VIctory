@@ -531,7 +531,6 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
 
-<<<<<<< HEAD
 /// The prefix of wave totals the console's structure builder computes (issue #4): each console
 /// wave of a 256-thread group writes its total (10 + its index) to LDS, then, under
 /// `if (id >> 6 != 0)`, loops over the totals of the waves before it with lanes leaving at their
