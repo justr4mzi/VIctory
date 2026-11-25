@@ -9546,7 +9546,8 @@ impl<'a> Lower<'a> {
             // sized only.
             3 if name.starts_with("image_sample")
                 || name.starts_with("image_gather")
-                || name == "image_get_resinfo" =>
+                || name == "image_get_resinfo"
+                || (name == "image_get_lod" && self.s.pixel) =>
             {
                 (5, 3)
             }
@@ -9854,8 +9855,8 @@ impl<'a> Lower<'a> {
                     l.as_float(x)
                 }
             };
-            if kind == 5 && (*unorm || op == 81) {
-                return Err("a cube sample with texel coordinates or a level query");
+            if kind == 5 && *unorm {
+                return Err("a cube sample with texel coordinates");
             }
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 let x = addr_packed(self, coord_base, k)?;
