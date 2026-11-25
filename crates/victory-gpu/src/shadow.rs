@@ -88,7 +88,7 @@ pub(crate) struct Shadow {
     /// the title's own bytes and nothing is copied either way. The heap,
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64, bool)>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2409,9 +2409,9 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
-        if self.place.is_some() {
+        if let Some((_, _, section)) = self.place {
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            crate::inplace::gone(self.window, self.len, section);
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -2798,7 +2798,7 @@ impl Shadow {
     /// over it in a heap opened on it. Shaped as a copy so that everything
     /// that binds, views or keeps a copy works on it unchanged; what
     /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
-    fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
+    fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool, section: bool) -> Shadow {
         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
         let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
         // Not a copy: not counted with them, and nothing asks what the
@@ -2807,7 +2807,7 @@ impl Shadow {
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
-        shadow.place = Some((placed.heap, placed.bias));
+        shadow.place = Some((placed.heap, placed.bias, section));
         shadow
     }
 
@@ -3306,7 +3306,7 @@ impl Shadow {
         }
         OWN_WRITES[1].fetch_add(bytes.len() as u64, Ordering::Relaxed);
         let n = OWN_WRITES[0].fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 16384 == 0 {
+        if n.is_multiple_of(16384) {
             tracing::info!(
                 "what shaders wrote, stored through views of our own (VICTORY_BACK_OWN_VIEW=1), since the start: {n} stretches {} MB, {} pages noted current for the copy that wrote them (not copied in again), {} stretches written the old way; with VICTORY_BACK_OWN_CHECK=1: {} stores the title's address did not show, {} pages noted current whose CPU side differs from title memory, {} of those with the guard clean",
                 OWN_WRITES[1].load(Ordering::Relaxed) >> 20,
@@ -3916,7 +3916,7 @@ impl Shadow {
             COPY_CHANGED[1].fetch_add(sent as u64, Ordering::Relaxed);
             COPY_CHANGED[2].fetch_add(stretches.len() as u64, Ordering::Relaxed);
             let calls = COPY_CHANGED[3].fetch_add(1, Ordering::Relaxed) + 1;
-            if calls % 65536 == 0 {
+            if calls.is_multiple_of(65536) {
                 tracing::info!(
                     "copies in the card's memory, refreshed by what differs (VICTORY_COPY_CHANGED=1), since the start: {calls} refreshes read {} MB of title memory the title had written to; {} MB of it differed from the copy and went on to the card, in {} stretches",
                     COPY_CHANGED[0].load(Ordering::Relaxed) >> 20,
@@ -4394,7 +4394,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false, false)));
             return entry.shadow.clone();
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
@@ -4585,7 +4585,7 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    let (cell, _) = window_of(address, end, WINDOW);
+    let (cell, cell_len) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
@@ -4612,10 +4612,31 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(shadow);
         return Some(shadow.clone());
     }
+    if crate::inplace::section_windows_on() {
+        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+        let found = if unsized_ask {
+            longest_tail(there, address, end)
+        } else {
+            holder(there, address, end)
+        };
+        if let Some(key) = found
+            && let Some(shadow) = map.get(&key)
+            && shadow.place.is_some()
+        {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+    }
+    if let Some((placed, rs, rl)) = crate::inplace::place_section_window(address, end, cell, cell_len, unsized_ask) {
+        let shadow = Arc::new(Shadow::placed(placed, rs, rl, true, true));
+        note(&shadow);
+        map.insert((rs, rl), shadow.clone());
+        return Some(shadow);
+    }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        let shadow = Arc::new(Shadow::placed(placed, start, len, true, false));
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);

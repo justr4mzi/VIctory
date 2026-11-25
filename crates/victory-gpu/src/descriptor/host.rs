@@ -33,6 +33,7 @@ struct SlotState {
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
@@ -1039,6 +1040,7 @@ impl HostHeap {
         let h = HostHeap {
             heap,
             cpu,
+            gpu,
             step,
             count,
             dynamic: extra,
@@ -2078,10 +2080,8 @@ impl HostHeap {
 
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 
@@ -2214,6 +2214,7 @@ impl HostHeap {
     ) -> (u64, u64) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
+        let mut tabled = 0u64;
         due.clear();
         {
             let mut guard = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -2253,13 +2254,16 @@ impl HostHeap {
                 // A table's slot lately: left to its draws, and looked at
                 // again next time.
                 if !tables && self.tabled_lately(index as u32, frame) {
-                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tabled += 1;
                     continue;
                 }
                 *last = print;
                 let words = |k| u32::from_le_bytes(header[k..k + 4].try_into().unwrap());
                 due.push((index as u32, handle, [words(0), words(4), words(8)]));
             }
+        }
+        if tabled != 0 {
+            COPIED_TABLED.fetch_add(tabled, std::sync::atomic::Ordering::Relaxed);
         }
         if !due.is_empty() {
             let mut changed = Vec::new();
