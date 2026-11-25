@@ -177,11 +177,57 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+/// `VICTORY_RAM_RELIEF_MB=<n>`: when the PC has less than `n` MB of
+/// physical memory available, the process's working set is emptied into the
+/// page file, once every five seconds (`K32EmptyWorkingSet`).
+///
+/// Why: a title that commits more than the PC holds (19.5 GB against 15.8
+/// GB here) reaches an allocation that fails, and this title writes through
+/// the null pointer it got: `0xc0000005` at `victory-image+0x23cf683` at
+/// world entry, with the OOM report's `memory.load_percent` at 94 to 99.
+/// Faulting the working set out for a moment hands it the room to finish
+/// that allocation. It is a valve, not a fix: every page faulted out is
+/// faulted back in afterwards. Off by default.
+fn relieve() {
+    static LIMIT: OnceLock<Option<u64>> = OnceLock::new();
+    let Some(limit) = *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_RAM_RELIEF_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&mb| mb > 0)
+    }) else {
+        return;
+    };
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = now_ms();
+    if now.saturating_sub(LAST.load(Ordering::Relaxed)) < 15_000 {
+        return;
+    }
+    let Some(free) = available_physical_ram() else {
+        return;
+    };
+    if free >> 20 >= limit {
+        return;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: our own process and no out parameters.
+    let ok = unsafe { K32EmptyWorkingSet(GetCurrentProcess()) } != 0;
+    tracing::info!(
+        free_mb = free >> 20,
+        emptied = ok,
+        "memory relief: the working set was emptied into the page file"
+    );
+}
+
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
 /// `VICTORY_SWEEP=0` keeps everything, as before.
 fn sweep() {
+    // The low-memory valve first, whatever the sweep is set to.
+    relieve();
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
     static ON: OnceLock<bool> = OnceLock::new();
@@ -2987,6 +3033,12 @@ fn join_copies() -> bool {
 /// that continue the one before ([`join_copies`]).
 static COPIES_JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Since the last frame-rate line, what [`copy_mapped`] moved: bytes and
+/// calls into host copies of ours ([0], [1]), and into title memory ([2],
+/// [3]). The frame line's "copies ... MB" is the time of the first; this
+/// says how the bytes are cut into calls.
+pub(crate) static COPY_MOVED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Whether the copy `next` (destination, source, bytes) goes on exactly
 /// where `last` ended, source and destination both, and the two as one do
 /// not overlap (source over destination): then one copy of both moves the
@@ -2999,6 +3051,38 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
     d.checked_add(n) == Some(dst)
         && s.checked_add(n) == Some(src)
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
+}
+
+/// How far apart two refreshes of one title buffer may be and still become
+/// one copy (`coalesce`): a call moves 11 to 21 KB here, so 64 KB of extra
+/// bytes is cheaper than one more kernel call.
+const COPY_GAP: usize = 64 << 10;
+
+/// Joins the refreshes of one title buffer that lie within [`COPY_GAP`] of
+/// each other into one range. The copy takes the bytes between them from
+/// title memory too, which is where both ranges come from; `Shadow::update`
+/// cuts the merged range again around what shaders are writing.
+fn coalesce(refreshes: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
+    if refreshes.len() < 2 {
+        return;
+    }
+    refreshes.sort_unstable_by_key(|(shadow, from, _)| (std::sync::Arc::as_ptr(shadow) as usize, *from));
+    let mut out: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
+        Vec::with_capacity(refreshes.len());
+    for (shadow, from, to) in refreshes.drain(..) {
+        let mut joined = false;
+        if let Some((last, _, last_to)) = out.last_mut()
+            && std::sync::Arc::ptr_eq(last, &shadow)
+            && from <= last_to.saturating_add(COPY_GAP)
+        {
+            *last_to = (*last_to).max(to);
+            joined = true;
+        }
+        if !joined {
+            out.push((shadow, from, to));
+        }
+    }
+    *refreshes = out;
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
@@ -6043,6 +6127,12 @@ impl Batch {
 
     fn flush(&mut self) {
         self.index.clear();
+        // Copies of one title buffer that lie close together become one:
+        // the refresh moves 460 to 1,370 MB a frame in 25,000 to 90,000
+        // calls of 11 to 21 KB each, and the bytes between two such ranges
+        // are title memory as well (the copy takes its bytes from there).
+        // `Shadow::update` still cuts them where shaders write.
+        coalesce(&mut self.refreshes);
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = self.refreshes.len() > 1;
@@ -6091,6 +6181,25 @@ impl Batch {
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
+/// `VICTORY_COPY_FAST=1`: a copy of title memory into a host copy of ours
+/// is a plain `memcpy` when the kernel says every page of the source can be
+/// read, instead of a `ReadProcessMemory` of the whole range.
+///
+/// Why: the kernel's copy runs at about 600 MB/s on this title's buffers
+/// (measured in gameplay: 182 MB in 260 ms, 380 MB in 581 ms), while the
+/// CPU moves the same bytes at several GB/s. The copies are the frame's
+/// largest bucket, so the call's own cost is most of the frame.
+///
+/// Off by default while the race below is not settled: the title may unmap
+/// a page between the question and the copy (a page pool's pages move when
+/// streaming replaces them), and a fault there kills the process, where the
+/// kernel's call reports the page instead. Pages of the buffers a list
+/// declares are not shown to move in the runs so far.
+fn fast_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_FAST").is_some_and(|v| v == "1"))
+}
+
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -6104,6 +6213,16 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     if len == 0 {
         return;
+    }
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        if title_dst {
+            COPY_MOVED[2].fetch_add(len as u64, Relaxed);
+            COPY_MOVED[3].fetch_add(1, Relaxed);
+        } else {
+            COPY_MOVED[0].fetch_add(len as u64, Relaxed);
+            COPY_MOVED[1].fetch_add(1, Relaxed);
+        }
     }
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
@@ -6122,12 +6241,26 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
     }
+    // `VICTORY_COPY_FAST=1`: the source is all there, so move it with the
+    // CPU ([`fast_reads`] has why this is off by default).
+    if !title_dst && len >= 64 << 10 && fast_reads() && crate::texture::committed(src, len) {
+        // SAFETY: the question above found every page of the range readable,
+        // and a host destination is our own copy of `len` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        return;
+    }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
+        // A title destination the kernel wrote: its pages' dirty bits are
+        // the layer's own write. Left set, the next refresh reports them as
+        // the title's and copies the same bytes up again, every frame.
+        if title_dst {
+            crate::watch::forgot(dst as usize, len);
+        }
         return;
     }
     // The copy failed: a source page is not there, or the destination is
@@ -6562,6 +6695,22 @@ impl Meter {
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
             );
             crate::tiles::status();
+            {
+                let [hb, hc, tb, tc] =
+                    [0, 1, 2, 3].map(|i| COPY_MOVED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                if hc + tc > 0.0 {
+                    tracing::info!(
+                        "copies moved per frame: {:.1} MB into host copies in {:.0} calls ({:.0} KB a call), \
+                         {:.1} MB into title memory in {:.0} calls ({:.0} KB a call)",
+                        hb / 1e6,
+                        hc,
+                        if hc > 0.0 { hb / hc / 1e3 } else { 0.0 },
+                        tb / 1e6,
+                        tc,
+                        if tc > 0.0 { tb / tc / 1e3 } else { 0.0 }
+                    );
+                }
+            }
             {
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
