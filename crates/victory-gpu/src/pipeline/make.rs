@@ -665,12 +665,25 @@ fn spawn_worker(name: String) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Number of pipeline worker threads: `VICTORY_PIPELINE_WORKERS` (clamped
+/// to `1..=16`), or half the logical processors (`2..=8`).
+fn worker_count(env: Option<&str>, cpus: usize) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(1, 16))
+        .unwrap_or_else(|| (cpus / 2).clamp(2, 8))
+}
+
+/// Starts the workers (half the logical processors, 2 to 8, unless
+/// `VICTORY_PIPELINE_WORKERS` overrides it) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count(
+            std::env::var("VICTORY_PIPELINE_WORKERS").ok().as_deref(),
+            cpus,
+        );
         for i in 0..workers {
             let spawned = spawn_worker(format!("victory-pipelines-{i}"));
             if let Err(e) = spawned {
@@ -835,5 +848,16 @@ mod tests {
             started.elapsed() < Duration::from_millis(50),
             "subsequent frames must not block for the pipeline wait budget"
         );
+    }
+
+    #[test]
+    fn worker_count_respects_override_and_clamps() {
+        assert_eq!(worker_count(None, 16), 8);
+        assert_eq!(worker_count(None, 2), 2);
+        assert_eq!(worker_count(Some("1"), 16), 1);
+        assert_eq!(worker_count(Some("2"), 16), 2);
+        assert_eq!(worker_count(Some("0"), 16), 1);
+        assert_eq!(worker_count(Some("99"), 16), 16);
+        assert_eq!(worker_count(Some("abc"), 16), 8);
     }
 }
