@@ -120,12 +120,6 @@ pub fn add(t: T, n: u64) {
     TOTAL[t as usize].fetch_add(n, Relaxed);
 }
 
-/// Takes from a total (a time that was summed over threads is corrected
-/// to the time it took).
-pub fn sub(t: T, n: u64) {
-    TOTAL[t as usize].fetch_sub(n, Relaxed);
-}
-
 /// What a thread did inside our calls since its last present: for the
 /// thread that presents (the title's render thread).
 #[derive(Clone, Copy)]
@@ -662,8 +656,8 @@ mod tests {
     fn totals_and_a_threads_own_counts_add_up() {
         let before = TOTAL[T::DiskReads as usize].load(Relaxed);
         add(T::DiskReads, 3);
-        sub(T::DiskReads, 1);
-        assert_eq!(TOTAL[T::DiskReads as usize].load(Relaxed) - before, 2);
+        add(T::DiskReads, 1);
+        assert_eq!(TOTAL[T::DiskReads as usize].load(Relaxed) - before, 4);
         here(H::PaceUs, 5);
         here(H::PaceUs, 6);
         assert_eq!(HERE.with(|c| c.get())[H::PaceUs as usize], 11);

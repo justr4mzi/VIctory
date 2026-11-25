@@ -8011,15 +8011,21 @@ impl Batch {
         }
     }
 
-    /// Brings `[from, to)` of a copy up to date, timed.
-    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+    /// Refreshes one range and records its byte count. Diagnostics also keep
+    /// the time for this range, including when several ranges run together.
+    fn refresh(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
-        let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
-        crate::copystat::range(from, to - from, us, 0);
-        preparing(0, us);
+        crate::copystat::range(from, to - from, started.elapsed().as_micros() as u64, 0);
         preparing(1, copied as u64);
+    }
+
+    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let started = std::time::Instant::now();
+        Self::refresh(shadow, from, to);
+        preparing(0, started.elapsed().as_micros() as u64);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -8087,7 +8093,6 @@ impl Batch {
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
-            let before = PREPARING[0].load(Ordering::Relaxed);
             // Noted now: nothing reads the notes before the jobs are done.
             for (shadow, from, to) in &self.refreshes {
                 Self::brought(&mut self.current, shadow, *from, *to);
@@ -8095,13 +8100,10 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, from, to)| Box::new(move || Self::refresh(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
                 .collect();
             crate::shadow::wide_run(jobs);
-            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
-            PREPARING[0].fetch_sub(over, Ordering::Relaxed);
-            crate::framelog::sub(crate::framelog::T::CopyUs, over);
+            preparing(0, started.elapsed().as_micros() as u64);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
