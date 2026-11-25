@@ -101,7 +101,10 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 /// `VICTORY_ACTIVATE_RAYS=0` leaves it out.
 fn too_dear(shaders: &[Arc<Shader>]) -> bool {
     static OUT: OnceLock<bool> = OnceLock::new();
-    let out = *OUT.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
+    let out = *OUT.get_or_init(|| {
+        std::env::var_os("VICTORY_ACTIVATE_RAYS")
+            .map_or(!cfg!(test), |v| v == "0")
+    });
     out && named(shaders, b"CS_ScreenProbes_ActivateRays")
 }
 

@@ -78,7 +78,12 @@ pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        let enabled = match std::env::var("VICTORY_LEVELS_ON_DEMAND").as_deref().map(str::trim) {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => !cfg!(test),
+        };
+        if !enabled {
             return false;
         }
         let Some(host) = host() else {

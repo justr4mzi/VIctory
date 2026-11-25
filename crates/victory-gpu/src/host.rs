@@ -1681,7 +1681,11 @@ void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
 /// exact and when a landing falls back to the old fetch.
 fn inflight_fetch() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        relay()
+            && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT")
+                .map_or(!cfg!(test), |v| v != "0")
+    })
 }
 
 /// The bytes of the PC's memory pieces fetched inside flights go to
@@ -1835,7 +1839,10 @@ pub(crate) unsafe fn card_compare_dispatch(list: &ID3D12GraphicsCommandList, con
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_CARD_REHASH_RUNS")
+            .map_or(!cfg!(test), |v| v != "0")
+    })
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the

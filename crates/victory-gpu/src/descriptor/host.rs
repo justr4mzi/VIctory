@@ -2286,6 +2286,18 @@ fn view_extent() -> bool {
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    if let &View::Constant(address, size) = view {
+        if size == 0 {
+            return None;
+        }
+        let whole = crate::shadow::find(address, u64::from(size))?;
+        if whole.gpu(address) % 256 != 0
+            && let Some(own) = crate::shadow::exact(address, u64::from(size))
+        {
+            return Some((own, address, u64::from(size)));
+        }
+        return Some((whole, address, u64::from(size)));
+    }
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -2905,7 +2917,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
+            let mut shadow = crate::shadow::find(address, u64::from(size))?;
+            if shadow.gpu(address) % 256 != 0
+                && let Some(own) = crate::shadow::exact(address, u64::from(size))
+            {
+                shadow = own;
+            }
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
                 once!(
@@ -3125,19 +3142,26 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A view of a texture the title placed in memory itself, as a host
+/// shader or unordered-access view of the resource made for that memory
+/// (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let view_desc: [u32; 10] = desc[..10].try_into().ok()?;
+    if *unordered {
+        let texture = crate::resource::unordered_texture_at(address, resource)?;
+        Some(View::Unordered(texture as usize, 0, Some(view_desc)))
+    } else {
+        let texture = crate::resource::texture_at(address, resource)?;
+        Some(View::Shader(texture as usize, Some(view_desc)))
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -3659,6 +3683,111 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A non-256-byte-aligned constant buffer falls back to a dedicated
+    /// aligned shadow copy in both `buffer_copy` and `make`.
+    #[test]
+    fn unaligned_constant_buffer_uses_exact_256_byte_copy() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let ptr = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!ptr.is_null());
+        let base = ptr as u64;
+        let unaligned = base + 0x40;
+        let token = base as usize;
+        crate::shadow::register(token, base, crate::watch::PAGE as u64);
+
+        let view = View::Constant(unaligned, 128);
+        let (copy, start, len) = buffer_copy(&view).expect("buffer_copy must resolve unaligned CBV");
+        assert_eq!((start, len), (unaligned, 128));
+        assert_eq!(copy.gpu(unaligned) % 256, 0, "exact CBV shadow must be 256-byte aligned");
+        assert!(
+            make(&view, heap.cpu(0)).flatten().is_some(),
+            "host CBV must succeed via aligned exact shadow"
+        );
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        crate::shadow::unregister(token, base);
+        unsafe { VirtualFree(ptr, 0, MEM_RELEASE) };
+    }
+
+    /// Placed 2D and 3D unordered texture views mirror to real host UAV
+    /// resources instead of falling back to null descriptors.
+    #[test]
+    fn placed_unordered_textures_2d_and_3d_create_host_uavs() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let ptr = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!ptr.is_null());
+        let base = ptr as u64;
+
+        let mut res_2d = [0u32; 14];
+        res_2d[0] = 3; // Texture2D
+        res_2d[4] = 16;
+        res_2d[6] = 16;
+        res_2d[7] = (1 << 16) | 1;
+        res_2d[8] = 28; // R8G8B8A8_UNORM
+        res_2d[9] = 1;
+        let mut uav_2d = [0u32; 16];
+        uav_2d[0] = 28;
+        uav_2d[1] = 4; // D3D12_UAV_DIMENSION_TEXTURE2D
+        uav_2d[10] = base as u32;
+        uav_2d[11] = (base >> 32) as u32;
+        let view_2d = View::Placed(true, res_2d, uav_2d);
+        assert!(matches!(placed_texture(&view_2d), Some(View::Unordered(_, 0, Some(_)))));
+        assert!(make(&view_2d, heap.cpu(0)).flatten().is_some());
+
+        let addr_3d = base + 0x8000;
+        let mut res_3d = [0u32; 14];
+        res_3d[0] = 4; // Texture3D
+        res_3d[4] = 4;
+        res_3d[6] = 4;
+        res_3d[7] = (1 << 16) | 4;
+        res_3d[8] = 28; // R8G8B8A8_UNORM
+        res_3d[9] = 1;
+        let mut uav_3d = [0u32; 16];
+        uav_3d[0] = 28;
+        uav_3d[1] = 8; // D3D12_UAV_DIMENSION_TEXTURE3D
+        uav_3d[4] = u32::MAX;
+        uav_3d[10] = addr_3d as u32;
+        uav_3d[11] = (addr_3d >> 32) as u32;
+        let view_3d = View::Placed(true, res_3d, uav_3d);
+        assert!(matches!(placed_texture(&view_3d), Some(View::Unordered(_, 0, Some(_)))));
+        assert!(make(&view_3d, heap.cpu(1)).flatten().is_some());
+
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        unsafe { VirtualFree(ptr, 0, MEM_RELEASE) };
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.

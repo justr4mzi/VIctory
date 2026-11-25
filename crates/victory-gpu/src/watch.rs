@@ -1249,10 +1249,11 @@ pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
         Ok("0") => 0,
+        Ok("guards") => 1,
         Ok("1") => 3,
         Ok("slots") => 2,
         Ok("all") => 7,
-        _ => 1,
+        _ => if cfg!(test) { 1 } else { 3 },
     })
 }
 

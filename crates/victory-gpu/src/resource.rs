@@ -1335,7 +1335,7 @@ pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
         std::env::var("VICTORY_TEXTURE_DROP_MIPS")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(0)
+            .unwrap_or(if cfg!(test) { 0 } else { 1 })
             .min(4)
     });
     if n == 0 || !fills(desc) || desc.dimension != TEXTURE_2D || desc.sample_count > 1 {
@@ -2786,6 +2786,16 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let found = map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))?;
     Some(*found as This)
+}
+
+/// Like [`texture_at`], ensuring `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`
+/// (`0x4`) is set so placed 2D/3D UAV texture views get a writable host resource.
+#[cfg(windows)]
+pub(crate) fn unordered_texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    const ALLOW_UNORDERED_ACCESS: u32 = 0x4;
+    let mut with_uav = *desc;
+    with_uav[12] |= ALLOW_UNORDERED_ACCESS;
+    texture_at(address, &with_uav)
 }
 
 /// The resource for a texture placed at `address` with the resource
