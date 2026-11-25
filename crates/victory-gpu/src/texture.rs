@@ -41,6 +41,10 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
+    /// Memory each subresource (host `mip + slice * mips`) occupies relative to
+    /// the texture's base, for detiling only the pages that changed; `None`
+    /// for 3D textures (whose depth slices interleave) or when counts disagree.
+    ranges: Option<Vec<(u64, u64)>>,
     /// Mips per array slice.
     mips: u32,
     /// The title's levels the host texture leaves out
@@ -783,6 +787,15 @@ fn through_copy() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COPY").is_some_and(|v| v == "1"))
 }
 
+/// Whether a watched texture is detiled page by page instead of whole:
+/// only the 64 KiB pages the title wrote since the last refresh are read
+/// and detiled. `VICTORY_TEXTURE_PAGES=0` detiles the whole texture, as
+/// before.
+pub(crate) fn texture_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PAGES").is_none_or(|v| v != "0"))
+}
+
 /// Whether a texture refresh lets title memory move again as soon as it has
 /// copied the texture's bytes out (`VICTORY_TEXTURE_SHORT_HOLD=1`, default on
 /// outside tests; `=0` disables), and hashes and detiles the copy after.
@@ -1363,11 +1376,17 @@ impl Staging {
         if let Some((now, written, guarded)) =
             waited(1, || crate::watch::writes_since_kind(start, start + size, guard_on, last.asked))
         {
+            let previous = last.asked;
             if !guarded {
-                if last.asked != 0 && written.is_empty() {
+                if previous != 0 && written.is_empty() {
                     return 0;
                 }
                 last.asked = now;
+                if previous != 0 {
+                    if let Some(read) = self.refresh_pages(&written, previous) {
+                        return read;
+                    }
+                }
                 // Read through the copy, which stands unmapped pages: memory of
                 // big pools is too slow to ask page by page.
                 with_read(size, |read| {
@@ -1540,6 +1559,93 @@ impl Staging {
             last.asked = 0;
             0
         }
+    }
+
+    /// Detiles only the pages of title memory written since the last asking,
+    /// instead of the whole texture. Returns the bytes read, or `None` when
+    /// this cannot be done, so the caller falls back to the whole-texture
+    /// refresh.
+    fn refresh_pages(&self, written: &[(usize, u64)], previous: u64) -> Option<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !texture_pages() || self.on_demand || self.ranges.is_none() || previous == 0 {
+            return None;
+        }
+        let ranges = self.ranges.as_ref().unwrap();
+        let mut pages: Vec<usize> = written
+            .iter()
+            .filter(|&&(_, w)| w > previous)
+            .map(|&(p, _)| p)
+            .collect();
+        pages.sort_unstable();
+        pages.dedup();
+        if pages.is_empty() {
+            return Some(0);
+        }
+        let start = self.memory as usize;
+        let end_mem = start + self.layout.size as usize;
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for &page in &pages {
+            let lo = (page * crate::watch::PAGE).max(start);
+            let hi = ((page + 1) * crate::watch::PAGE).min(end_mem);
+            if lo >= hi {
+                continue;
+            }
+            if let Some(last) = runs.last_mut()
+                && last.0 + last.1 == lo
+            {
+                last.1 += hi - lo;
+                continue;
+            }
+            runs.push((lo, hi - lo));
+        }
+        if runs.is_empty() {
+            return Some(0);
+        }
+        // SAFETY: the mapped upload buffer is at least `self.bytes` bytes and is
+        // written only by the staging refresh.
+        let data = unsafe { std::slice::from_raw_parts_mut(self.data, self.bytes as usize) };
+        let mut read = 0usize;
+        for &(run_start, run_len) in &runs {
+            let mut buf = vec![0u8; run_len];
+            crate::host::copy_mapped(buf.as_mut_ptr(), run_start as *const u8, run_len, false);
+            let win_rel_start = (run_start - start) as u64;
+            let win_rel_end = win_rel_start + run_len as u64;
+            for (sub, &(rs, re)) in ranges.iter().enumerate() {
+                let a = rs.max(win_rel_start);
+                let b = re.min(win_rel_end);
+                if a >= b {
+                    continue;
+                }
+                let mip = (sub as u32) % self.mips;
+                let slice = (sub as u32) / self.mips;
+                let footprint = &self.footprints[sub];
+                let f = footprint.Footprint;
+                let pitch = f.RowPitch as usize;
+                let rows = self.rows[sub] as usize;
+                let len = (pitch * rows).saturating_mul(f.Depth as usize);
+                let Some(linear) = staging_subresource(data, footprint.Offset, len) else {
+                    tracing::warn!(mip, slice, "texture footprint starts beyond its staging buffer");
+                    continue;
+                };
+                let win_bytes = &buf[(a - win_rel_start) as usize..(b - win_rel_start) as usize];
+                if let Err(e) = self.layout.detile_window(
+                    win_bytes,
+                    a,
+                    mip + self.drop,
+                    slice,
+                    linear,
+                    pitch,
+                    pitch * rows,
+                ) {
+                    tracing::warn!(?e, mip, slice, "texture not detiled");
+                }
+            }
+            read += run_len;
+        }
+        self.dirty.store(true, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexWatched, read as u64);
+        Some(read)
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -1877,6 +1983,40 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         );
     }
     let (buffer, data, pooled, piece) = staging_buffer(host, total)?;
+    let drop_mips = crate::resource::drop_levels(&desc);
+    // Memory each subresource (host `mip + slice * mips`) occupies, for
+    // detiling only the pages that changed. `None` for 3D textures (whose
+    // depth slices interleave) or when the counts disagree.
+    let ranges = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        None
+    } else {
+        let slices = u32::from(d.DepthOrArraySize);
+        let mips = u32::from(d.MipLevels);
+        if mips as usize * slices as usize != count as usize {
+            None
+        } else {
+            let mut r = vec![(0u64, 0u64); count as usize];
+            let ftm = layout.first_tail_mip;
+            for slice in 0..slices {
+                let base = u64::from(slice) * layout.slice_size;
+                for mip in 0..mips {
+                    let title_mip = mip + drop_mips;
+                    let (start, end) = if title_mip >= ftm {
+                        (0u64, layout.alignment.min(layout.slice_size))
+                    } else if title_mip == 0 {
+                        (layout.mips[0].offset, layout.slice_size)
+                    } else {
+                        (
+                            layout.mips[title_mip as usize].offset,
+                            layout.mips[(title_mip - 1) as usize].offset,
+                        )
+                    };
+                    r[(mip + slice * mips) as usize] = (base + start, base + end);
+                }
+            }
+            Some(r)
+        }
+    };
     if piece.is_none() {
         crate::host::name(&buffer, || {
             format!(
@@ -1897,8 +2037,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         footprints,
         rows,
         layout,
+        ranges,
         mips: u32::from(d.MipLevels),
-        drop: crate::resource::drop_levels(&desc),
+        drop: drop_mips,
         bytes: total,
         memory,
         last: Mutex::default(),
@@ -1959,7 +2100,7 @@ mod remap_tests {
             assert!(staging.dirty.load(Relaxed), "a remap under the texture did not mark it");
         }
         // SAFETY: the allocation above, released once.
-        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+        assert!(unsafe { crate::watch::release_title_allocation(base) });
     }
 }
 
@@ -2027,6 +2168,7 @@ mod title_memory_tests {
                 footprints: vec![footprint],
                 rows: vec![SIDE],
                 layout: layout.clone(),
+                ranges: Some(vec![(0, layout.size)]),
                 mips: 1,
                 drop: 0,
                 bytes: total,
@@ -2057,7 +2199,7 @@ mod title_memory_tests {
             staging.refresh();
             assert!(staged() == expected(), "a refresh after a write");
             drop(staging);
-            assert_ne!(VirtualFree(memory.cast(), 0, MEM_RELEASE), 0);
+            assert!(crate::watch::release_title_allocation(memory.cast()));
         }
     }
 

@@ -603,6 +603,31 @@ impl Layout {
         )
     }
 
+    /// [`Layout::detile`] of the part of the texture's memory that `tiled`
+    /// holds: `tiled` starts at byte `window` of the texture and is shorter
+    /// than [`Layout::size`]. Only elements whose tiled position lies in
+    /// that window are written to `linear`; the rest of `linear` is left as
+    /// it was. A window covering the texture detiles it whole.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detile_window(
+        &self,
+        tiled: &[u8],
+        window: u64,
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        if window
+            .checked_add(tiled.len() as u64)
+            .is_none_or(|end| end > self.size)
+        {
+            return Err(Error::TooSmall);
+        }
+        self.walk_window(tiled, window, mip, slice, linear, row_pitch, depth_pitch)
+    }
+
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
     pub fn tile(
         &self,
@@ -620,6 +645,107 @@ impl Layout {
             row_pitch,
             depth_pitch,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_window(
+        &self,
+        tiled: &[u8],
+        window: u64,
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let depth = m.depth;
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= self.slices {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let n = self.desc.element_bytes as usize;
+        let bytes = m.width as usize * n;
+        let slice_bytes = (m.height as usize - 1)
+            .checked_mul(row_pitch)
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or(Error::TooSmall)?;
+        if row_pitch < bytes || (depth > 1 && depth_pitch < slice_bytes) {
+            return Err(Error::TooSmall);
+        }
+        let need = (depth as usize - 1)
+            .checked_mul(depth_pitch)
+            .and_then(|offset| offset.checked_add(slice_bytes))
+            .ok_or(Error::TooSmall)?;
+        let start = window;
+        let end = window + tiled.len() as u64;
+        if linear.len() < need || row_pitch < bytes {
+            return Err(Error::TooSmall);
+        }
+        let linear_mode = self.desc.swizzle == Swizzle::LINEAR;
+        let mut runs = Vec::new();
+        if !linear_mode {
+            let mut first_linear = 0usize;
+            let mut first_tiled = self.column(m, 0) as usize;
+            for x in 1..m.width as usize {
+                let offset = self.column(m, x as u32) as usize;
+                let linear_at = x * n;
+                if offset != first_tiled + (linear_at - first_linear) {
+                    runs.push((first_tiled, first_linear, linear_at - first_linear));
+                    first_linear = linear_at;
+                    first_tiled = offset;
+                }
+            }
+            runs.push((first_tiled, first_linear, bytes - first_linear));
+        }
+        for z in 0..depth {
+            let (s, inner) = self.split(first + z);
+            let base = u64::from(s) * self.slice_size + m.offset;
+            for y in 0..m.height {
+                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                let row_base = if linear_mode {
+                    base + u64::from(y) * u64::from(m.pitch) * n as u64
+                } else {
+                    base + self.row(m, y, inner)
+                };
+                if linear_mode {
+                    if row_base >= end || row_base + bytes as u64 <= start {
+                        continue;
+                    }
+                    let ts = row_base.max(start);
+                    let te = (row_base + bytes as u64).min(end);
+                    let ncopy = (te - ts) as usize;
+                    let src_i = (ts - start) as usize;
+                    let dst_i = (ts - row_base) as usize;
+                    linear[linear_row + dst_i..][..ncopy]
+                        .copy_from_slice(&tiled[src_i..][..ncopy]);
+                } else {
+                    for &(offset, linear_at, len) in &runs {
+                        let tiled_start = row_base + offset as u64;
+                        let tiled_end = tiled_start + len as u64;
+                        let ts = tiled_start.max(start);
+                        let te = tiled_end.min(end);
+                        if ts < te {
+                            let ncopy = (te - ts) as usize;
+                            let src_i = (ts - start) as usize;
+                            let dst_i = linear_row + linear_at + (ts - tiled_start) as usize;
+                            linear[dst_i..][..ncopy].copy_from_slice(&tiled[src_i..][..ncopy]);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Validates the full subresource before writing any bytes.
@@ -1308,5 +1434,43 @@ mod tests {
         .unwrap();
         assert_eq!(l.tile(&mut [], 0, 1, &[], 0, 0), Err(Error::Invalid));
         assert_eq!(l.detile(&[], 0, 1, &mut [], 0, 0), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn detile_window_matches_full_detile_for_written_pages() {
+        let d = desc(256, 256, 1, 4, Swizzle::SW_64KB_S);
+        let l = Layout::new(&d).unwrap();
+        let tiled: Vec<u8> = (0..l.size as usize)
+            .map(|i| ((i * 37) ^ (i >> 9)) as u8)
+            .collect();
+        let pitch = 256 * 4;
+        let mut full = vec![0u8; 256 * pitch];
+        l.detile(&tiled, 0, 0, &mut full, pitch, 0).unwrap();
+
+        let page = 64 << 10;
+        let mut partial = vec![0xA5u8; 256 * pitch];
+        let win = l.size.min(page as u64);
+        l.detile_window(&tiled[..win as usize], 0, 0, 0, &mut partial, pitch, 0)
+            .unwrap();
+        for (i, (&got, &want)) in partial.iter().zip(&full).enumerate() {
+            if got != 0xA5 {
+                assert_eq!(got, want, "byte {i} inside window diverged from full detile");
+            }
+        }
+        assert!(
+            partial.iter().any(|&b| b != 0xA5),
+            "window updated at least some texels"
+        );
+        l.detile_window(
+            &tiled[win as usize..],
+            win,
+            0,
+            0,
+            &mut partial,
+            pitch,
+            0,
+        )
+        .unwrap();
+        assert_eq!(partial, full);
     }
 }

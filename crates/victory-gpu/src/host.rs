@@ -2022,6 +2022,53 @@ fn wide_merge() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
 }
 
+/// Whether our send-up list (`Host::card_before`: the changed bytes of
+/// copies in the card's memory sent up, their pieces hashed again) goes
+/// first in the submission's own `ExecuteCommandLists` call instead of a
+/// call of its own (`VICTORY_FEED_ONE_CALL=1`; off by default; GPU feed
+/// plan, stage F1). The card runs the same commands in the same order: the
+/// list is closed where it was sent before and is the first of the
+/// submission's call; nothing else is sent to the direct queue between the
+/// two places (the copy queue's hold, `crate::queue2::Second::hold`, stays
+/// ahead of both; settles and `card_results_low` come before), and with the
+/// relay the queue's order is held until the call (`QUEUE_ORDER`), so a
+/// fetch numbered after the send still runs behind it. What it saves: one
+/// call and one list boundary between calls a submission (15-17 a frame).
+pub(crate) fn feed_one_call() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    match ONE_CALL_HERE.get() {
+        0 => *ON.get_or_init(|| {
+            let on = std::env::var_os("VICTORY_FEED_ONE_CALL").is_some_and(|v| v == "1");
+            if on {
+                tracing::info!("our send-up list goes first in its submission's own call (VICTORY_FEED_ONE_CALL=1)");
+            }
+            on
+        }),
+        here => here == 2,
+    }
+}
+
+thread_local! {
+    /// For tests: [`feed_one_call`] on this thread (0: the setting, 1 off,
+    /// 2 on).
+    static ONE_CALL_HERE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Send-up lists this thread sent first in their submission's own call
+    /// ([`feed_one_call`]), for tests.
+    static SENDUP_JOINED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// With [`feed_one_call`], from `Host::card_before` to the submission's
+/// call: the send-up list, closed and not sent; with the relay the queue's
+/// order held until it is sent, and the send's number.
+struct SendUp {
+    list: ID3D12CommandList,
+    order: Option<std::sync::MutexGuard<'static, u64>>,
+    sent_as: u64,
+}
+
 /// One declared range of a copy in the card's memory, in a submission.
 struct CardRange {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
@@ -4496,10 +4543,14 @@ impl Host {
     /// copies, inside the card's memory, in the same place of its order as
     /// before. So the copies change exactly when they did on one queue; what
     /// leaves the direct queue is the crossing from the PC's memory.
-    fn card_before(&self, runs: &[&HostList], flown: bool, sent: u64) -> Option<CardPlan> {
+    /// With [`feed_one_call`] the send-up list is closed but not sent: it
+    /// comes back as a [`SendUp`] for the submission's own call, at its
+    /// front, and the queue's order (with the relay) stays held until it
+    /// is on the queue ([`Host::sent_up`]).
+    fn card_before(&self, runs: &[&HostList], flown: bool, sent: u64) -> (Option<CardPlan>, Option<SendUp>) {
         use std::sync::Arc;
         if !crate::shadow::cards() {
-            return None;
+            return (None, None);
         }
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
@@ -4540,23 +4591,16 @@ impl Host {
             None => 0,
         };
         let mut dirty = crate::shadow::card_dirty(sent_as);
-        // With fetches on a copy queue (`crate::queue2`, bit 1 of
-        // `VICTORY_QUEUE2`): the send's number is signalled on the direct
-        // queue behind the send, so that a fetch knows which sends the card
-        // has finished (`Second::order_done`).
-        let numbered = || {
-            if sent_as != 0
-                && let Some(second) = crate::queue2::second().filter(|s| s.fetches())
-            {
-                second.sent_up(&self.queue, sent_as);
-            }
-        };
         if declared.is_empty() && dirty.is_empty() {
-            numbered();
-            return None;
+            self.numbered(sent_as);
+            return (None, None);
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let work = work.as_mut()?;
+        let Some(work) = work.as_mut() else {
+            return (None, None);
+        };
+        let one_call = feed_one_call();
+        let mut held: Option<ID3D12CommandList> = None;
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -4703,6 +4747,11 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     crate::shot::span_end(list, shot_span, 0, || "SYNC LIST (changed bytes go up to the card's copies and are hashed)".to_string());
                     list.Close()?;
+                    if one_call {
+                        // To the front of the submission's own call.
+                        held = Some(list.cast()?);
+                        return Ok(());
+                    }
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -4712,8 +4761,17 @@ impl Host {
             }
             used.push((false, sync));
         }
-        numbered();
-        drop(order);
+        // The send-up list goes to the queue later (`VICTORY_FEED_ONE_CALL`):
+        // the order stays held, and its number is signalled behind it then
+        // (`Host::sent_up`).
+        let sendup = match held {
+            Some(list) => Some(SendUp { list, order, sent_as }),
+            None => {
+                self.numbered(sent_as);
+                drop(order);
+                None
+            }
+        };
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
@@ -4842,7 +4900,30 @@ impl Host {
             plan.lists.push((true, check));
         }
         work.out += 1;
-        Some(plan)
+        (Some(plan), sendup)
+    }
+
+    /// With fetches on a copy queue (`crate::queue2`, bit 1 of
+    /// `VICTORY_QUEUE2`) and the relay: the number of the send of changed
+    /// ranges `sent_as` signalled on the direct queue behind what was sent
+    /// to it so far, so that a fetch knows which sends the card has
+    /// finished (`Second::order_done`).
+    fn numbered(&self, sent_as: u64) {
+        if sent_as != 0
+            && let Some(second) = crate::queue2::second().filter(|s| s.fetches())
+        {
+            second.sent_up(&self.queue, sent_as);
+        }
+    }
+
+    /// With [`feed_one_call`]: the send-up list `up` went to the queue at
+    /// the front of its submission's call: its number is signalled behind
+    /// that call (later than behind the list alone, which only makes a
+    /// fetch on the copy queue take fewer sends for done), and the queue's
+    /// order is let go.
+    fn sent_up(&self, up: SendUp) {
+        self.numbered(up.sent_as);
+        drop(up.order);
     }
 
     /// With [`relay`]: whether the compare's result area is half taken by
@@ -6084,7 +6165,19 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown, *submitted);
+        let (card, mut sendup) = self.card_before(runs, flown, *submitted);
+        // `VICTORY_FEED_ONE_CALL=1`: the send-up list first in this call (in
+        // timing runs, in the first group).
+        if let Some(up) = &sendup {
+            SENDUP_JOINED.set(SENDUP_JOINED.get() + 1);
+            lists.insert(0, Some(up.list.clone()));
+            for first in &mut firsts {
+                *first += 1;
+            }
+            if let Some(first) = firsts.first_mut() {
+                *first = 0;
+            }
+        }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -6101,6 +6194,9 @@ impl Host {
                         runs[k].run_tile_steps();
                     }
                     self.queue.ExecuteCommandLists(&lists[range.clone()]);
+                }
+                if let Some(up) = sendup.take() {
+                    self.sent_up(up);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -6154,6 +6250,9 @@ impl Host {
                         runs[k].run_tile_steps();
                     }
                     self.queue.ExecuteCommandLists(&lists[range.clone()]);
+                }
+                if let Some(up) = sendup.take() {
+                    self.sent_up(up);
                 }
                 self.card_sent();
                 let waited = self
@@ -10335,6 +10434,137 @@ void main() {
             eprintln!("queue2_tests: the direct queue alone (late {}, relay {})", late(), relay());
         }
         drop(lists);
+    }
+
+    /// Our send-up list with several copies in it, in a call of its own and
+    /// first in its submission's call ([`feed_one_call`]): three copies in the
+    /// card's memory, each with title bytes to send up and shader writes
+    /// declared in every round, so that one send-up list takes ranges of all
+    /// three and hashes each. The title bytes reach the shaders and the writes
+    /// come back, in every copy; the debug layer (on the software adapter) finds
+    /// nothing wrong with the barriers.
+    #[test]
+    fn warp_three_copies_go_up_in_one_list_and_their_writes_come_back() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let Some(host) = host() else {
+            return;
+        };
+        // Never on a real card.
+        // SAFETY: a plain query.
+        let software = host
+            .adapter
+            .as_ref()
+            .and_then(|a| unsafe { a.GetDesc1() }.ok())
+            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
+        if !software {
+            eprintln!("queue2_tests: skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)");
+            return;
+        }
+        const PIECE: usize = 64 << 10;
+        const LEN: usize = 2 << 20;
+        const ROUNDS: usize = 6;
+        const COPIES: usize = 3;
+        let mut outcomes: Vec<Vec<Vec<u8>>> = Vec::new();
+        for one_call in [false, true] {
+            ONE_CALL_HERE.set(if one_call { 2 } else { 1 });
+            let joined = SENDUP_JOINED.get();
+            let titles: Vec<*mut u8> = (0..COPIES)
+                .map(|c| {
+                    // SAFETY: a plain allocation of our own.
+                    let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) }
+                        as *mut u8;
+                    assert!(!title.is_null());
+                    for i in 0..LEN / 4 {
+                        // SAFETY: inside the allocation.
+                        unsafe { title.add(i * 4).cast::<u32>().write_volatile(0x3C00_0000 | (c as u32) << 20 | i as u32) };
+                    }
+                    crate::shadow::register(0x52_5250 + c + 8 * usize::from(one_call), title as u64, LEN as u64);
+                    title
+                })
+                .collect();
+            let dword = |c: usize, at: usize| unsafe { titles[c].add(at).cast::<u32>() };
+            let shadows: Vec<_> = titles
+                .iter()
+                .map(|&t| crate::shadow::find(t as u64, LEN as u64).expect("a host copy"))
+                .collect();
+            if !shadows.iter().all(|s| s.carded()) {
+                eprintln!("queue2_tests: skipped, the copies are not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
+                return;
+            }
+            let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+            // SAFETY: the shader's own root signature; plain creation.
+            let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
+                let pso = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: code.as_ptr().cast(),
+                            BytecodeLength: code.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .expect("a pipeline");
+                (root, pso)
+            };
+            let from = |k: usize| (1 + k) * PIECE + 4 * k + 64;
+            let to = |k: usize| (20 + k) * PIECE + 8 * k + 128;
+            let written = |c: usize, k: usize| 0x0200_0000 + 0x1000 * k as u32 + 0x10 * c as u32 + 3;
+            let mut lists = Vec::new();
+            for k in 0..ROUNDS {
+                let list = host.new_list().expect("a host list");
+                for (c, shadow) in shadows.iter().enumerate() {
+                    // SAFETY: inside the allocation.
+                    unsafe { dword(c, from(k)).write_volatile(written(c, k)) };
+                    shadow.refresh(&list, titles[c] as u64, LEN as u64);
+                    shadow.gpu_writes(&list, (titles[c] as usize + (20 + k) * PIECE) as u64, PIECE as u64);
+                    // SAFETY: an open list; the copy's buffer, with unordered access.
+                    unsafe {
+                        list.list.SetComputeRootSignature(&root);
+                        list.list.SetPipelineState(&pso);
+                        let constants = [to(k) as u32, from(k) as u32, (k + c) as u32, 3_000];
+                        list.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                        list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
+                        list.list.Dispatch(1, 1, 1);
+                    }
+                }
+                list.close();
+                assert_eq!(host.log_messages(), None, "the debug layer found an error");
+                if late() {
+                    host.execute_own(&list);
+                } else {
+                    host.execute(&[&list]);
+                }
+                lists.push(list);
+            }
+            settle_now(WHY_SYNC);
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            for c in 0..COPIES {
+                for k in 0..ROUNDS {
+                    // SAFETY: inside the allocation.
+                    let (sum, kept) = unsafe { (dword(c, to(k)).read_volatile(), dword(c, from(k)).read_volatile()) };
+                    assert_eq!(kept, written(c, k), "copy {c}, round {k}: the title's own dword changed");
+                    assert_eq!(sum, written(c, k) + (k + c) as u32, "copy {c}, round {k}: the shader's write");
+                }
+            }
+            drop(lists);
+            assert_eq!(
+                SENDUP_JOINED.get() - joined,
+                if one_call { ROUNDS as u64 } else { 0 },
+                "send-up lists in their submission's own call"
+            );
+            // SAFETY: the allocations, nothing writes them now.
+            outcomes.push(titles.iter().map(|&t| unsafe { std::slice::from_raw_parts(t, LEN) }.to_vec()).collect());
+            for (c, &t) in titles.iter().enumerate() {
+                crate::shadow::unregister(0x52_5250 + c + 8 * usize::from(one_call), t as u64);
+                // SAFETY: `t` was allocated by `VirtualAlloc` above for this test iteration.
+                assert!(unsafe { crate::watch::release_title_allocation(t.cast()) });
+            }
+        }
+        ONE_CALL_HERE.set(0);
+        assert!(outcomes[0] == outcomes[1], "the same bytes with the send-up list in a call of its own and in the submission's");
     }
 
     /// `memory[to] = first` at once; then `spin` steps, each a store to

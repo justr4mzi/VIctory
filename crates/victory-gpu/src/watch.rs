@@ -1919,6 +1919,113 @@ pub fn title_memory_reading_now() -> Option<Reading> {
     }
 }
 
+fn clear_guards_range(g: &mut Guards, lo: usize, hi: usize) -> bool {
+    let changed = g.overlaps_any(lo, hi);
+    g.absent.remove_range(lo, hi);
+    g.holes.remove_range(lo, hi);
+    g.protected.remove_range(lo, hi);
+    g.clean.remove_range(lo, hi);
+    g.aliased.remove_range(lo, hi);
+    g.viewed.remove_range(lo, hi);
+    g.hot.remove_range(lo, hi);
+    let hot_keys: Vec<usize> = g.hot_until.range(lo..hi).map(|(&k, _)| k).collect();
+    for block in hot_keys {
+        g.hot_until.remove(&block);
+    }
+    let streak_keys: Vec<usize> = g.fault_streak.range(lo..hi).map(|(&k, _)| k).collect();
+    for block in streak_keys {
+        g.fault_streak.remove(&block);
+    }
+    changed
+}
+
+fn invalidate_journal_and_caches(at: usize, len: usize) {
+    {
+        let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+        let mut j = journal();
+        j.ahead.retain(|&(a, b)| b <= first || a >= last);
+        j.ahead_guarded.retain(|&(a, b)| b <= first || a >= last);
+        j.written.retain(|&p, _| p < first || p >= last);
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::backreads::remapped(at, len);
+    crate::texback::remapped(at, len);
+    crate::descriptor::host::remapped(at, len);
+    crate::texture::remapped(at, len);
+    crate::resource::evict_placed_in(at as u64, len as u64);
+    crate::inplace::views_gone(at, len);
+    crate::inplace::title_memory_freeing(at, len);
+}
+
+/// Releases a complete private title allocation and invalidates its tracked
+/// pages. Query every protection region: a guarded allocation is not
+/// necessarily described by a single VirtualQuery result.
+///
+/// # Safety
+/// `address` must point into a live private allocation owned by the caller,
+/// with the same lifetime requirements as VirtualFree(MEM_RELEASE). Only
+/// its base address is accepted for release; interior addresses are rejected.
+pub unsafe fn release_title_allocation(address: *mut std::ffi::c_void) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_PRIVATE, MEM_RELEASE, MEMORY_BASIC_INFORMATION, VirtualFree, VirtualQuery,
+    };
+
+    let base = address as usize;
+    let mut end = base;
+    // SAFETY: this C structure consists of integers and raw pointers;
+    // zero is valid for every field before VirtualQuery fills it.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: valid output buffer for the query.
+        if unsafe { VirtualQuery(end as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.AllocationBase != address
+            || info.Type != MEM_PRIVATE
+        {
+            break;
+        }
+        let Some(next) = (info.BaseAddress as usize).checked_add(info.RegionSize) else {
+            return false;
+        };
+        if next <= end {
+            return false;
+        }
+        end = next;
+    }
+    if end == base {
+        return false;
+    }
+    let mut g = guards();
+    // SAFETY: the caller owns the reservation; a release requires size zero.
+    if unsafe { VirtualFree(address, 0, MEM_RELEASE) } == 0 {
+        return false;
+    }
+    let (lo, hi) = (base / BLOCK, end.div_ceil(BLOCK));
+    // The old mapping no longer exists. Do not VirtualProtect its address
+    // (which another allocator might already have reused).
+    if clear_guards_range(&mut g, lo, hi) {
+        GUARD_GEN.fetch_add(1, Ordering::Release);
+    }
+    drop(g);
+    invalidate_journal_and_caches(base, end - base);
+    true
+}
+
+/// Invalidates trackers for a newly allocated private write-watched title
+/// range `[at, at + len)` without marking it as view memory.
+pub fn title_private_allocated(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (lo, hi) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if guards_read().overlaps_any(lo, hi) {
+        let mut g = guards();
+        if clear_guards_range(&mut g, lo, hi) {
+            GUARD_GEN.fetch_add(1, Ordering::Release);
+        }
+    }
+    invalidate_journal_and_caches(at, len);
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
@@ -2876,7 +2983,7 @@ mod journal_tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
     /// Write-watched memory of `pages` pages, committed; freed on drop.
@@ -2894,7 +3001,7 @@ mod journal_tests {
     impl Drop for Watched {
         fn drop(&mut self) {
             // SAFETY: our allocation, no longer used.
-            unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+            unsafe { super::release_title_allocation(self.0 as *mut _) };
         }
     }
 

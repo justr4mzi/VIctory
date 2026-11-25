@@ -4234,35 +4234,155 @@ struct Entry {
     shadow: Option<Arc<Shadow>>,
 }
 
+// Small buffers are common. Once a backward search is a page away from
+// the requested end, only entries in the long-buffer index can reach it.
+const SHORT_BUFFER: u64 = PAGE as u64;
+
+struct BufferMap {
+    entries: BTreeMap<(u64, usize), Entry>,
+    long_ends: BTreeMap<(u64, usize), u64>,
+    // Releasing a buffer can leave this bound larger than necessary.
+    longest: u64,
+}
+
+impl BufferMap {
+    const fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            long_ends: BTreeMap::new(),
+            longest: 0,
+        }
+    }
+
+    fn register(&mut self, resource: usize, start: u64, len: u64) {
+        let key = (start, resource);
+        let end = start.saturating_add(len);
+        self.longest = self.longest.max(len);
+        let previous = self.entries.insert(key, Entry { end, shadow: None });
+        if len > SHORT_BUFFER {
+            self.long_ends.insert(key, end);
+        } else if previous.is_some() {
+            self.long_ends.remove(&key);
+        }
+    }
+
+    fn unregister(&mut self, resource: usize, start: u64) {
+        let key = (start, resource);
+        self.entries.remove(&key);
+        self.long_ends.remove(&key);
+    }
+
+    fn containing(&self, address: u64, end: u64) -> Option<(&(u64, usize), &Entry)> {
+        let last = (address, usize::MAX);
+        let mut earlier = self.entries.range(..=last).rev();
+        let nearest = earlier.next()?;
+        if nearest.1.end >= end {
+            return Some(nearest);
+        }
+        let nearby = end.saturating_sub(SHORT_BUFFER);
+        if let Some(hit) = earlier
+            .take_while(|(key, _)| key.0 >= nearby)
+            .find(|(_, entry)| entry.end >= end)
+        {
+            return Some(hit);
+        }
+        let earliest = end.saturating_sub(self.longest);
+        let (key, _) = self
+            .long_ends
+            .range(..=last)
+            .rev()
+            .take_while(|(key, _)| key.0 >= earliest)
+            .find(|(_, limit)| **limit >= end)?;
+        self.entries.get_key_value(key)
+    }
+
+    fn overlapping(&mut self, at: u64, end: u64) -> impl Iterator<Item = &mut Entry> {
+        let earliest = at.saturating_sub(self.longest);
+        self.entries
+            .range_mut(..(end, 0))
+            .rev()
+            .take_while(move |(key, _)| key.0 >= earliest)
+            .map(|(_, entry)| entry)
+            .filter(move |entry| entry.end > at && at < end)
+    }
+}
+
+#[cfg(test)]
+mod buffer_map_tests {
+    use super::{BufferMap, WINDOW, overlapping_windows};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_long_buffer_still_covers_the_query_after_many_shorter_buffers() {
+        let mut map = BufferMap::new();
+        map.register(0, 0, 4096);
+        for start in 1..=300 {
+            map.register(1, start, 1);
+        }
+        assert_eq!(map.containing(300, 301).map(|(key, _)| *key), Some((300, 1)));
+        assert_eq!(map.containing(300, 302).map(|(key, _)| *key), Some((0, 0)));
+        assert_eq!(map.overlapping(300, 301).count(), 2);
+        assert_eq!(map.overlapping(301, 302).count(), 1);
+        assert_eq!(map.overlapping(300, 300).count(), 0);
+        assert!(map.containing(4096, 4097).is_none());
+        map.unregister(0, 0);
+        assert!(map.containing(300, 302).is_none());
+    }
+
+    #[test]
+    fn the_long_buffer_index_tracks_replacement_and_removal() {
+        use super::SHORT_BUFFER;
+        let mut map = BufferMap::new();
+        map.register(1, 0, 8 * SHORT_BUFFER);
+        map.register(2, SHORT_BUFFER, 4 * SHORT_BUFFER);
+        for i in 0..300 {
+            map.register(3, 2 * SHORT_BUFFER + i, 1);
+        }
+        let query = |m: &BufferMap| {
+            m.containing(3 * SHORT_BUFFER, 3 * SHORT_BUFFER + 1)
+                .map(|(key, _)| *key)
+        };
+        assert_eq!(query(&map), Some((SHORT_BUFFER, 2)));
+        map.register(2, SHORT_BUFFER, 1);
+        assert_eq!(query(&map), Some((0, 1)));
+        map.unregister(1, 0);
+        assert_eq!(query(&map), None);
+        map.register(2, SHORT_BUFFER, 4 * SHORT_BUFFER);
+        assert_eq!(query(&map), Some((SHORT_BUFFER, 2)));
+    }
+
+    #[test]
+    fn remapping_a_later_cell_in_a_multi_cell_window_finds_the_window() {
+        let windows = BTreeMap::from([((0, 3 * WINDOW), ()), ((WINDOW, WINDOW), ()), ((3 * WINDOW, WINDOW), ())]);
+        let overlaps: Vec<_> = overlapping_windows(&windows, 2 * WINDOW, 2 * WINDOW + 1)
+            .map(|(key, _)| *key)
+            .collect();
+        assert_eq!(overlaps, [(0, 3 * WINDOW)]);
+    }
+}
+
 /// Title buffers by (start address, resource), with their copy once made.
 ///
 /// Read most of the time; written only when a buffer is registered or
 /// released, or when a copy is made on first use.
-static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> =
-    std::sync::RwLock::new(BTreeMap::new());
+static BUFFERS: std::sync::RwLock<BufferMap> = std::sync::RwLock::new(BufferMap::new());
 
-fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BufferMap> {
     BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
-fn buffers_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+fn buffers_write() -> std::sync::RwLockWriteGuard<'static, BufferMap> {
     BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers_write().insert(
-        (start, resource),
-        Entry {
-            end: start + len,
-            shadow: None,
-        },
-    );
+    buffers_write().register(resource, start, len);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers_write().remove(&(start, resource));
+    buffers_write().unregister(resource, start);
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -4270,11 +4390,17 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
     buffers_read()
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end > address)
+        .containing(address, address.checked_add(1)?)
         .map(|(k, e)| (k.0, e.end - k.0))
+}
+
+// A sized view can cover several window grid cells.
+fn overlapping_windows<T>(
+    windows: &BTreeMap<(u64, u64), T>,
+    at: u64,
+    end: u64,
+) -> impl Iterator<Item = (&(u64, u64), &T)> {
+    windows.range(..(end, 0)).filter(move |(key, _)| key.0.saturating_add(key.1) > at)
 }
 
 /// Title memory `[at, at + len)` is about to show something else or be
@@ -4282,22 +4408,23 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
 /// tables, so that the next ask makes a copy or opens the memory anew, and
 /// goes when no list and no slot holds it any more. Returns how many.
 pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
-            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
+        let keys: Vec<(u64, u64)> = overlapping_windows(&map, at, end)
+            .filter(|(_, shadow)| shadow.place.is_some())
             .map(|(key, _)| *key)
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
-        // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers_write();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
+        for entry in map.overlapping(at, end) {
+            if entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
             }
         }
@@ -4313,7 +4440,11 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
-    let mut spans: Vec<(u64, u64, bool)> = buffers_read().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
+    let mut spans: Vec<(u64, u64, bool)> = buffers_read()
+        .entries
+        .iter()
+        .map(|(key, entry)| (key.0, entry.end - key.0, false))
+        .collect();
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
@@ -4355,12 +4486,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let needs_copy = {
         let map = buffers_read();
-        match map
-            .range(..=(address, usize::MAX))
-            .rev()
-            .take(64)
-            .find(|(_, e)| e.end >= end)
-        {
+        match map.containing(address, end) {
             Some((_, entry)) => match &entry.shadow {
                 Some(shadow) => return Some(shadow.clone()),
                 None => true,
@@ -4372,17 +4498,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         return loose(address, end, len <= 1, any);
     }
     let mut map = buffers_write();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    let key = map.containing(address, end).map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
-    let entry = map.get_mut(&key)?;
+    let entry = map.entries.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -5052,6 +5173,7 @@ mod card_merge_tests {
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
     let mut all: Vec<(u64, u64, u64)> = buffers_read()
+        .entries
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();

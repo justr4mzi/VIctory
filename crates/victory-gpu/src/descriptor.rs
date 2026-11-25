@@ -1412,7 +1412,7 @@ mod tests {
     #[test]
     fn records_copied_as_bytes_are_made_at_the_next_sync() {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         };
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         let memory = unsafe {
@@ -1455,7 +1455,7 @@ mod tests {
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
-        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+        assert!(unsafe { crate::watch::release_title_allocation(memory) });
     }
 
     /// A descriptor record straddling a 64 KiB page boundary in an unaligned
@@ -1464,7 +1464,7 @@ mod tests {
     #[test]
     fn straddling_record_across_page_boundary_is_mirrored_on_sync() {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         };
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         let memory = unsafe {
@@ -1508,7 +1508,7 @@ mod tests {
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
-        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+        assert!(unsafe { crate::watch::release_title_allocation(memory) });
     }
 
     /// Raw-byte-copied buffer views are queued into `buffer_changes()` by
@@ -1518,7 +1518,7 @@ mod tests {
     #[test]
     fn raw_copied_buffer_view_is_queued_by_sync_heaps_and_made_for_draw() {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         };
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         let memory = unsafe {
@@ -1584,7 +1584,7 @@ mod tests {
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
-        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+        assert!(unsafe { crate::watch::release_title_allocation(memory) });
     }
 
     /// Verifies `HostHeap::copied` cache invalidation across API writes,
@@ -1595,7 +1595,7 @@ mod tests {
     #[test]
     fn copied_fingerprint_invalidates_across_api_writes_unmake_and_zeroing() {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         };
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         let memory = unsafe {
@@ -1682,7 +1682,7 @@ mod tests {
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
-        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+        assert!(unsafe { crate::watch::release_title_allocation(memory) });
     }
 
     #[test]
@@ -1942,7 +1942,7 @@ mod tests {
     #[test]
     fn sync_heaps_and_mirror_for_pass_keep_seen_pages_without_remirroring() {
         use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         };
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         let memory = unsafe {
@@ -2025,6 +2025,6 @@ mod tests {
             assert_eq!(host.take_forgotten_copied(), vec![4]);
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
-        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+        assert!(unsafe { crate::watch::release_title_allocation(memory) });
     }
 }
