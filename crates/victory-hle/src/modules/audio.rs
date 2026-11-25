@@ -673,6 +673,7 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    raise_priority();
                     loop {
                         xma().pump();
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
@@ -683,6 +684,42 @@ fn wake_decoder() {
         })
         .unpark();
 }
+
+/// Has the calling thread, the decoding thread, scheduled like a host
+/// audio engine's: in MMCSS's "Pro Audio" class, else time-critical, else
+/// highest. The title's mixer that takes what it decodes runs
+/// time-critical; at normal priority this thread lost the CPU to bulk
+/// workers (DirectStorage's, one per core) while frames were slow, and
+/// rings of at most 83 ms ran dry. It works only while a ring has room,
+/// so it cannot hog a core.
+#[cfg(windows)]
+fn raise_priority() {
+    use windows_sys::Win32::System::Threading::{
+        AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadPriority,
+        THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    let (name, mut task) = (windows_sys::core::w!("Pro Audio"), 0);
+    // SAFETY: a NUL-terminated task name and an out parameter. The
+    // registration is for the thread's life, which is the process's.
+    let mmcss = unsafe { AvSetMmThreadCharacteristicsW(name, &mut task) };
+    if !mmcss.is_null() {
+        tracing::info!("XMA decoder: MMCSS \"Pro Audio\"");
+        return;
+    }
+    let error = std::io::Error::last_os_error();
+    let priority = [
+        (THREAD_PRIORITY_TIME_CRITICAL, "time-critical"),
+        (THREAD_PRIORITY_HIGHEST, "highest"),
+    ]
+    .into_iter()
+    // SAFETY: changes only this thread's priority.
+    .find(|&(p, _)| unsafe { SetThreadPriority(GetCurrentThread(), p) } != 0)
+    .map_or("normal", |(_, name)| name);
+    tracing::info!(%error, priority, "XMA decoder: no MMCSS");
+}
+
+#[cfg(not(windows))]
+fn raise_priority() {}
 
 /// Runs an XMA command; false for one this does not know.
 fn xma_command(command: u32, word: impl Fn(usize) -> Option<u32>) -> bool {
