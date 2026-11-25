@@ -94,6 +94,7 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod idiom;
+mod lds;
 mod link;
 mod lower;
 mod own_bits;
@@ -181,24 +182,29 @@ pub fn group_sync() -> u8 {
 /// is exact, so the switch is for telling a translator fault from a
 /// clean-up fault, and for measuring what the clean-up is worth.
 /// `VICTORY_SHADER_OPT`:
-/// - unset: every pass but the last one below (63).
+/// - unset: every pass except `WIDE` below (447).
 /// - `0`: none (the module as the lowering made it).
 /// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
-///   says about its condition, 16 one read for one place within a block,
-///   32 a first-lane read of two host waves without the round that asks
-///   which half has a lane (where every lane has one).
-///   64 the dwords of one console load read by one call for every four
-///   (not on unless asked: `127` is every pass with it).
+///   says about its condition, 16 one read for one place within a block and
+///   non-aliasing local/shared forwarding, 32 a first-lane read of two host
+///   waves without the round that asks which half has a lane (where every lane
+///   has one), 64 the dwords of one console load read by one call for every
+///   four (not on unless asked), 128 pure loop-invariant code motion, 256
+///   adjacent redundant barrier elimination (`511` is every pass with it).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
+    #[cfg(test)]
+    if let Some(passes) = TEST_SHADER_OPT.with(std::cell::Cell::get) {
+        return passes & bitcode::opt::ALL;
+    }
     static ASKED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     let asked = *ASKED.get_or_init(|| {
         std::env::var("VICTORY_SHADER_OPT").ok().map(|v| parse_shader_opt(Some(&v)))
     });
-    asked.unwrap_or(bitcode::opt::ALL & !SKIPPED_OPT.load(std::sync::atomic::Ordering::Relaxed))
+    asked.unwrap_or(bitcode::opt::DEFAULT & !SKIPPED_OPT.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Passes the host's driver cannot take, unless `VICTORY_SHADER_OPT` names them.
@@ -213,6 +219,26 @@ pub fn set_host_vendor(vendor: u32) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_SHADER_OPT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with `shader_opt()` overridden to `passes` on the current thread
+/// (tests only; restores the previous override on unwind).
+#[cfg(test)]
+pub(crate) fn with_shader_opt<R>(passes: u32, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<u32>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SHADER_OPT.with(|c| c.set(self.0));
+        }
+    }
+    let prev = TEST_SHADER_OPT.with(|c| c.replace(Some(passes)));
+    let _guard = Reset(prev);
+    f()
+}
+
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest
@@ -224,20 +250,35 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
     out.push(u8::from(cfg!(feature = "diagnostics")));
     out.push(u8::from(cfg!(debug_assertions)));
-    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
-        out.extend_from_slice(name.as_bytes());
-        out.push(b'=');
-        if let Some(value) = std::env::var_os(name) {
-            out.extend_from_slice(value.as_encoded_bytes());
-        }
-        out.push(0);
-    }
+    switch_values(&mut out, env!("VICTORY_SHADER_SWITCHES"), |name| {
+        std::env::var_os(name)
+    });
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out
+}
+
+/// The fingerprint's part for the switches `names` lists (comma-separated),
+/// each value read through `value`: `NAME\0` when unset, `NAME=value\0`
+/// when set, so a switch set to nothing keys apart from an unset one
+/// (several count as on when merely set, `VICTORY_STRICT_JOINS` and
+/// `VICTORY_MESH_OUTPUT_STRICT` among them). Pure, for testing.
+fn switch_values(
+    out: &mut Vec<u8>,
+    names: &str,
+    value: impl Fn(&str) -> Option<std::ffi::OsString>,
+) {
+    for name in names.split(',').filter(|n| !n.is_empty()) {
+        out.extend_from_slice(name.as_bytes());
+        if let Some(value) = value(name) {
+            out.push(b'=');
+            out.extend_from_slice(value.as_encoded_bytes());
+        }
+        out.push(0);
+    }
 }
 
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
@@ -775,17 +816,45 @@ fn emit_forms(
         original
     };
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
-    // trace programs): right once the wave takes that skip together ([`widen`]; the
-    // lowering has named the skipped blocks).
+    // trace programs) or cross-lane code in a shader that could not run with local waves alone:
+    // retry `widen` allowing loop-adjacent branches cleanly now that `local_waves` was tried.
     let original = match original {
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
-                && what == lower::LANE_MASK
+                && (what == lower::LANE_MASK || lower::needs_every_lane(what))
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+            let deep = native.wave64
+                && lower::host_max_wave() == 32
+                && std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let base = if deep {
+                ir::without_skips(p, true)
+                    .or_else(|| ir::without_skips(p, false))
+                    .or_else(|| ir::without_early_outs(p))
+            } else {
+                None
+            };
+            let log = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
+                if why {
+                    match r {
+                        Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
+                        Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    }
+                }
+            };
+            let again = widen(c, native, base.as_ref().unwrap_or(p), why);
+            log("wave-wide branches (retry)", &again);
             match again {
                 Ok(_) => again,
+                Err(_) if base.is_some() => {
+                    let fallback = widen(c, native, p, why);
+                    log("wave-wide branches (fallback)", &fallback);
+                    match fallback {
+                        Ok(_) => fallback,
+                        Err(_) => emit_program(c, native, p, st, io, res),
+                    }
+                }
                 Err(_) => emit_program(c, native, p, st, io, res),
             }
         }
@@ -884,7 +953,11 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs)
+            if {
+                let g = cs.threads.iter().product::<u32>();
+                g > 0 && g <= 1024 && (g <= 32 || g.is_multiple_of(64))
+            } => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -1191,14 +1264,48 @@ mod tests {
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
-        assert_eq!(usual, 63, "the passes of the builds before the wide loads");
+        assert_eq!(usual, 447, "the passes on by default (all except WIDE)");
+        assert_eq!(all, 511);
         assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
+        assert_eq!(parse_shader_opt(Some("447")), usual);
+        assert_eq!(parse_shader_opt(Some("511")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
+    }
+
+    /// Switches that count as on when merely set (`VICTORY_STRICT_JOINS`,
+    /// `VICTORY_MESH_OUTPUT_STRICT`) translate differently when set to an
+    /// empty value than when unset, so the cache key must tell the two apart.
+    #[test]
+    fn a_switch_set_to_nothing_keys_apart_from_an_unset_one() {
+        use std::ffi::OsString;
+        let key = |strict: Option<&str>, mesh: Option<&str>| {
+            let mut out = Vec::new();
+            super::switch_values(
+                &mut out,
+                "VICTORY_MESH_OUTPUT_STRICT,VICTORY_STRICT_JOINS",
+                |name| match name {
+                    "VICTORY_MESH_OUTPUT_STRICT" => mesh.map(OsString::from),
+                    "VICTORY_STRICT_JOINS" => strict.map(OsString::from),
+                    other => panic!("{other} is not in the list"),
+                },
+            );
+            out
+        };
+        assert_ne!(key(None, None), key(Some(""), None));
+        assert_ne!(key(None, None), key(None, Some("")));
+        assert_ne!(key(Some(""), None), key(None, Some("")));
+        assert_ne!(key(Some(""), None), key(Some("1"), None));
+        // A value cannot run into the next switch's name.
+        assert_ne!(key(Some("x"), None), key(None, Some("x")));
+        assert_eq!(key(Some("1"), None), key(Some("1"), None));
+        // Both are switches the real key reads.
+        let read: Vec<_> = env!("VICTORY_SHADER_SWITCHES").split(',').collect();
+        assert!(read.contains(&"VICTORY_STRICT_JOINS"), "{read:?}");
+        assert!(read.contains(&"VICTORY_MESH_OUTPUT_STRICT"), "{read:?}");
     }
 
     #[test]
