@@ -915,7 +915,23 @@ pub(crate) fn probe_view_limit() {
 /// still holds its own; a draw refused its table read slots never made
 /// for it, and the card stopped within frames). 2^18 leaves 737,000; a
 /// table past them is made afresh in these slots like any other.
+/// Dynamic slots past `count` on uncapped host heaps when the title's
+/// slots leave room (`VICTORY_DYNAMIC_SLOTS`, 2^19; `=262144` is previous).
 pub(crate) const DYNAMIC: u32 = 1 << 18;
+
+fn dynamic_uncapped() -> u32 {
+    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_DYNAMIC_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1 << 19)
+            .max(DYNAMIC)
+    })
+}
+
+/// Tables refused for want of free dynamic slots, since the start.
+pub(crate) static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -949,6 +965,14 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
+        let extra = if !sampler && null >= UNCAPPED_VIEWS - 1 && count.saturating_add(dynamic_uncapped()) <= null {
+            dynamic_uncapped()
+        } else {
+            extra
+        };
+        if !sampler {
+            tracing::info!(count, extra, null, "view heap: the title's slots, dynamic slots, the null slot");
+        }
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -1022,8 +1046,8 @@ impl HostHeap {
             stripes,
             made_keys: (0..count).map(|_| AtomicU64::new(0)).collect(),
             copied: Mutex::new((Vec::new(), Vec::new())),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            next: Mutex::new((0, vec![false; extra as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -1140,7 +1164,7 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { self.dynamic as usize } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -1158,6 +1182,7 @@ impl HostHeap {
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1170,7 +1195,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 

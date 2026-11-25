@@ -42,6 +42,8 @@ pub mod frame;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod over;
@@ -54,6 +56,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod placed;
+#[cfg(windows)]
+mod ranges;
 #[cfg(windows)]
 mod plaincopy;
 #[cfg(windows)]

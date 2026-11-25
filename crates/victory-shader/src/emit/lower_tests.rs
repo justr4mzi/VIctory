@@ -752,3 +752,111 @@ fn cube_image_get_lod_lowers_and_validates() {
     #[cfg(not(windows))]
     let _ = lowered;
 }
+
+#[test]
+fn a_uniform_branch_can_choose_between_immediate_samplers() {
+    // A root constant selects wrap or clamp. Keep the sample live with an LDS store.
+    let words = [
+        0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
+        0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
+        0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 1-3
+        0xBF06_8001,                    // s_cmp_eq_u32 s1, 0
+        0xBF85_0002,                    // branch to clamp
+        0xBE88_0380, 0xBF82_0002,       // wrap, skip clamp
+        0xBE88_03FF, 0x0000_0092,       // clamp all axes
+        0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], ..., s[8:11]
+        0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
+        S_ENDPGM,
+    ];
+    let (mut layout, mut used) = texture_tables();
+    layout[1] = root(RootType::Constants, 1, 1);
+    used.truncate(1);
+    let lowered = lower_with(&words, layout, used).unwrap();
+    assert_eq!(lowered.samplers.len(), 2);
+    assert!(lowered.samplers.contains(&[0, 0, 0, 0]));
+    assert!(lowered.samplers.contains(&[0x92, 0, 0, 0]));
+}
+
+/// MIMG `op vdata, v[vaddr..], s[srsrc..srsrc+7]` on a 2D image.
+const fn mimg_2d(op: u8, dmask: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x3C << 26 | (op as u32 & 0x7F) << 18 | (dmask as u32) << 8 | 1 << 3,
+        ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+#[test]
+fn an_image_read_as_float_and_by_an_atomic_is_annotated_twice() {
+    use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+
+    // One 2D image UAV from the descriptor table at s4, loaded (four
+    // float channels) and then atomically minimised in the same block.
+    let mut words = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        // s_load_dwordx8 s[8:15], s[4:5], 0
+        0x3D << 26 | 0x03 << 18 | 8 << 6 | 4 >> 1,
+        125 << 25,
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+    ];
+    words.extend(mimg_2d(0x00, 0xF, 2, 0, 8)); // image_load v[2:5], v[0:1], s[8:15]
+    words.extend(mimg_2d(0x15, 0x1, 2, 0, 8)); // image_atomic_umin v2, v[0:1], s[8:15]
+    words.push(S_ENDPGM);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 4,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    })
+    .unwrap();
+
+    const TEXTURE_2D_UAV: u32 = 0x1002;
+    assert!(
+        lowered.annotations.contains(&(TEXTURE_2D_UAV, 0x409)),
+        "the load's annotation: {:x?}",
+        lowered.annotations
+    );
+    assert!(
+        lowered.annotations.contains(&(TEXTURE_2D_UAV, 0x105)),
+        "the atomic's annotation: {:x?}",
+        lowered.annotations
+    );
+}

@@ -2053,7 +2053,20 @@ pub(crate) fn let_go_idle() {
     if !sweeping() {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    static IDLE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let vm = crate::host::host().and_then(|h| h.video_memory()).map(|mut m| {
+        m[1] = m[1].saturating_sub(crate::placed::free_bytes());
+        m
+    });
+    let idle_ms = match *IDLE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_IDLE_MS").ok()?.trim().parse().ok()
+    }) {
+        Some(ms) => ms,
+        None => {
+            let base = crate::host::vram_idle_ms(vm);
+            if !cfg!(test) && base == 5_000 { 15_000 } else { base }
+        }
+    };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);

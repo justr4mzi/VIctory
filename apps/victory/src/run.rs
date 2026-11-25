@@ -20,12 +20,13 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    apply_title_patches(&mut prepared)?;
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -366,4 +367,51 @@ mod tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+/// Bytes as lower-case hex.
+#[cfg(windows)]
+fn hex_str(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Optional title code patches from `VICTORY_TITLE_PATCH=<rva>:<old hex>:<new hex>,...`.
+/// The old bytes must be there (another build of the title is refused), and the
+/// patched copy gets a distinct cached image name.
+#[cfg(windows)]
+fn apply_title_patches(prepared: &mut victory_loader::PreparedImage) -> Result<()> {
+    let mut patches = Vec::new();
+    let spec = std::env::var("VICTORY_TITLE_PATCH").unwrap_or_default();
+    for one in spec.split(',').filter(|p| !p.trim().is_empty()) {
+        let parts: Vec<&str> = one.split(':').collect();
+        anyhow::ensure!(
+            parts.len() == 3,
+            "VICTORY_TITLE_PATCH entry is not <rva>:<old>:<new>: {one}"
+        );
+        let rva = u32::from_str_radix(parts[0].trim().trim_start_matches("0x"), 16)?;
+        patches.push((rva, from_hex(parts[1])?, from_hex(parts[2])?));
+    }
+    if patches.is_empty() {
+        return Ok(());
+    }
+    prepared.patch(&patches)?;
+    for (rva, old, new) in &patches {
+        println!(
+            "title patch    +{rva:#x} VICTORY_TITLE_PATCH: {} -> {}",
+            hex_str(old),
+            hex_str(new)
+        );
+    }
+    Ok(())
+}
+
+/// Bytes from hex digits.
+#[cfg(windows)]
+fn from_hex(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim();
+    anyhow::ensure!(s.len().is_multiple_of(2), "odd hex length: {s}");
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(anyhow::Error::from))
+        .collect()
 }

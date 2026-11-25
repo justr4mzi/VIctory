@@ -77,6 +77,12 @@ pub(crate) struct Staging {
     /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
     /// own, released when this is dropped.
     pooled: u64,
+    /// The offset in `buffer` of what `data` points at (not 0 only with a
+    /// range of a block), which the copies' footprints are from.
+    base: u64,
+    /// Its range of a block ([`staging_range`]), given back with this.
+    #[allow(dead_code)]
+    piece: Option<Piece>,
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
@@ -110,13 +116,141 @@ pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// without, in turn, each change said in the log: a buffer made without
 /// is freed as before, and the spare ones wait for the next turn.
 /// `VICTORY_STAGING_POOL_MB`: the most kept spare (256 unless said).
-fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64, Option<Piece>)> {
+    let making = std::time::Instant::now();
+    let made = match staging_range(host, total) {
+        Some((buffer, data, piece)) => Some((4, (buffer, data, 0, Some(piece)))),
+        None => staging_buffer_alone(host, total)
+            .map(|(buffer, data, size, spare)| (if spare { 2 } else { 0 }, (buffer, data, size, None))),
+    };
+    let (kind, buffer) = made?;
+    STAGING_MADE[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    STAGING_MADE[kind + 1].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    Some(buffer)
+}
+
+/// Staging buffers since the frame line last asked and the microseconds
+/// they took: made by the host, taken from the spare ones, cut from blocks.
+pub(crate) static STAGING_MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Whether staging buffers are ranges of big blocks (`VICTORY_STAGING_BLOCKS=1`,
+/// default on outside tests; `=0` uses individual pooled buffers).
+fn staging_blocks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_STAGING_BLOCKS").map_or(!cfg!(test), |v| v != "0")
+    })
+}
+
+const BLOCK: u64 = 64 << 20;
+const GRAIN: u64 = 4096;
+const BLOCKS_KEPT: u64 = 256 << 20;
+
+/// A block of upload memory, mapped for its life, and what is free in it.
+struct Block {
+    buffer: ID3D12Resource,
+    data: usize,
+    ranges: crate::ranges::Ranges,
+}
+// SAFETY: a free-threaded D3D12 object and the address of its mapping.
+unsafe impl Send for Block {}
+
+/// The blocks (`None` where one was given back) and their free bytes.
+static BLOCKS: Mutex<(Vec<Option<Block>>, u64)> = Mutex::new((Vec::new(), 0));
+
+/// A staging buffer's range of a block; dropping it gives the range back
+/// (and the block, if that leaves it free and [`BLOCKS_KEPT`] are).
+struct Piece {
+    block: usize,
+    offset: u64,
+    len: u64,
+}
+
+impl Drop for Piece {
+    fn drop(&mut self) {
+        let mut gone = None;
+        {
+            let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+            let (all, free) = &mut *blocks;
+            if let Some(Some(block)) = all.get_mut(self.block) {
+                block.ranges.give(self.offset, self.len);
+                *free += self.len;
+                if block.ranges.room() == BLOCK && *free >= BLOCKS_KEPT + BLOCK {
+                    *free -= BLOCK;
+                    gone = all[self.block].take();
+                }
+            }
+        }
+        drop(gone);
+    }
+}
+
+/// A range of a block for a staging buffer of `total` bytes, if enabled.
+fn staging_range(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, Piece)> {
+    if staging_blocks() { cut_from_blocks(host, total) } else { None }
+}
+
+/// A range of a block for a staging buffer of `total` bytes, all zeros.
+fn cut_from_blocks(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, Piece)> {
+    let len = total.max(1).next_multiple_of(GRAIN);
+    if len > BLOCK / 4 {
+        return None;
+    }
+    let (buffer, data, piece, used_before) = {
+        let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let (all, free) = &mut *blocks;
+        let found = all.iter_mut().enumerate().find_map(|(i, b)| {
+            let b = b.as_mut()?;
+            b.ranges.take(len, GRAIN).map(|(offset, used)| (i, offset, used))
+        });
+        let (index, offset, used) = match found {
+            Some(found) => found,
+            None => {
+                let (buffer, data) = host.upload_buffer(BLOCK)?;
+                crate::host::name(&buffer, || "staging block".to_owned());
+                let mut ranges = crate::ranges::Ranges::new(BLOCK);
+                let (offset, used) = ranges.take(len, GRAIN)?;
+                let fresh = Block { buffer, data: data as usize, ranges };
+                *free += BLOCK;
+                let index = match all.iter().position(Option::is_none) {
+                    Some(index) => {
+                        all[index] = Some(fresh);
+                        index
+                    }
+                    None => {
+                        all.push(Some(fresh));
+                        all.len() - 1
+                    }
+                };
+                (index, offset, used)
+            }
+        };
+        *free -= len;
+        let block = all[index].as_ref()?;
+        (
+            block.buffer.clone(),
+            (block.data + offset as usize) as *mut u8,
+            Piece { block: index, offset, len },
+            used,
+        )
+    };
+    if used_before {
+        // SAFETY: the range's own part of the block's mapping, which nothing
+        // else holds.
+        unsafe { std::ptr::write_bytes(data, 0, total as usize) };
+    }
+    Some((buffer, data, piece))
+}
+
+/// A staging buffer of its own, spare or made; the last says whether it was
+/// spare.
+fn staging_buffer_alone(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64, bool)> {
     let size = total.max(64 << 10).next_power_of_two();
     if size > SPARE_MOST.1 || !staging_pool() {
         // (Counted as made: the frame log's "staging N made" is then the
         // buffers of a run without the pool too.)
         SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
+        return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0, false));
     }
     let spare = {
         let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
@@ -131,10 +265,10 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
         // SAFETY: the buffer's own mapping, `size` bytes, which nothing
         // else holds.
         unsafe { std::ptr::write_bytes(data as *mut u8, 0, total as usize) };
-        return Some((buffer, data as *mut u8, size));
+        return Some((buffer, data as *mut u8, size, true));
     }
     SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
+    host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size, false))
 }
 
 /// Whether staging buffers are taken from and returned to the spare ones
@@ -949,7 +1083,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
                         f.RowPitch
                     )
                 },
-                (gpu + footprint.Offset, len),
+                (gpu + staging.base + footprint.Offset, len),
             );
         }
         let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -965,7 +1099,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: staging.base + footprint.Offset,
+                    ..*footprint
+                },
             },
         };
         // SAFETY: an open list; both locations name live resources.
@@ -1739,16 +1876,19 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data, pooled) = staging_buffer(host, total)?;
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    let (buffer, data, pooled, piece) = staging_buffer(host, total)?;
+    if piece.is_none() {
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    let base = piece.as_ref().map_or(0, |p| p.offset);
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
@@ -1770,6 +1910,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         pooled,
+        base,
+        piece,
     });
     map.insert(resource as usize, s.clone());
     add_to_address_index(&s);
@@ -1863,7 +2005,7 @@ mod title_memory_tests {
                 }
             };
             fill(0);
-            let (buffer, data, pooled) = staging_buffer(host, total).expect("a staging buffer");
+            let (buffer, data, pooled, piece) = staging_buffer(host, total).expect("a staging buffer");
             STAGED[0].fetch_add(1, Ordering::Relaxed);
             STAGED[1].fetch_add(total, Ordering::Relaxed);
             let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
@@ -1876,6 +2018,7 @@ mod title_memory_tests {
                     RowPitch: pitch as u32,
                 },
             };
+            let base = piece.as_ref().map_or(0, |p| p.offset);
             let staging = Staging {
                 buffer,
                 #[cfg(feature = "diagnostics")]
@@ -1897,6 +2040,8 @@ mod title_memory_tests {
                 judged: [const { AtomicU64::new(0) }; 2],
                 waiting: AtomicU64::new(0),
                 pooled,
+                base,
+                piece,
             };
             let expected = || {
                 let mut linear = vec![0u8; total as usize];
