@@ -7746,7 +7746,6 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
-        #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
@@ -7861,14 +7860,12 @@ impl Meter {
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
             #[cfg(feature = "diagnostics")]
-            {
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
-                for (why, n) in drops.iter().take(40) {
-                    tracing::info!(
-                        "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / frames
-                    );
-                }
+            crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+            // Which shaders and pipelines the dropped draws are for, most
+            // first: release builds show the ten that cost the most.
+            let shown = if cfg!(feature = "diagnostics") { 40 } else { 10 };
+            for (why, n) in drops.iter().take(shown) {
+                tracing::info!("dropped {:.1}/frame without a host pipeline: {why}", *n as f64 / frames);
             }
         }
         if self.caption.is_none() {
