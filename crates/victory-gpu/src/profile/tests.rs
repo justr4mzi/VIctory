@@ -1003,3 +1003,167 @@ fn what_looking_costs() {
         thread.join().unwrap();
     }
 }
+
+#[test]
+fn frame_fits_accounts_for_saved_register_offsets_and_truncated_codes() {
+    // Synthetic image buffer: [0..16) code (`nop; nop`), [16..) UNWIND_INFO.
+    let mut img = [0u8; 64];
+    img[0] = 0x90;
+    img[1] = 0x90;
+    let base = img.as_ptr() as u64;
+    let entry: [u32; 3] = [0, 2, 16];
+    let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+    ctx.Rip = base + 1;
+    let start = 0x1000usize;
+    let end = start + 128;
+    let limit = start + 256;
+    ctx.Rsp = start as u64;
+
+    // 1) UWOP_SAVE_NONVOL (op=4, reg=rbx=3) at scaled offset 40 -> byte offset 320,
+    //    needs 328 bytes (> limit - start = 256). Must be rejected.
+    img[16..24].copy_from_slice(&[
+        1,
+        1,
+        2,
+        0, // version=1, prolog=1, count=2, frame=0
+        1,
+        (3 << 4) | 4, // offset=1, UWOP_SAVE_NONVOL rbx
+        40,
+        0, // scaled offset = 40 -> 320 bytes (+8 = 328)
+    ]);
+    assert!(
+        !unsafe { frame_fits(base, &entry, &ctx, start, end, limit) },
+        "UWOP_SAVE_NONVOL past limit must not fit"
+    );
+
+    // Confirm real RtlVirtualUnwind indeed reads at that offset (> 64) even with frame_size = 0.
+    let mut stack = [0u64; 48];
+    stack[40] = 0xdead_beef_cafe_babe;
+    let mut probe = ctx;
+    probe.Rsp = stack.as_ptr() as u64;
+    let (mut data, mut frame) = (null_mut(), 0);
+    unsafe {
+        RtlVirtualUnwind(
+            UNW_FLAG_NHANDLER,
+            base,
+            probe.Rip,
+            (&entry as *const [u32; 3]).cast(),
+            &mut probe,
+            &mut data,
+            &mut frame,
+            null_mut(),
+        );
+    }
+    assert_eq!(probe.Rbx, 0xdead_beef_cafe_babe);
+
+    // 2) Same UWOP_SAVE_NONVOL at scaled offset 20 -> 160 (+8 = 168 <= 256): fits.
+    img[22..24].copy_from_slice(&20u16.to_le_bytes());
+    assert!(
+        unsafe { frame_fits(base, &entry, &ctx, start, end, limit) },
+        "UWOP_SAVE_NONVOL within limit must fit"
+    );
+
+    // 3) Truncated UWOP_ALLOC_LARGE (op=1, info=0 needs 2 slots, count=1): rejected.
+    img[16..22].copy_from_slice(&[
+        1, 1, 1, 0, // count=1
+        1, 1, // UWOP_ALLOC_LARGE (info=0) with missing second slot
+    ]);
+    assert!(
+        !unsafe { frame_fits(base, &entry, &ctx, start, end, limit) },
+        "truncated multi-slot unwind code must be rejected"
+    );
+
+    // 4) UWOP_PUSH_MACHFRAME followed by another code replaces Rsp mid-unwind: rejected.
+    img[16..24].copy_from_slice(&[
+        1, 1, 2, 0, // count=2
+        1, 10, // UWOP_PUSH_MACHFRAME
+        1, 0, // trailing UWOP_PUSH_NONVOL reading through unchecked Rsp
+    ]);
+    assert!(
+        !unsafe { frame_fits(base, &entry, &ctx, start, end, limit) },
+        "UWOP_PUSH_MACHFRAME with trailing unwind codes must be rejected"
+    );
+
+    // 5) Rip past `finish` must return false rather than underflowing `code`.
+    ctx.Rip = base + 8;
+    img[16..20].copy_from_slice(&[1, 0, 0, 0]);
+    assert!(
+        !unsafe { frame_fits(base, &entry, &ctx, start, end, limit) },
+        "Rip past function finish must be rejected"
+    );
+}
+
+#[test]
+fn epilogue_fits_recognizes_bnd_prefixed_epilogues() {
+    let start = 0x1000usize;
+    let end = start + 128;
+    let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+    ctx.Rsp = start as u64;
+
+    // All of these are executed as epilogues by Windows `RtlVirtualUnwind`
+    // because it skips a single `0xf2` (`bnd`) prefix before the terminator.
+    let bad: &[(&str, &[u8])] = &[
+        ("pop rsp; bnd ret", &[0x5c, 0xf2, 0xc3]),
+        (
+            "add rsp, 0x200; bnd ret",
+            &[0x48, 0x81, 0xc4, 0x00, 0x02, 0x00, 0x00, 0xf2, 0xc3],
+        ),
+        (
+            "add rsp, 0x200; bnd jmp rel8",
+            &[0x48, 0x81, 0xc4, 0x00, 0x02, 0x00, 0x00, 0xf2, 0xeb, 0x00],
+        ),
+        (
+            "add rsp, 0x200; bnd rex jmp rax",
+            &[
+                0x48, 0x81, 0xc4, 0x00, 0x02, 0x00, 0x00, 0xf2, 0x48, 0xff, 0xe0,
+            ],
+        ),
+        (
+            "add rsp, 0x200; bnd rep ret",
+            &[0x48, 0x81, 0xc4, 0x00, 0x02, 0x00, 0x00, 0xf2, 0xf3, 0xc3],
+        ),
+    ];
+    for &(name, code) in bad {
+        ctx.Rip = code.as_ptr() as u64;
+        assert!(
+            !unsafe { epilogue_fits(&ctx, code.len(), 0, start, end) },
+            "{name} must be rejected"
+        );
+    }
+
+    // An in-bounds `add rsp, 0x10; bnd ret` must still fit, and real
+    // `RtlVirtualUnwind` executes it as an epilogue (`rsp_delta = 0x18`).
+    let ok = [0x48u8, 0x83, 0xc4, 0x10, 0xf2, 0xc3];
+    ctx.Rip = ok.as_ptr() as u64;
+    assert!(
+        unsafe { epilogue_fits(&ctx, ok.len(), 0, start, end) },
+        "in-bounds add rsp, 0x10; bnd ret must fit"
+    );
+
+    let stack = [0x1111_2222_3333_4444u64; 16];
+    let mut img = [0u8; 64];
+    img[0] = 0x90;
+    img[1..1 + ok.len()].copy_from_slice(&ok);
+    img[32..38].copy_from_slice(&[1, 1, 1, 0, 1, 0x02]);
+    let image = img.as_ptr() as u64;
+    let entry: [u32; 3] = [0, (1 + ok.len()) as u32, 32];
+    let mut probe: CONTEXT = unsafe { std::mem::zeroed() };
+    probe.Rip = image + 1;
+    probe.Rsp = stack.as_ptr() as u64;
+    let rsp0 = probe.Rsp;
+    let (mut data, mut frame) = (null_mut(), 0);
+    unsafe {
+        RtlVirtualUnwind(
+            UNW_FLAG_NHANDLER,
+            image,
+            probe.Rip,
+            (&entry as *const [u32; 3]).cast(),
+            &mut probe,
+            &mut data,
+            &mut frame,
+            null_mut(),
+        );
+    }
+    assert_eq!(probe.Rsp - rsp0, 0x18);
+    assert_eq!(probe.Rip, 0x1111_2222_3333_4444);
+}

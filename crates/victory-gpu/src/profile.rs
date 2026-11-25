@@ -1200,9 +1200,10 @@ unsafe fn frame_fits(
             .wrapping_sub(u64::from(begin));
         // The frame register the function itself names (its first part).
         let mut pointer = 0;
-        // Bytes above the frame's base that unwinding may read: the
-        // return address, a machine frame's tail.
-        let mut reach = 64usize;
+        // Cumulative stack adjustment across unwind codes, and the furthest
+        // saved-register read offset (`UWOP_SAVE_*`).
+        let mut frame_size = 0usize;
+        let mut save_end = 0usize;
         // Bases other than the stack pointer: frame pointers set up.
         let mut bases = [0usize; 4];
         let mut based = 0;
@@ -1227,24 +1228,31 @@ unsafe fn frame_fits(
             while i < count {
                 let [offset, op] = codes.add(2 * i).cast::<[u8; 2]>().read();
                 let (op, op_info) = (op & 15, usize::from(op >> 4));
-                i += match op {
+                let step = match op {
                     // A register pushed.
                     0 => {
-                        reach += 8;
+                        frame_size = frame_size.saturating_add(8);
                         1
                     }
                     // A large allocation: its size in the next one or two slots.
                     1 if op_info == 0 => {
-                        reach += usize::from(slot(i + 1)) * 8;
+                        if i + 2 > count {
+                            return false;
+                        }
+                        frame_size = frame_size.saturating_add(usize::from(slot(i + 1)) * 8);
                         2
                     }
-                    1 => {
-                        reach += usize::from(slot(i + 1)) | usize::from(slot(i + 2)) << 16;
+                    1 if op_info == 1 => {
+                        if i + 3 > count {
+                            return false;
+                        }
+                        let bytes = usize::from(slot(i + 1)) | (usize::from(slot(i + 2)) << 16);
+                        frame_size = frame_size.saturating_add(bytes);
                         3
                     }
                     // A small allocation.
                     2 => {
-                        reach += op_info * 8 + 8;
+                        frame_size = frame_size.saturating_add(op_info * 8 + 8);
                         1
                     }
                     // The frame pointer set: done already if the thread is
@@ -1254,19 +1262,60 @@ unsafe fn frame_fits(
                         set = part > 0 || chained || at >= u64::from(offset);
                         1
                     }
-                    // Registers saved in the frame (near, far), an epilogue
-                    // note and a spare code, vector registers saved.
-                    4 | 8 => 2,
-                    5 | 9 => 3,
+                    // General register saved in the frame (near, far).
+                    4 => {
+                        if i + 2 > count {
+                            return false;
+                        }
+                        let off = usize::from(slot(i + 1)) * 8;
+                        save_end = save_end.max(frame_size.saturating_add(off).saturating_add(8));
+                        2
+                    }
+                    5 => {
+                        if i + 3 > count {
+                            return false;
+                        }
+                        let off = usize::from(slot(i + 1)) | (usize::from(slot(i + 2)) << 16);
+                        save_end = save_end.max(frame_size.saturating_add(off).saturating_add(8));
+                        3
+                    }
+                    // Epilogue note (version 2) and spare code.
                     6 => 1,
-                    7 => 2,
-                    // A machine frame.
+                    7 => {
+                        if i + 2 > count {
+                            return false;
+                        }
+                        2
+                    }
+                    // 128-bit vector register saved in the frame (near, far).
+                    8 => {
+                        if i + 2 > count {
+                            return false;
+                        }
+                        let off = usize::from(slot(i + 1)) * 16;
+                        save_end = save_end.max(frame_size.saturating_add(off).saturating_add(16));
+                        2
+                    }
+                    9 => {
+                        if i + 3 > count {
+                            return false;
+                        }
+                        let off = usize::from(slot(i + 1)) | (usize::from(slot(i + 2)) << 16);
+                        save_end = save_end.max(frame_size.saturating_add(off).saturating_add(16));
+                        3
+                    }
+                    // A machine frame. Replaces `Rsp` from the stack, so no
+                    // further unwind codes or chained parent may read through it.
                     10 => {
-                        reach += 48;
+                        if i + 1 < count || chained {
+                            return false;
+                        }
+                        frame_size = frame_size.saturating_add(48);
                         1
                     }
                     _ => return false,
                 };
+                i += step;
             }
             if frame & 15 != 0 && (set || !found || part > 0 || chained) {
                 let register = gpr(context, frame & 15) as usize;
@@ -1279,12 +1328,23 @@ unsafe fn frame_fits(
             }
             if !chained {
                 let rsp = context.Rsp as usize;
-                let code = image + u64::from(finish) - context.Rip;
+                // Bytes above the frame's base that unwinding may read: the
+                // cumulative frame + return/machine tail, or the furthest
+                // saved-register slot.
+                let reach = frame_size.saturating_add(64).max(save_end);
+                let Some(code) = image
+                    .checked_add(u64::from(finish))
+                    .and_then(|f| f.checked_sub(context.Rip))
+                else {
+                    return false;
+                };
                 return rsp >= start
                     && rsp < end
                     && reach <= SLACK
-                    && rsp + reach <= limit
-                    && bases[..based].iter().all(|base| base + reach <= limit)
+                    && rsp.checked_add(reach).is_some_and(|top| top <= limit)
+                    && bases[..based]
+                        .iter()
+                        .all(|&base| base.checked_add(reach).is_some_and(|top| top <= limit))
                     && epilogue_fits(context, code as usize, pointer, start, end);
             }
             let parent = codes
@@ -1368,12 +1428,23 @@ unsafe fn epilogue_fits(
         at += if rex { 2 } else { 1 };
         pops += 1;
     }
+    // Optional Intel MPX `bnd` prefix (`0xf2`) before the return or jump,
+    // which `RtlVirtualUnwind` skips before matching the terminator.
+    if byte(at) == 0xf2 {
+        at += 1;
+    }
     // A return or a jump: only then are the instructions before it run.
     let leaves = matches!(byte(at), 0xc3 | 0xc2 | 0xeb | 0xe9)
         || byte(at) == 0xf3 && byte(at + 1) == 0xc3
         || byte(at) == 0xff && byte(at + 1) == 0x25
         || byte(at) & 0xf0 == 0x40 && byte(at + 1) == 0xff && byte(at + 2) & 0x38 == 0x20;
-    !leaves || (!pops_rsp && pops < 64 && rsp >= start && rsp + 8 * (pops + 1) <= end)
+    !leaves
+        || (!pops_rsp
+            && pops < 64
+            && rsp >= start
+            && rsp
+                .checked_add(8 * (pops + 1))
+                .is_some_and(|top| top <= end))
 }
 
 /// The class of a time in nanoseconds: four to a power of two (the
