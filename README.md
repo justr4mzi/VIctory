@@ -1,9 +1,21 @@
-# `justr4mzi/VIctory` — `v11-ready` RX 6700 XT Edition (`AI-assisted`)
+# `justr4mzi/VIctory` — `v12-ready` RX 6700 XT Edition (`AI-assisted`)
 
-> **Personal fork (`AI-assisted`)** built on [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) (`d510ee4a`), curated PRs (`#768`, `#901`–`#903`, `#927`, `#948`, `#951`, `#957`, `#959` audio, `#989`, `#1002`, `#1005`–`#1068`), upstream `Marvisak/VIctory` shader fixes (`4015a182`, `a1a2077a`, `da82e444`), and validated `!cfg!(test)` defaults for **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64) + 48 GB RAM**.
-> Previous milestones are preserved on `backup-v6-final`, `backup-v7-final`, `backup-v8-final`, `backup-v9-base2`, and `v10-final`.
+> **Personal fork (`AI-assisted`)** built on `v11-ready` / [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork), adding curated community PRs (`#798`, `#1069`, `#1078`, `#1080`, `#1081`, `#1082`, `#1086`, `#1093`, `#1094`, `#1096`, `#1097`, `#1102`, `#1104`, upstream `mv#2723`), RDNA2 memory/descriptor tuning, and validated `!cfg!(test)` defaults for **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64) + 48 GB RAM**.
+> Previous milestones are preserved on `backup-v6-final`, `backup-v7-final`, `backup-v8-final`, `backup-v9-base2`, `v10-final`, and `v11-ready`.
 > Full changelog and PR comparison ledger: see **[FORK.md](FORK.md)**.
-> Zero game files, assets, filenames, hashes, or offsets are included (`cargo xtask policy`: **199 files ok**).
+> Zero game files, assets, filenames, hashes, or offsets are included (`cargo xtask policy`: **205 files ok**).
+
+## `v12` Highlights & Verified Checks (`v12-ready`, `v12-rx6700xt`)
+
+- **Workspace & GPU tests:**
+  - `cargo test --workspace -- --test-threads=1`: **749 passed, 0 failed, 19 ignored**.
+  - `cargo test -p victory-gpu --features diagnostics -- --test-threads=1`: **277 passed, 0 failed, 11 ignored**.
+  - `cargo xtask policy`: **205 files ok** (`lower.rs` = `504,741` B <= `524,288` B without changing `xtask/src/policy.rs`).
+- **Release build (Thin LTO + `codegen-units = 1`):** `8,985,088` B (`SHA-256: D0266814F7085A7229FAC325A78FAE41616038FD8CCCA074807F489CE3164CEB`).
+- **Key improvements over `v11-ready`:**
+  - **Wave A (`0297ada2`):** `VICTORY_PLACED_TEX=1` (`placed.rs`), `skip_tabled_buffers` + `entry.null_buf` (`descriptor/host.rs`), Series S two-plane compositor (`over.rs`), `mv#2723` `(u32, u32)` handle keys, and `fx#1096` `sampler_choice`.
+  - **Wave B (`28ec55d9`):** `#1069` `Section::committed` bitset + `VICTORY_REMAP_LEAN=1`, `#1102` `VICTORY_JOURNAL_UNLOCKED=1`, `#1086` re-entrant `REMAPPING` & `VICTORY_REMAP_BATCH=1`, `#1078` `VICTORY_TEXTURE_SHORT_HOLD=1`, `#1097` `PLACEHOLDERS` / `VICTORY_PLACEHOLDER_FAST=1` / `VICTORY_HOT_GUARD=1` / `bake_room()`, `#1094` `mask_runs`, `#1104` `GetAsyncKeyState` low-bit tap + `VICTORY_KEYS_HOLD_MS`.
+  - **Wave C (`65ca7980`):** `VICTORY_STAGING_BLOCKS=1` shared suballocation (`texture.rs`), `VICTORY_DYNAMIC_SLOTS=1` (`1 << 19` = 524,288 slots on uncapped heaps), `#1080` VRAM idle eviction fix (`placed::free_bytes()`, `VICTORY_TEXTURE_IDLE_MS`, 15 s default under `<80%` budget), `#1082` `VICTORY_MEMORY_RECLAIM` copy quarantine/reuse (`memory.rs`), `#798` policy-clean `PreparedImage::patch` (`VICTORY_TITLE_PATCH`, `KNOWN_BUILDS = &[]`), `#1093` opt-in `VICTORY_AMBIENT` pass (`ambient.rs`), `ranges.rs`, and `emit/lower/valu16.rs` split + `#1096` / `mv#2723` tests.
 
 ## `v11` Highlights & Verified Checks
 

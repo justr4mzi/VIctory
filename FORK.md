@@ -1,8 +1,23 @@
-# Fork: `justr4mzi/VIctory` (`v11-ready` RX 6700 XT Edition, AI-assisted)
+# Fork: `justr4mzi/VIctory` (`v12-ready` RX 6700 XT Edition, AI-assisted)
 
-Personal fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (rebased onto [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) through `d510ee4a` with curated community PRs `#768`, `#901`–`#903`, `#927`, `#948`, `#951`, `#957`, `#959` audio, `#989`, `#1002`, `#1005`–`#1068`, upstream `Marvisak` shader fixes `4015a182` / `a1a2077a` / `da82e444`, and local RX 6700 XT fixes). Branches `v11-rx6700xt`, `v9-rx6700xt`, `ultimate-rx6700xt`, and `main` target **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64)** with 48 GB system RAM.
+Personal fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (built atop `v11-ready` / [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) with curated PRs `#798`, `#1069`, `#1078`, `#1080`, `#1081`, `#1082`, `#1086`, `#1093`, `#1094`, `#1096`, `#1097`, `#1102`, `#1104`, upstream `mv#2723`, and local RX 6700 XT / Ryzen 5 5600 tuning). Branches `v12-rx6700xt`, `v11-rx6700xt`, `v9-rx6700xt`, `ultimate-rx6700xt`, and `main` target **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64)** with 48 GB system RAM.
 
-Nothing here is upstream-approved; please direct upstream feedback to the original repositories and PR authors. **Zero game data, filenames, executables, hashes, or offsets are included** (`cargo xtask policy` verified: **`199 files ok`**). This fork, its conflict resolutions, and its local fixes/defaults are **AI-assisted**.
+Nothing here is upstream-approved; please direct upstream feedback to the original repositories and PR authors. **Zero game data, filenames, executables, hashes, or offsets are included** (`cargo xtask policy` verified: **`205 files ok`**). This fork, its conflict resolutions, and its local fixes/defaults are **AI-assisted**.
+
+## `v12` (`v12-ready`, `v12-rx6700xt`) Changelog & Verification
+
+- **Verified offline tests (`cargo test --workspace -- --test-threads=1`):** **749 passed, 0 failed, 19 ignored** (`victory-gpu --features diagnostics`: **277 passed, 0 failed, 11 ignored**; `cargo xtask policy`: **205 files ok**; `lower.rs`: `504,741` B <= `524,288` B).
+- **Release build (Thin LTO, `codegen-units = 1`):** `8,985,088` B (`SHA-256: D0266814F7085A7229FAC325A78FAE41616038FD8CCCA074807F489CE3164CEB`).
+- **Wave A (`0297ada2`):** `VICTORY_PLACED_TEX=1` (`placed.rs`), `skip_tabled_buffers` + `entry.null_buf` (`descriptor/host.rs`), Series S two-plane compositor (`over.rs`, wired into `host.rs` & `queue.rs`), `mv#2723` `(u32, u32)` handle keys, and `fx#1096` `sampler_choice`.
+- **Wave B (`28ec55d9`):** `#1069` `Section::committed` bitset + `VICTORY_REMAP_LEAN=1`, `#1102` `VICTORY_JOURNAL_UNLOCKED=1`, `#1086` re-entrant `REMAPPING` & `VICTORY_REMAP_BATCH=1`, `#1078` `VICTORY_TEXTURE_SHORT_HOLD=1`, `#1097` `PLACEHOLDERS` / `VICTORY_PLACEHOLDER_FAST=1` / `VICTORY_HOT_GUARD=1` / `bake_room()`, `#1094` `mask_runs`, and `#1104` `GetAsyncKeyState` low-bit tap + `VICTORY_KEYS_HOLD_MS`.
+- **Wave C (`65ca7980`):**
+  - `texture.rs`: `VICTORY_STAGING_BLOCKS=1` shared suballocation (`cut_from_blocks`, `staging_buffer_alone`).
+  - `descriptor/host.rs`: `VICTORY_DYNAMIC_SLOTS=1` (`1 << 19` = 524,288 slots on uncapped heaps before `null`).
+  - `resource.rs` (`#1080`): subtract `placed::free_bytes()` from `vm[1]` before `vram_idle_ms()`, add `VICTORY_TEXTURE_IDLE_MS`, raise normal `<80%` default to `15_000` ms outside `cfg!(test)`.
+  - `memory.rs` (`#1082`): copy reclamation & `QUARANTINE = 8` (`VICTORY_MEMORY_RECLAIM`).
+  - `victory-loader/src/prepare.rs` + `apps/victory/src/run.rs` (`#798`): policy-clean `PreparedImage::patch` + `VICTORY_TITLE_PATCH` (`KNOWN_BUILDS = &[]`).
+  - `ambient.rs` + `pipeline.rs` + `draw.rs` (`#1093`): opt-in indirect-light pass (`VICTORY_AMBIENT`).
+  - `ranges.rs` (`#1097`), plus `emit/lower/valu16.rs` extraction (`lower.rs` down to `504,741` B) & `fx#1096` / `mv#2723` shader tests.
 
 ## `v11` (`v11-ready`, `50b537b4`) Changelog & Verification
 
