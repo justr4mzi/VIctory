@@ -1075,12 +1075,20 @@ fn read_back(
         return Err("a destination corner other than the footprint's");
     }
     let host = crate::host::host().ok_or("no host")?;
-    let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
-    // The title's buffer holds every row at its own pitch.
-    let bytes = pitch * (rows - 1) + row;
-    let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
+    // SAFETY: a non-null source box passed to CopyTextureRegion names six dwords.
+    let extent = match unsafe { source_box.as_ref() } {
+        Some(&[left, top, front, right, bottom, back]) => Some([
+            right.checked_sub(left).ok_or("reversed source box")?,
+            bottom.checked_sub(top).ok_or("reversed source box")?,
+            back.checked_sub(front).ok_or("reversed source box")?,
+        ]),
+        None => None,
+    };
+    let (footprint, layout) = dst.footprint.read_back_layout(extent).ok_or("an invalid read-back footprint")?;
+    let data = buffer_range(dst.resource, dst.footprint.offset, layout.dst_bytes)
+        .ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
-    let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
+    let buffer = host.read_back_buffer(layout.host_bytes).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
@@ -1097,8 +1105,9 @@ fn read_back(
     #[cfg(feature = "diagnostics")]
     list.note_op(|| {
         format!(
-            "read back of {:?} sub {} into buffer {:?}+{:#x}: {rows} rows of {row} bytes",
-            src.resource, src.footprint.offset as u32, dst.resource, dst.footprint.offset
+            "read back of {:?} sub {} into buffer {:?}+{:#x}: {} rows of {} bytes",
+            src.resource, src.footprint.offset as u32, dst.resource, dst.footprint.offset,
+            layout.rows_per_slice * layout.slices, layout.row
         )
     });
     // SAFETY: an open list; both locations in the host's layout (asserted
@@ -1108,7 +1117,7 @@ fn read_back(
         list.list
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
     };
-    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize]);
+    list.defer_read_back(buffer, data, layout);
     Ok(())
 }
 
@@ -2218,5 +2227,109 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn partial_texture_read_back_preserves_destination_bytes_outside_the_box() {
+        use crate::resource::PlacedFootprint;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_DESC,
+            D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+        };
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+
+        let iid = crate::object::guid(
+            0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+            ..Default::default()
+        };
+        let buffer = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 1024,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_UNKNOWN,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let texture = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..buffer
+        };
+        let create = |desc: &D3D12_RESOURCE_DESC| {
+            let mut resource = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null, (&raw const heap).cast(), 0, std::ptr::from_ref(desc).cast(),
+                    0, null.cast(), &iid, &mut resource,
+                ),
+                S_OK
+            );
+            resource
+        };
+        let src = create(&buffer);
+        let dst = create(&buffer);
+        let texture = create(&texture);
+        let (src_data, _) = crate::resource::buffer_bytes(src).unwrap();
+        let (dst_data, _) = crate::resource::buffer_bytes(dst).unwrap();
+        // SAFETY: both title buffers span 1024 writable bytes.
+        unsafe {
+            for row in 0..4 {
+                for byte in 0..16 {
+                    src_data.add(row * 256 + byte).write((row * 16 + byte) as u8);
+                }
+            }
+            dst_data.write_bytes(0xa5, 1024);
+        }
+
+        let to_texture = CopyLocation { resource: texture, kind: 0, footprint: PlacedFootprint::new(0, 0, 0, 0, 0, 0) };
+        let from_buffer = CopyLocation { resource: src, kind: 1, footprint: PlacedFootprint::new(0, 28, 4, 4, 1, 256) };
+        let to_buffer = CopyLocation { resource: dst, kind: 1, footprint: PlacedFootprint::new(0, 28, 4, 4, 1, 64) };
+        copy_texture_region(list, &to_texture, 0, 0, 0, &from_buffer, null.cast());
+        let region = [1, 1, 0, 3, 3, 1];
+        copy_texture_region(list, &to_buffer, 0, 0, 0, &to_texture, &region);
+        assert_eq!(close(list), S_OK);
+        host.execute(&[host_list(list).expect("host list")]);
+
+        // SAFETY: the list completed and the destination spans 1024 bytes.
+        for (offset, &byte) in unsafe { std::slice::from_raw_parts(dst_data, 1024) }.iter().enumerate() {
+            let (row, column) = (offset / 64, offset % 64);
+            let expected = if row < 2 && column < 8 {
+                ((row + 1) * 16 + 4 + column) as u8
+            } else {
+                0xa5
+            };
+            assert_eq!(byte, expected, "destination byte {offset}");
+        }
+
+        let release = |object: This| slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        for object in [list, allocator, texture, src, dst] {
+            assert_eq!(release(object), 0);
+        }
     }
 }

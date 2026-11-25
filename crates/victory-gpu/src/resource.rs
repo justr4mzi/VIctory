@@ -661,6 +661,11 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    #[cfg(all(windows, test))]
+    pub(crate) const fn new(offset: u64, format: u32, width: u32, height: u32, depth: u32, row_pitch: u32) -> Self {
+        Self { offset, format, width, height, depth, row_pitch }
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
@@ -669,24 +674,62 @@ impl PlacedFootprint {
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
 
-    /// For a read back through a host buffer: this footprint at offset 0
-    /// with its rows pitched as the host wants them (multiples of 256
-    /// bytes), then the bytes that buffer needs, the bytes of a row, the
-    /// rows, and the title's own pitch.
-    pub(crate) fn host_rows(&self) -> Option<(PlacedFootprint, [u64; 4])> {
+    /// The staging footprint and the rows covered by a texture read-back.
+    #[cfg(windows)]
+    pub(crate) fn read_back_layout(&self, extent: Option<[u32; 3]>) -> Option<(Self, ReadBackLayout)> {
+        let [width, height, depth] = extent.unwrap_or([self.width, self.height, self.depth]);
+        if width == 0 || height == 0 || depth == 0
+            || width > self.width || height > self.height || depth > self.depth
+        {
+            return None;
+        }
         let (element, block) = element(self.format)?;
-        let lines = (u64::from(self.height).div_ceil(block) * u64::from(self.depth)).max(1);
-        let row = u64::from(self.width).div_ceil(block) * element;
-        let pitch = row.max(1).next_multiple_of(256);
-        let host = PlacedFootprint {
+        let row = u64::from(width).div_ceil(block) * element;
+        let dst_pitch = u64::from(self.row_pitch);
+        if row > dst_pitch {
+            return None;
+        }
+        let rows_per_slice = u64::from(height).div_ceil(block);
+        let dst_slice_pitch = dst_pitch.checked_mul(u64::from(self.height).div_ceil(block))?;
+        let host_pitch = row.next_multiple_of(256);
+        let host_bytes = host_pitch.checked_mul(rows_per_slice)?.checked_mul(u64::from(depth))?;
+        let dst_bytes = dst_slice_pitch.checked_mul(u64::from(depth) - 1)?
+            .checked_add(dst_pitch.checked_mul(rows_per_slice - 1)?)?
+            .checked_add(row)?;
+        let staging = Self {
             offset: 0,
-            row_pitch: u32::try_from(pitch).ok()?,
+            width,
+            height,
+            depth,
+            row_pitch: u32::try_from(host_pitch).ok()?,
             ..*self
         };
-        Some((host, [pitch * lines, row, lines, u64::from(self.row_pitch)]))
+        Some((staging, ReadBackLayout {
+            row: usize::try_from(row).ok()?,
+            rows_per_slice: usize::try_from(rows_per_slice).ok()?,
+            slices: depth as usize,
+            host_pitch: usize::try_from(host_pitch).ok()?,
+            dst_pitch: self.row_pitch as usize,
+            dst_slice_pitch: usize::try_from(dst_slice_pitch).ok()?,
+            host_bytes,
+            dst_bytes,
+        }))
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
+
+/// Destination span and row strides for a texture read-back at the footprint origin.
+#[cfg(windows)]
+pub(crate) struct ReadBackLayout {
+    pub(crate) row: usize,
+    pub(crate) rows_per_slice: usize,
+    pub(crate) slices: usize,
+    pub(crate) host_pitch: usize,
+    pub(crate) dst_pitch: usize,
+    pub(crate) dst_slice_pitch: usize,
+    pub(crate) host_bytes: u64,
+    pub(crate) dst_bytes: u64,
+}
 
 const NO_FOOTPRINT: PlacedFootprint = PlacedFootprint {
     offset: u64::MAX,

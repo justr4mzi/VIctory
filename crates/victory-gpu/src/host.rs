@@ -1844,7 +1844,7 @@ struct Deferred {
     /// has run: the host buffer the list copies the texels into, the title
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
-    backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    backs: Vec<(ID3D12Resource, usize, crate::resource::ReadBackLayout)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -2999,7 +2999,7 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+    for (buffer, at, layout) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -3007,19 +3007,27 @@ fn read_backs(list: &HostList) {
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
-                for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                for slice in 0..layout.slices {
+                    let src = from.add(slice * layout.rows_per_slice * layout.host_pitch);
+                    let dst = (*at as *mut u8).add(slice * layout.dst_slice_pitch);
+                    for line in 0..layout.rows_per_slice {
+                        std::ptr::copy_nonoverlapping(
+                            src.add(line * layout.host_pitch),
+                            dst.add(line * layout.dst_pitch),
+                            layout.row,
+                        );
+                    }
                 }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
-                if walls_trace() && *rows == 1 && *row <= 96 {
+                if walls_trace() && layout.slices == 1 && layout.rows_per_slice == 1 && layout.row <= 96 {
                     let mut values = [0f32; 24];
-                    std::ptr::copy_nonoverlapping(from, values.as_mut_ptr().cast::<u8>(), *row & !3);
+                    std::ptr::copy_nonoverlapping(from, values.as_mut_ptr().cast::<u8>(), layout.row & !3);
                     tracing::info!(
                         frame = crate::frame::current(),
                         to = format_args!("{:#x}", *at),
-                        bytes = *row,
-                        values = ?&values[..*row / 4],
+                        bytes = layout.row,
+                        values = ?&values[..layout.row / 4],
                         "walls trace: a read-back lands in title memory"
                     );
                 }
@@ -5612,12 +5620,10 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
-    /// A read back: once the list has run, `rows` rows of `row` bytes go
-    /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
-    /// to title memory at `dst`, pitched `pitch`. The buffer lives until
-    /// the list is reset.
-    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
-        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    /// After the list has run, copy the read-back region to the title's
+    /// footprint. The read-back buffer lives until the list is reset.
+    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, layout: crate::resource::ReadBackLayout) {
+        self.deferred().backs.push((buffer, dst as usize, layout));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
