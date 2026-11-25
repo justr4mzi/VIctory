@@ -1834,8 +1834,21 @@ fn back_piece(
     if differs == 0 {
         return None;
     }
+    mask_runs(mask, runs);
+    Some((first, n))
+}
+
+/// The runs of `mask`'s non-zero bytes, as (offset, length), into `runs`;
+/// stretches of zero words are passed over a word at a time. Where a
+/// shader wrote here and there in a piece, most of its mask is zeros.
+fn mask_runs(mask: &[u8], runs: &mut Vec<(usize, usize)>) {
+    let n = mask.len();
+    let zero_word = |i: usize| i + 8 <= n && mask[i..i + 8] == [0; 8];
     let mut i = 0;
     while i < n {
+        while zero_word(i) {
+            i += 8;
+        }
         while i < n && mask[i] == 0 {
             i += 1;
         }
@@ -1847,7 +1860,6 @@ fn back_piece(
             runs.push((start, i - start));
         }
     }
-    Some((first, n))
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
@@ -2366,6 +2378,41 @@ mod stale_tests {
         assert_eq!(stale_pages_in(base, &copied, 0, at(0x101) + 8, at(0x101) + 16, &[]), [0x101]);
         assert!(stale_pages_in(base, &copied, 0, at(0x104), at(0x106), &[(0x104, 9)]).is_empty());
     }
+}
+
+/// Lightweight release-mode breakdown of `Shadow::update_free` per frame:
+/// [0] `watch::writes` microseconds, [1] `copy_stale` microseconds,
+/// [2] `unwatched` whole-copy microseconds, [3] refresh calls.
+static REFRESH_BREAKDOWN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn refresh_breakdown_line(frames: f64) {
+    let [watch_us, copy_us, whole_us, calls] = [0, 1, 2, 3].map(|i| REFRESH_BREAKDOWN[i].swap(0, Ordering::Relaxed));
+    let [ph_watch, ph_absent, ph_tex] =
+        [0, 1, 2].map(|i| crate::inplace::PLACEHOLDER_HITS[i].swap(0, Ordering::Relaxed));
+    let [gww_us, gww_n, g_scan_us, g_prot_us, vp_n, hot_skips] =
+        [0, 1, 2, 3, 4, 5].map(|i| crate::watch::WATCH_TIMING[i].swap(0, Ordering::Relaxed));
+    if calls == 0 && ph_watch + ph_absent + ph_tex == 0 {
+        return;
+    }
+    tracing::info!(
+        "refresh breakdown per frame: watch {:.1} ms (gww {:.1} ms/{:.0}, guard_scan {:.1} ms, guard_prot {:.1} ms/{:.0} vp, hot_skip {:.0}), \
+         copy_stale {:.1} ms, whole {:.1} ms ({:.0} calls); \
+         placeholder fast-path skips (VICTORY_PLACEHOLDER_FAST={}): watch {:.0}, absent {:.0}, tex_query {:.0}",
+        watch_us as f64 / 1e3 / frames,
+        gww_us as f64 / 1e3 / frames,
+        gww_n as f64 / frames,
+        g_scan_us as f64 / 1e3 / frames,
+        g_prot_us as f64 / 1e3 / frames,
+        vp_n as f64 / frames,
+        hot_skips as f64 / frames,
+        copy_us as f64 / 1e3 / frames,
+        whole_us as f64 / 1e3 / frames,
+        calls as f64 / frames,
+        u8::from(crate::inplace::placeholder_fast()),
+        ph_watch as f64 / frames,
+        ph_absent as f64 / frames,
+        ph_tex as f64 / frames,
+    );
 }
 
 /// Copies of windows outside buffers let go since the start, and their
@@ -3412,13 +3459,18 @@ impl Shadow {
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             let floor = self.all_copied.load(Ordering::Relaxed);
+            let t0 = std::time::Instant::now();
             let ask = if floor > 0 {
                 crate::watch::writes_since(from, to, true, floor)
             } else {
                 crate::watch::writes(from, to, true)
             };
+            let watch_us = t0.elapsed().as_micros() as u64;
+            REFRESH_BREAKDOWN[0].fetch_add(watch_us, Ordering::Relaxed);
             if let Some((now, written)) = ask {
+                REFRESH_BREAKDOWN[3].fetch_add(1, Ordering::Relaxed);
                 self.watched.store(1, Ordering::Relaxed);
+                let t1 = std::time::Instant::now();
                 let copied = if floor > 0 {
                     if written.is_empty() {
                         if from == self.start as usize && to == (self.start + self.len) as usize {
@@ -3431,6 +3483,7 @@ impl Shadow {
                 } else {
                     self.copy_stale(from, to, now, &written)
                 };
+                REFRESH_BREAKDOWN[1].fetch_add(t1.elapsed().as_micros() as u64, Ordering::Relaxed);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3444,11 +3497,13 @@ impl Shadow {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
-        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
+        let whole_us = started.elapsed().as_micros() as u64;
+        REFRESH_BREAKDOWN[2].fetch_add(whole_us, Ordering::Relaxed);
+        REFRESH_BREAKDOWN[3].fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
+        crate::copystat::whole(from, to - from, whole_us);
         to - from
     }
 
@@ -4757,4 +4812,84 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod mask_runs_tests {
+    use super::mask_runs;
+
+    fn runs_bytes(mask: &[u8]) -> Vec<(usize, usize)> {
+        let (n, mut runs, mut i) = (mask.len(), Vec::new(), 0);
+        while i < n {
+            while i < n && mask[i] == 0 {
+                i += 1;
+            }
+            let start = i;
+            while i < n && mask[i] != 0 {
+                i += 1;
+            }
+            if i > start {
+                runs.push((start, i - start));
+            }
+        }
+        runs
+    }
+
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn word_search_finds_the_byte_runs() {
+        let mut state = 0x2545_f491_4f6c_dd1d;
+        let lens: Vec<usize> = (0..=40).chain([63, 64, 65, 4095, 4096, 65536]).collect();
+        for &len in &lens {
+            for density in [1u64, 2, 7, 64, 4096] {
+                for _ in 0..50 {
+                    let mask: Vec<u8> = (0..len)
+                        .map(|_| {
+                            if next(&mut state).is_multiple_of(density) {
+                                (next(&mut state) as u8) | 1
+                            } else {
+                                0
+                            }
+                        })
+                        .collect();
+                    let mut runs = Vec::new();
+                    mask_runs(&mask, &mut runs);
+                    assert_eq!(runs, runs_bytes(&mask), "length {len}, density {density}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn mask_runs_speed() {
+        const N: usize = 64 << 10;
+        for (name, every) in [
+            ("all bytes written", 1usize),
+            ("every 16th dword", 64),
+            ("1 byte per 4 KiB", 4096),
+        ] {
+            let mask: Vec<u8> = (0..N).map(|i| u8::from(i.is_multiple_of(every))).collect();
+            let time = |f: &dyn Fn(&[u8]) -> usize| {
+                let start = std::time::Instant::now();
+                for _ in 0..4000 {
+                    std::hint::black_box(f(std::hint::black_box(&mask)));
+                }
+                (4000 * N) as f64 / start.elapsed().as_secs_f64() / 1e9
+            };
+            let bytes = time(&|m| runs_bytes(m).len());
+            let words = time(&|m| {
+                let mut r = Vec::new();
+                mask_runs(m, &mut r);
+                r.len()
+            });
+            eprintln!("{name}: byte by byte {bytes:.2} GB/s, by words {words:.2} GB/s");
+        }
+    }
 }

@@ -1171,8 +1171,13 @@ mod host {
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                    // Down now, or pressed since the last look (the low bit): a title that
+                    // asks once a frame at a frame a second still sees a tap between two asks.
                     // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                    .filter(|&vk| {
+                        let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
+                        state < 0 || state & 1 != 0
+                    })
                     .collect();
                 down.extend(held);
             } else {
@@ -1272,7 +1277,8 @@ mod host {
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus, and
+    /// 0.2 s (`VICTORY_KEYS_HOLD_MS`: that long instead, for runs at a frame a
+    /// second) that long after input starts, with or without focus, and
     /// `VICTORY_KEYS_FILE=<path>` polls a command file every 200 ms for
     /// `<key>` (250 ms hold) or `<key>:<ms>` tokens and clears it after reading.
     #[cfg(feature = "diagnostics")]
@@ -1289,6 +1295,10 @@ mod host {
             });
             (Instant::now(), keys.collect())
         });
+        static HOLD: LazyLock<Duration> = LazyLock::new(|| {
+            let ms = std::env::var("VICTORY_KEYS_HOLD_MS").ok().and_then(|v| v.parse().ok());
+            Duration::from_millis(ms.unwrap_or(200))
+        });
         static FILE: LazyLock<Option<(std::path::PathBuf, std::sync::Mutex<FileKeys>)>> =
             LazyLock::new(|| {
                 let path = std::env::var_os("VICTORY_KEYS_FILE")?;
@@ -1301,7 +1311,7 @@ mod host {
         let now = start.elapsed();
         let mut out: Vec<u8> = keys
             .iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+            .filter(|&&(at, _)| (at..at + *HOLD).contains(&now))
             .map(|&(_, vk)| vk)
             .collect();
         if let Some((path, state)) = &*FILE {

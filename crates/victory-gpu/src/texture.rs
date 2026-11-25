@@ -649,6 +649,21 @@ fn through_copy() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COPY").is_some_and(|v| v == "1"))
 }
 
+/// Whether a texture refresh lets title memory move again as soon as it has
+/// copied the texture's bytes out (`VICTORY_TEXTURE_SHORT_HOLD=1`, default on
+/// outside tests; `=0` disables), and hashes and detiles the copy after.
+fn short_hold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_TEXTURE_SHORT_HOLD").map_or(!cfg!(test), |v| v != "0")
+    })
+}
+
+/// Lets title memory move again ([`short_hold`]).
+fn hold_no_more(mapped: &mut Option<crate::watch::Reading>) {
+    drop(mapped.take());
+}
+
 /// Calls `f` with the `size` bytes of title memory at `memory`, read
 /// through the kernel into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
@@ -1240,7 +1255,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let mut mapped = Some(if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -1250,7 +1265,9 @@ impl Staging {
             mapped
         } else {
             waited(2, crate::watch::title_memory_reading)
-        };
+        });
+        // With `short_hold`: let go as soon as the bytes are copied out.
+        let short = short_hold();
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1268,6 +1285,9 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                if short {
+                    hold_no_more(&mut mapped);
+                }
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1286,6 +1306,24 @@ impl Staging {
             let _ = changed;
             return size;
         }
+        if through_copy() && short {
+            return with_read(size, |tiled| {
+                crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+                hold_no_more(&mut mapped);
+                let tiled = &*tiled;
+                let hash = blake3::hash(tiled);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                if last.hash == Some(hash) {
+                    return size;
+                }
+                last.hash = Some(hash);
+                self.detile(tiled);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                size
+            });
+        }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
@@ -1301,8 +1339,29 @@ impl Staging {
                 size
             });
         }
+        if short {
+            return with_read(size, |copy| {
+                // SAFETY: committed memory of the texture's layout size, and
+                // it stays committed while `mapped` is held, until the copy
+                // is done.
+                unsafe { std::ptr::copy_nonoverlapping(self.memory, copy.as_mut_ptr(), size) };
+                hold_no_more(&mut mapped);
+                let copy = &*copy;
+                let hash = blake3::hash(copy);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                if last.hash == Some(hash) {
+                    return size;
+                }
+                last.hash = Some(hash);
+                self.detile(copy);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                size
+            });
+        }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
@@ -1481,11 +1540,14 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
-    if by_query() {
-        return committed_by_query(at, len);
-    }
     if len == 0 {
         return true;
+    }
+    if let Some(mapped) = crate::inplace::placeholder_mapped_bytes(at as usize, len) {
+        return mapped == len as u64;
+    }
+    if by_query() {
+        return committed_by_query(at, len);
     }
     let (there, of) = readable(at as usize, len, true);
     there == of
@@ -1578,6 +1640,9 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
     let start = at as usize;
+    if let Some(mapped) = crate::inplace::placeholder_mapped_bytes(start, len) {
+        return mapped;
+    }
     let end = start.saturating_add(len);
     if start >= end {
         return 0;
@@ -1759,6 +1824,97 @@ mod remap_tests {
 #[cfg(test)]
 mod title_memory_tests {
     use super::{mapped_bytes, with_title};
+
+    #[test]
+    fn a_refresh_detiles_what_title_memory_holds() {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+        use windows_sys::Win32::System::Memory::*;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        const SIDE: u32 = 256;
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: SIDE,
+            height: SIDE,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_S,
+        })
+        .expect("a layout");
+        let size = layout.size as usize;
+        let (pitch, rows) = (SIDE as usize * 4, SIDE as usize);
+        let total = (pitch * rows) as u64;
+        // SAFETY: memory of our own, freed at the end; the staging buffer
+        // holds `total` bytes.
+        unsafe {
+            let memory = VirtualAlloc(std::ptr::null(), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!memory.is_null());
+            let fill = |seed: u8| {
+                let bytes = std::slice::from_raw_parts_mut(memory, size);
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    *b = (i as u8).wrapping_mul(31) ^ (i >> 8) as u8 ^ seed;
+                }
+            };
+            fill(0);
+            let (buffer, data, pooled) = staging_buffer(host, total).expect("a staging buffer");
+            STAGED[0].fetch_add(1, Ordering::Relaxed);
+            STAGED[1].fetch_add(total, Ordering::Relaxed);
+            let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    Width: SIDE,
+                    Height: SIDE,
+                    Depth: 1,
+                    RowPitch: pitch as u32,
+                },
+            };
+            let staging = Staging {
+                buffer,
+                #[cfg(feature = "diagnostics")]
+                size: total,
+                data,
+                footprints: vec![footprint],
+                rows: vec![SIDE],
+                layout: layout.clone(),
+                mips: 1,
+                drop: 0,
+                bytes: total,
+                memory,
+                last: Mutex::default(),
+                dirty: AtomicBool::new(true),
+                uploaded: AtomicBool::new(false),
+                used: AtomicU64::new(0),
+                on_demand: false,
+                detiled: AtomicU32::new(0),
+                judged: [const { AtomicU64::new(0) }; 2],
+                waiting: AtomicU64::new(0),
+                pooled,
+            };
+            let expected = || {
+                let mut linear = vec![0u8; total as usize];
+                layout
+                    .detile(std::slice::from_raw_parts(memory, size), 0, 0, &mut linear, pitch, total as usize)
+                    .expect("detiled");
+                linear
+            };
+            let staged = || std::slice::from_raw_parts(data, total as usize).to_vec();
+            staging.refresh();
+            assert!(staged() == expected(), "the first refresh");
+            fill(0x5a);
+            staging.refresh();
+            assert!(staged() == expected(), "a refresh after a write");
+            drop(staging);
+            assert_ne!(VirtualFree(memory.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 
     #[test]
     fn a_streamed_mip_can_be_mapped_between_two_unmapped_ends() {

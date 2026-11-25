@@ -1594,6 +1594,16 @@ pub(crate) fn room() -> bool {
     }
 }
 
+/// Room check used ONLY during one-time character decoration bakes
+/// (`PS_BakeDecorations_*`, `draw.rs` `early_textures`).
+#[cfg(windows)]
+pub(crate) fn bake_room() -> bool {
+    match crate::host::host().and_then(|h| h.video_memory()) {
+        Some([budget, used, ..]) => used < budget / 100 * 97,
+        None => true,
+    }
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
 /// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as

@@ -1646,21 +1646,46 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
-    let mut ok = true;
     let batch = crate::resource::batch_page_mappings();
-    for b in batches.into_iter().flatten() {
-        if b.ranges.is_null() {
-            continue;
-        }
-        // SAFETY: each batch holds `count` ranges.
-        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
-        ok &= copy_page_ranges(ranges, b.destination, pool, pool_pages, batch, map);
-    }
+    let ok = map_batches(remap_batch(), batches.unwrap_or(&[]), pool, pool_pages, batch, map);
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
     S_OK
+}
+
+/// Whether one call's page mappings hold title memory still once, for all
+/// of them (`VICTORY_REMAP_BATCH=1`, default on outside tests; `=0` disables).
+fn remap_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_REMAP_BATCH").map_or(!cfg!(test), |v| v != "0")
+    })
+}
+
+/// Maps `batches` with `map` (`(to, from, len)`, `from` 0 unmaps), as
+/// [`copy_page_mappings`] does; with `hold`, title memory held still once
+/// around all of them ([`remap_batch`]). False if a mapping failed.
+fn map_batches(
+    hold: bool,
+    batches: &[PageBatch],
+    pool: u64,
+    pool_pages: u32,
+    batch: bool,
+    mut map: impl FnMut(u64, u64, u64) -> bool,
+) -> bool {
+    let _held = hold.then(crate::watch::title_memory_remapping);
+    let mut ok = true;
+    for b in batches {
+        if b.ranges.is_null() {
+            continue;
+        }
+        // SAFETY: each batch holds `count` ranges.
+        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+        ok &= copy_page_ranges(ranges, b.destination, pool, pool_pages, batch, &mut map);
+    }
+    ok
 }
 
 /// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
@@ -1881,5 +1906,100 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::{PAGE, PageBatch, PageRange, map_batches};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_batch_maps_the_same_pages_held_once_or_page_by_page() {
+        let ranges = [
+            PageRange { kind: 0, start: 2, count: 3 },
+            PageRange { kind: 1, start: 7, count: 2 },
+            PageRange { kind: 2, start: 0, count: 1 },
+            PageRange { kind: 3, start: 0, count: 4 },
+            PageRange { kind: 0, start: 9, count: 1 },
+        ];
+        let (dest, pool) = (0x10_0000_0000u64, 0x20_0000_0000u64);
+        let batches = [PageBatch { destination: dest, count: ranges.len() as u32, ranges: ranges.as_ptr() }];
+        let expected = vec![
+            (dest, pool + 2 * PAGE, 3 * PAGE),
+            (dest + 3 * PAGE, pool + 7 * PAGE, PAGE),
+            (dest + 4 * PAGE, pool + 7 * PAGE, PAGE),
+            (dest + 5 * PAGE, 0, PAGE),
+            (dest + 10 * PAGE, pool + 9 * PAGE, PAGE),
+        ];
+        for hold in [false, true, false] {
+            let seen = Mutex::new(Vec::new());
+            let map = |to, from, len| {
+                let _changing = crate::watch::title_memory_remapping();
+                assert!(crate::watch::title_memory_reading_now().is_none(), "a read began during a remap");
+                seen.lock().unwrap().push((to, from, len));
+                true
+            };
+            assert!(map_batches(hold, &batches, pool, 16, false, map));
+            assert_eq!(*seen.lock().unwrap(), expected, "hold {hold}");
+        }
+        let bad = [PageRange { kind: 0, start: 15, count: 2 }];
+        let batches = [PageBatch { destination: dest, count: 1, ranges: bad.as_ptr() }];
+        assert!(!map_batches(true, &batches, pool, 16, false, |_, _, _| true));
+    }
+
+    fn spin(us: u64) {
+        let until = Instant::now() + Duration::from_micros(us);
+        while Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+
+    #[test]
+    #[ignore = "a measurement: run by hand"]
+    fn what_a_batch_of_page_mappings_waits_for_beside_texture_refreshes() {
+        const PAGES: u32 = 850;
+        let ranges: Vec<PageRange> = (0..PAGES).map(|i| PageRange { kind: 0, start: i, count: 1 }).collect();
+        let batches = [PageBatch { destination: 0x10_0000_0000, count: PAGES, ranges: ranges.as_ptr() }];
+        let map = |_, _, _| {
+            let _changing = crate::watch::title_memory_remapping();
+            spin(5);
+            true
+        };
+        println!();
+        println!("{:<28} {:>14} {:>14} {:>9}", "texture refreshes hold", "page by page", "held once", "faster");
+        for (what, hold_us) in [("~2 ms (today)", 2_000u64), ("~0.3 ms (SHORT_HOLD)", 300)] {
+            let mut row = Vec::new();
+            for once in [false, true] {
+                let stop = AtomicBool::new(false);
+                let total = std::thread::scope(|s| {
+                    for _ in 0..2 {
+                        s.spawn(|| {
+                            while !stop.load(Ordering::Relaxed) {
+                                {
+                                    let _reading = crate::watch::title_memory_reading();
+                                    spin(hold_us);
+                                }
+                                spin(50);
+                            }
+                        });
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                    let mut times = Vec::new();
+                    for _ in 0..5 {
+                        let t = Instant::now();
+                        assert!(map_batches(once, &batches, 0x20_0000_0000, PAGES, false, map));
+                        times.push(t.elapsed().as_secs_f64() * 1e3);
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                    times.sort_by(f64::total_cmp);
+                    times[times.len() / 2]
+                });
+                row.push(total);
+            }
+            println!("{what:<28} {:>11.1} ms {:>11.1} ms {:>8.1}x", row[0], row[1], row[0] / row[1]);
+        }
     }
 }
