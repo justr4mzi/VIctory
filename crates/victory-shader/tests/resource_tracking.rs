@@ -2,7 +2,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use victory_shader::ir::{self, Program, Reg};
-use victory_shader::resource::{Address, MEMORY, track};
+use victory_shader::resource::{Address, track};
 use victory_shader::{HwStage, RootParam, RootType};
 
 const TABLE: RootParam = RootParam {
@@ -134,16 +134,14 @@ fn shared_sum_with_two_dynamic_terms_stays_opaque() {
             ),
         ]
     );
-    // Not from a root parameter: title memory.
-    let memory = Address {
-        param: MEMORY,
-        offset: 0,
-        dynamic: None,
-    };
-    assert_eq!(
-        track(&program, &[], HwStage::Ps, None).unwrap().scalar,
-        [((0, 3), memory), ((0, 4), memory)]
-    );
+    // Not from a root parameter: refused on the fxceless tree as an untraceable address.
+    assert!(matches!(
+        track(&program, &[], HwStage::Ps, None),
+        Err(victory_shader::ShaderError::Unsupported {
+            what: "an address not from a root parameter",
+            ..
+        })
+    ));
 }
 
 // cargo test -p victory-shader --release --test resource_tracking \
