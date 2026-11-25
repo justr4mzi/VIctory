@@ -1,3 +1,30 @@
+# `justr4mzi/VIctory` — `v7` RX 6700 XT World-Rendering Edition (`AI-assisted`)
+
+> **Personal fork (`AI-assisted`)** rebased onto [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) (`9376fd6`) for **Windows 11 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64)**.
+> Previous `v6` stack is preserved intact on branch `backup-v6-final` and tag `v6-final` (`a0b1b07`).
+> Full changelog (`02f404e` -> `v1..v6` -> `v7`) and skipped/deferred PR ledger: see **[FORK.md](FORK.md)**.
+> Zero game files, assets, filenames, hashes, or offsets are included (`cargo xtask policy`: **177 files ok**).
+
+## `v7` Summary & Offline Verification
+
+- **Workspace tests (`cargo test --workspace -- --test-threads=1`):** **567 passed, 0 failed, 10 ignored**.
+- **GPU diagnostics tests (`cargo test -p victory-gpu --features diagnostics -- --test-threads=1`):** **167 passed, 0 failed, 3 ignored**.
+- **Asset policy (`cargo xtask policy`):** **`177 files ok`** (with `lower.rs` unit tests extracted to `lower_tests.rs`, `520,122` B <= `524,288` B, without altering `xtask/src/policy.rs`).
+- **Release build (`victory.exe`):** **`8,195,072` bytes** (Thin LTO, `1m 13s`).
+- **Shader translation + DXIL validation (`dxil.dll 10.0.26100.0`, 26,599 containers / 26,148 programs):**
+  - **Vertex / Pixel:** `14,137` validated of `14,248` emitted (`14,259` total)
+  - **Compute:** **`2,729` validated of `2,729` emitted** (`2,734` total, `100%` of emitted CS!)
+  - **Mesh:** `8,660` validated of `8,765` emitted (`8,765` total)
+  - **Total primary validated:** **`25,526`** (`+1,007` over `v6`, `+3,848` over upstream `02f404e`), `216` validator rejections. *(Verified offline; not yet tested live in-game.)*
+- **Key additions over `fxceless 9376fd6`:**
+  - **AMD RX 6700 XT stability (Layer 1):** `myokex` pipeline slow-compile timeouts/wait budgets + RT resolve skip + `myokex #5` known AMD crasher PSO skip & release `VICTORY_SKIP_PIPELINES` + `ZSlayerHQ #7` BVH skinning/trace skip while BVH builder is off + `ztrx #61` automatic AMD (`0x1002`) `bitcode::opt::REUSE` bypass + `myokex #4` self-`CopyResource` skip.
+  - **World correctness, Series S & VRAM (Layer 2):** `fxceless` `#795`, `#794`, `#784`, `#792`, `#783`, `#793`, `#610` (`VICTORY_TEXTURE_DROP_MIPS=N`), `#188` (`--console series-s` stretch/overlay), `#518` (64 KiB thread-group `CARD_COMPARE`), plus `ka1qux` `99cec4e` (`#632` slot write-number race fix) and `6391441` (`#606` remap marks staged textures dirty).
+  - **Native Wave64 & Shaders (Layer 3):** `fxceless` `#497`, `#558` (barrier-free all-lane native wave64 retry), `ZSlayerHQ #6` (`b05b60e` immediate sampler phi), `ztrx #68` (`81428dc` standalone `v_interp_p1_f32`), `ztrx #69` (`0cad4fa` single texture size dword read).
+- **RX 6700 XT Tuning Switches:** Defaults use `VICTORY_RELAY=2` and `VICTORY_NO_WATCHDOG=1`. Optional switches for live tuning: `VICTORY_TEXTURE_DROP_MIPS=1`, `VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_CARD_FETCH_INFLIGHT=1`, `VICTORY_ACTIVATE_RAYS=0`, `VICTORY_D3D12_BACKGROUND=0`, `--console series-s`.
+- **Credits:** Upstream [Marvisak/VIctory](https://github.com/Marvisak/VIctory), [fxceless/victory-fork](https://github.com/fxceless/victory-fork), [myokex/victory-amd](https://github.com/myokex/victory-amd), [ztrx](https://github.com/ztrx), [ZSlayerHQ](https://github.com/ZSlayerHQ), [ka1qux](https://github.com/ka1qux).
+
+---
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
