@@ -1981,7 +1981,7 @@ impl HostHeap {
     ) -> (u64, u64) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
-        let mut due: Vec<(u32, u64)> = Vec::new();
+        let mut due: Vec<(u32, u64, [u32; 3])> = Vec::new();
         {
             let mut guard = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             let copied = &mut guard.0;
@@ -1996,6 +1996,9 @@ impl HostHeap {
                     continue;
                 };
                 let Some(record) = page.get(at..at + step as usize) else {
+                    continue;
+                };
+                let Some(header) = record.first_chunk::<12>() else {
                     continue;
                 };
                 looked += 1;
@@ -2021,11 +2024,12 @@ impl HostHeap {
                     continue;
                 }
                 *last = print;
-                due.push((index as u32, handle));
+                let words = |k| u32::from_le_bytes(header[k..k + 4].try_into().unwrap());
+                due.push((index as u32, handle, [words(0), words(4), words(8)]));
             }
         }
-        for &(index, handle) in &due {
-            self.mirror(index, handle, false);
+        for &(index, handle, record) in &due {
+            self.mirror_record(index, handle, false, record, false, true);
         }
         (looked, due.len() as u64)
     }
@@ -2040,9 +2044,9 @@ impl HostHeap {
 
     /// Variant of [`HostHeap::mirror`] used by `prepare_heap_buffers`:
     /// materializes deferred views (`for_draw = true`) without re-inserting
-    /// `index` into `self.changed`.
+    /// `index` into `self.changed` or clearing `copied[index]` for `Some(view)`.
     pub(crate) fn mirror_for_pass(&self, index: u32, handle: u64) -> Option<View> {
-        self.mirror_inner(index, handle, true, true, false)
+        self.mirror_inner(index, handle, true, false, false)
     }
 
     /// Reads the raw descriptor tag/words at `handle` and returns `(key, i, generation)`
@@ -2117,6 +2121,7 @@ impl HostHeap {
         }
         let mut stale_unmade: Vec<u32> = Vec::new();
         let mut self_changed = false;
+        let mut force_forget = false;
         let result = {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
@@ -2130,6 +2135,7 @@ impl HostHeap {
                         self.make_null(index);
                         let _ = self.note_buffer(index, None, false, notify_changed);
                         self_changed = true;
+                        force_forget = true;
                     } else if for_draw {
                         // Left for later and stale since: out of the sets and the stride table.
                         let _ = self.note_buffer(index, None, false, notify_changed);
@@ -2199,7 +2205,7 @@ impl HostHeap {
                 }
             }
         };
-        if invalidate_copied && self_changed {
+        if (invalidate_copied || force_forget) && self_changed {
             self.forget_copied(index);
         }
         for stale in stale_unmade {

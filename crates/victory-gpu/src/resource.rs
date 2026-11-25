@@ -1522,8 +1522,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
     }
+    let placed_live = (r.host.placed.load(Relaxed) && fills(&r.desc))
+        .then(|| footprint(&r.desc).map_or(0, |f| f.size))
+        .filter(|&size| size > 0)
+        .map(|size| (r.data() as u64, this as usize, size));
     r.host.used.store(crate::host::moment(), Relaxed);
-    made.clone()
+    let out = made.clone();
+    drop(made);
+    if let Some((start, at, size)) = placed_live {
+        placed_live_insert(start, at, size);
+    }
+    out
 }
 
 /// The host copy of title texture `this` if it is made, without making it
@@ -1904,6 +1913,56 @@ pub(crate) fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64)
     a_start < b_start.saturating_add(b_len) && b_start < a_start.saturating_add(a_len)
 }
 
+#[cfg(windows)]
+#[derive(Default)]
+struct PlacedLive {
+    entries: std::collections::BTreeMap<(u64, usize), u64>,
+    max_size: u64,
+}
+
+#[cfg(windows)]
+impl PlacedLive {
+    fn insert(&mut self, start: u64, at: usize, size: u64) {
+        if size == 0 {
+            return;
+        }
+        self.entries.insert((start, at), size);
+        self.max_size = self.max_size.max(size);
+    }
+
+    fn remove(&mut self, start: u64, at: usize) {
+        self.entries.remove(&(start, at));
+    }
+
+    fn overlapping(&self, base: u64, len: u64) -> Vec<usize> {
+        if len == 0 || self.entries.is_empty() {
+            return Vec::new();
+        }
+        let lo = base.saturating_sub(self.max_size);
+        let hi = base.saturating_add(len);
+        self.entries
+            .range((lo, 0)..(hi, usize::MAX))
+            .filter_map(|(&(start, at), &size)| ranges_overlap(start, size, base, len).then_some(at))
+            .collect()
+    }
+}
+
+#[cfg(windows)]
+static PLACED_LIVE: std::sync::Mutex<PlacedLive> = std::sync::Mutex::new(PlacedLive {
+    entries: std::collections::BTreeMap::new(),
+    max_size: 0,
+});
+
+#[cfg(windows)]
+fn placed_live_insert(start: u64, at: usize, size: u64) {
+    PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner()).insert(start, at, size);
+}
+
+#[cfg(windows)]
+fn placed_live_remove(start: u64, at: usize) {
+    PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner()).remove(start, at);
+}
+
 /// Lets go of the host copies of placed textures the title fills whose
 /// backing overlaps `[base, base + len)`, as soon as the runtime unmaps or
 /// moves those pages (`crate::watch::title_memory_remapped`), so dead
@@ -1916,9 +1975,12 @@ pub(crate) fn evict_placed_in(base: u64, len: u64) -> u64 {
     }
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    for &at in all.iter() {
-        // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
+    let candidates = PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner()).overlapping(base, len);
+    for at in candidates {
+        if !all.contains(&at) {
+            continue;
+        }
+        // SAFETY: `at` is still in `TEXTURES` under its lock held here.
         let r = unsafe { &*(at as *const Resource) };
         if !r.host.placed.load(Relaxed) || !fills(&r.desc) || crate::texture::host_wrote(at) {
             continue;
@@ -1943,6 +2005,7 @@ pub(crate) fn evict_placed_in(base: u64, len: u64) -> u64 {
             }
         };
         if let Some((host, _)) = gone {
+            placed_live_remove(r.data() as u64, at);
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
@@ -2003,6 +2066,7 @@ pub(crate) fn let_go_idle() {
             }
         };
         if let Some((host, _)) = gone {
+            placed_live_remove(r.data() as u64, at);
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
@@ -2562,12 +2626,14 @@ impl Drop for Resource {
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
-            textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            let at = std::ptr::from_ref::<Resource>(self) as usize;
+            textures().remove(&at);
+            placed_live_remove(self.data() as u64, at);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-                let at = self.data() as u64;
-                if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
-                    targets.remove(&at);
+                let data_at = self.data() as u64;
+                if targets.get(&data_at) == Some(&at) {
+                    targets.remove(&data_at);
                 }
             }
         }
@@ -4278,5 +4344,21 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(ranges_overlap(0x1000, 0x1000, 0x1800, 0x1000));
         assert!(ranges_overlap(u64::MAX - 0x100, 0x1000, u64::MAX - 0x10, 0x10));
         assert_eq!(evict_placed_in(0x1000, 0), 0);
+    }
+
+    #[test]
+    fn placed_live_index_returns_only_overlapping_entries() {
+        let mut live = PlacedLive::default();
+        live.insert(0x10_0000, 1, 0x4_0000); // [0x10_0000, 0x14_0000)
+        live.insert(0x20_0000, 2, 0x2_0000); // [0x20_0000, 0x22_0000)
+        live.insert(0x30_0000, 3, 0x1_0000); // [0x30_0000, 0x31_0000)
+
+        assert_eq!(live.overlapping(0x12_0000, 0x1000), vec![1]);
+        assert_eq!(live.overlapping(0x14_0000, 0xC_0000), Vec::<usize>::new());
+        assert_eq!(live.overlapping(0x13_0000, 0xE_0000), vec![1, 2]);
+        assert_eq!(live.overlapping(0x20_0000, 0), Vec::<usize>::new());
+
+        live.remove(0x10_0000, 1);
+        assert_eq!(live.overlapping(0x12_0000, 0x1000), Vec::<usize>::new());
     }
 }

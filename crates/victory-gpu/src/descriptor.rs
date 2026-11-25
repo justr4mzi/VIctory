@@ -1863,4 +1863,79 @@ mod tests {
             "draw-side mirror must still notify changed"
         );
     }
+
+    #[test]
+    fn sync_heaps_and_mirror_for_pass_keep_seen_pages_without_remirroring() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let mut buf_data = vec![0u8; 256];
+        let buf_addr = buf_data.as_mut_ptr() as u64;
+        let desc = HeapDesc {
+            kind: 0,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: memory as u64,
+            size: 64 * 32,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut resource = [0u32; 14];
+            resource[0] = 1;
+            resource[4] = 256;
+            resource[8] = 1;
+            let mut srv_desc = [0u32; 16];
+            srv_desc[0] = 39;
+            srv_desc[1] = 1;
+            srv_desc[2] = 5768;
+            srv_desc[6] = 64;
+            srv_desc[8] = 1;
+            srv_desc[10] = buf_addr as u32;
+            srv_desc[11] = (buf_addr >> 32) as u32;
+            let mut elsewhere = [0u64; 4];
+            let source = elsewhere.as_mut_ptr() as u64;
+            create_placed_srv(std::ptr::null(), &resource, &srv_desc, source);
+            unsafe {
+                std::ptr::copy_nonoverlapping(source as *const u8, memory.cast::<u8>().add(3 * 32), 32);
+            }
+            let _ = SYNCED[2].swap(0, std::sync::atomic::Ordering::Relaxed);
+            sync_heaps();
+            assert!(SYNCED[2].swap(0, std::sync::atomic::Ordering::Relaxed) >= 1);
+            assert!(host.buffer_changes().contains(&3));
+            let handle = heap(h).handle(3).unwrap();
+            assert!(host.mirror_for_pass(3, handle).is_some());
+            assert!(host.take_forgotten_copied().is_empty());
+            // Dirty the write-watch page without changing bytes: `seen_pages` stays valid (`SYNCED[2] == 0`).
+            unsafe {
+                std::ptr::write_volatile(memory.cast::<u8>().add(4 * 32), 0);
+            }
+            sync_heaps();
+            assert_eq!(SYNCED[2].swap(0, std::sync::atomic::Ordering::Relaxed), 0);
+            assert!(host.buffer_changes().is_empty());
+
+            // Now modify slot 4 on the same page: only slot 4 is mirrored (`SYNCED[2] == 1`), not slot 3.
+            unsafe {
+                std::ptr::copy_nonoverlapping(source as *const u8, memory.cast::<u8>().add(4 * 32), 32);
+            }
+            sync_heaps();
+            assert_eq!(SYNCED[2].swap(0, std::sync::atomic::Ordering::Relaxed), 1);
+            assert_eq!(host.buffer_changes(), vec![4]);
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
 }
