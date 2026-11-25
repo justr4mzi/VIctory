@@ -813,9 +813,7 @@ struct Guards {
 
 impl Guards {
     fn knows(&self, block: usize) -> bool {
-        self.protected.contains(block)
-            || self.absent.contains(block)
-            || self.holes.contains(block)
+        self.protected.contains(block) || self.holes.contains(block)
     }
 
     fn overlaps_any(&self, lo: usize, hi: usize) -> bool {
@@ -907,6 +905,13 @@ fn guard_locked(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
                     continue;
                 }
                 g.absent.remove_range(block, block + 1);
+                if !is_view(block * BLOCK, (block + 1) * BLOCK) {
+                    if let Some(from) = run.take() {
+                        protect(g, from, block);
+                    }
+                    block += 1;
+                    continue;
+                }
             }
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(block) {
@@ -2062,6 +2067,59 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(p, 3 * BLOCK);
+    }
+
+    /// An uncommitted block noted in `g.absent` whose virtual address is later
+    /// backed by `MEM_WRITE_WATCH` or ordinary `MEM_PRIVATE` memory must not be
+    /// hijacked into `PAGE_READONLY` guarded memory.
+    #[test]
+    fn absent_block_reallocated_as_private_memory_is_not_guarded() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        let watched = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!watched.is_null());
+        let addr = watched as usize;
+        let b = addr / BLOCK;
+        guards().absent.insert_range(b, b + 1);
+        assert!(writes(addr, addr + PAGE, true).is_some());
+        assert!(
+            writable(addr),
+            "MEM_WRITE_WATCH private memory at a formerly absent address must remain writable"
+        );
+        assert!(!guards().protected.contains(b));
+        assert_ne!(unsafe { VirtualFree(watched, 0, MEM_RELEASE) }, 0);
+
+        let plain = unsafe {
+            VirtualAlloc(
+                watched,
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert_eq!(plain, watched);
+        guards().absent.insert_range(b, b + 1);
+        assert!(
+            writes(addr, addr + PAGE, true).is_none(),
+            "ordinary MEM_PRIVATE memory at a formerly absent address must not be treated as a view"
+        );
+        assert!(writable(addr));
+        assert!(!guards().protected.contains(b));
+        assert_ne!(unsafe { VirtualFree(plain, 0, MEM_RELEASE) }, 0);
+        let mut g = guards();
+        g.absent.remove_range(b, b + 1);
+        g.holes.remove_range(b, b + 1);
+        g.clean.remove_range(b, b + 1);
     }
 }
 

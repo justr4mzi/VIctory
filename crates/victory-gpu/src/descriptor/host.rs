@@ -28,8 +28,10 @@ pub(crate) struct HostHeap {
     made: Mutex<Vec<u64>>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
-    /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
-    copied: Mutex<Vec<u64>>,
+    /// ([`HostHeap::mirror_copied`]; 0: never looked at), paired with slot
+    /// indices forgotten since the last [`sync_heaps`] pass so `seen_pages`
+    /// re-scans their pages. Made on first use.
+    copied: Mutex<(Vec<u64>, Vec<u32>)>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -963,7 +965,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            copied: Mutex::new(Vec::new()),
+            copied: Mutex::new((Vec::new(), Vec::new())),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -1440,13 +1442,26 @@ impl HostHeap {
     }
 
     /// Clears the cached raw-copy fingerprint for `index` so a subsequent
-    /// raw-byte copy back to an earlier record is not mistakenly skipped.
+    /// raw-byte copy back to an earlier record is not mistakenly skipped, and
+    /// notes `index` so `sync_heaps` invalidates its cached `seen_pages` page.
     /// Must never be called while holding `self.made`.
     fn forget_copied(&self, index: u32) {
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let (copied, forgotten) = &mut *guard;
         if let Some(slot) = copied.get_mut(index as usize) {
             *slot = 0;
+            forgotten.push(index);
         }
+    }
+
+    /// Drains slot indices whose cached raw-copy fingerprint was invalidated
+    /// since the previous `sync_heaps` pass.
+    pub(crate) fn take_forgotten_copied(&self) -> Vec<u32> {
+        let mut guard = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = std::mem::take(&mut guard.1);
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Makes host slot `index` null again, as it is before its view is
@@ -1458,9 +1473,13 @@ impl HostHeap {
         if key == 0 {
             return;
         }
-        match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.cpu(index)),
-            None => null_view(self.cpu(index)),
+        if self.sampler {
+            self.null_sampler(index);
+        } else {
+            match view_at(key as u32, (key >> 32) as u32) {
+                Some(view) => null_for(&view, self.cpu(index)),
+                None => null_view(self.cpu(index)),
+            }
         }
         self.keep(index, None);
     }
@@ -1880,7 +1899,8 @@ impl HostHeap {
         let print = record_print(record) | 1;
         let all_zero = record.iter().all(|&b| b == 0);
         let check_made_for_zero = {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let copied = &mut guard.0;
             if copied.is_empty() {
                 copied.resize(self.count as usize, 0);
             }
@@ -1910,8 +1930,8 @@ impl HostHeap {
             if !is_made {
                 return false;
             }
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(last) = copied.get_mut(index as usize) {
+            let mut guard = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(last) = guard.0.get_mut(index as usize) {
                 *last = print;
             }
         }

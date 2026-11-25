@@ -204,6 +204,23 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        let forgotten = host.take_forgotten_copied();
+        if !forgotten.is_empty() {
+            let mut seen = seen_pages().lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.is_empty() {
+                let step_len = step as usize;
+                for index in forgotten {
+                    let addr = start as usize + index as usize * step_len;
+                    let first_page = (addr & !(crate::watch::PAGE - 1)).max(start as usize);
+                    seen.remove(&first_page);
+                    let last_page =
+                        ((addr + step_len.saturating_sub(1)) & !(crate::watch::PAGE - 1)).max(start as usize);
+                    if last_page != first_page {
+                        seen.remove(&last_page);
+                    }
+                }
+            }
+        }
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
