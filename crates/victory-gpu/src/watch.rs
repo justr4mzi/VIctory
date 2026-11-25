@@ -834,6 +834,7 @@ fn writes_since_kind_as(
             match clean_hit {
                 Some(true) => Some(Vec::new()),
                 Some(false) => {
+                    install();
                     let mut g = guards();
                     if in_placeholder || g.knows(first) {
                         #[cfg(feature = "diagnostics")]
@@ -2029,8 +2030,11 @@ fn install() {
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
+        VEH_INSTALLED.store(true, Ordering::Release);
     });
 }
+
+static VEH_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether `at` is committed read-write memory now.
 fn writable(at: usize) -> bool {
@@ -2779,6 +2783,77 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn placeholder_fast_path_installs_veh_before_guarding() {
+        use crate::watch::{BLOCK, VEH_INSTALLED, title_memory_remapped, writes_since_kind_as};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE,
+            UnmapViewOfFile2, VirtualAlloc2, VirtualFree,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let (p, section) = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            VirtualFree(p as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                p as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_eq!(view.Value as usize, p);
+            (p, section)
+        };
+        crate::inplace::title_memory_placeholder(p, BLOCK);
+        crate::inplace::title_memory_view(p, BLOCK, section as usize, 0);
+
+        let result = writes_since_kind_as(p, p + BLOCK, true, 0, false);
+        assert!(result.is_some());
+        assert!(
+            VEH_INSTALLED.load(Ordering::Acquire),
+            "VEH handler must be installed on placeholder fast path"
+        );
+
+        unsafe { ((p + 8) as *mut u8).write(0x42) };
+        let after = writes_since_kind_as(p, p + BLOCK, true, 0, false).expect("guarded");
+        assert!(!after.1.is_empty());
+
+        unsafe {
+            let view = windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: p as *mut _,
+            };
+            UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        title_memory_remapped(p, BLOCK);
+        crate::inplace::views_gone(p, BLOCK);
     }
 }
 
