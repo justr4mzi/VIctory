@@ -178,6 +178,12 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     }
 }
 
+/// What staging and shadow buffers may use: the lower of available physical
+/// RAM and commit headroom, since both run out (fxceless #822).
+pub(crate) fn available_cache_ram() -> Option<u64> {
+    memory_status().map(|(phys, commit)| phys.min(commit))
+}
+
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
