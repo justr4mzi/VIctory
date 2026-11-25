@@ -1430,23 +1430,20 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     true
 }
 
-/// How many bytes of `[at, at + len)` are committed memory: all of a
-/// texture that is there, some of one streaming in (its smaller mips lie
-/// at the start of its memory, and their pages are mapped first), none of
-/// one not there. With neither the first nor the last page committed the
-/// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again).
+/// How many bytes of `[at, at + len)` are backed by readable memory.
+/// The fast path samples console pages. If both ends are absent, walk the
+/// virtual-memory regions to distinguish an absent texture from readable
+/// mip data in the middle.
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    if len == 0 {
-        return 0;
-    }
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     let start = at as usize;
     let end = start.saturating_add(len);
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+    if start >= end {
         return 0;
     }
-    if !by_query() {
+    if !by_query() && (committed(at, 1) || committed((end - 1) as *const u8, 1)) {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
             // By page, without the walk: whole pages, cut to the range.
@@ -1483,7 +1480,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         if n == 0 || next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
             there += (next - p) as u64;
         }
         p = next;
@@ -1622,7 +1619,33 @@ mod remap_tests {
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::with_title;
+    use super::{mapped_bytes, with_title};
+
+    #[test]
+    fn a_streamed_mip_can_be_mapped_between_two_unmapped_ends() {
+        use windows_sys::Win32::System::Memory::*;
+        const MIP: usize = 64 << 10;
+        const SIZE: usize = 4 * MIP;
+        // SAFETY: a private reservation; only the committed middle is written.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(mapped_bytes(base, SIZE), 0);
+            let middle = base.add(MIP);
+            assert_eq!(VirtualAlloc(middle.cast(), MIP, MEM_COMMIT, PAGE_READWRITE), middle.cast());
+            let hidden = base.add(2 * MIP);
+            assert_eq!(VirtualAlloc(hidden.cast(), MIP, MEM_COMMIT, PAGE_NOACCESS), hidden.cast());
+            middle.write_bytes(0xb6, MIP);
+            let available = mapped_bytes(base, SIZE);
+            with_title(base, SIZE, |bytes| {
+                assert!(bytes[..MIP].iter().all(|&b| b == 0));
+                assert!(bytes[MIP..2 * MIP].iter().all(|&b| b == 0xb6));
+                assert!(bytes[2 * MIP..].iter().all(|&b| b == 0));
+            });
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            assert_eq!(available, MIP as u64);
+        }
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
