@@ -326,6 +326,45 @@ fn a_scalar_carry_chain_reaches_the_select() {
     }
 }
 
+/// The 24-bit multiplies lower both halves of their 48-bit product:
+/// `v_mul_i32_i24` and `v_mul_u32_u24` the low dword, `v_mul_hi_i32_i24`
+/// and `v_mul_hi_u32_u24` the high one. An LDS store keeps the result live.
+#[test]
+fn the_24_bit_multiplies_lower_both_halves() {
+    for op in [0x09u32, 0x0A, 0x0B, 0x0C] {
+        let words = [
+            0x7E02_0285,               // v_mov_b32 v1, 5
+            0x7E04_0287,               // v_mov_b32 v2, 7
+            op << 25 | 2 << 9 | 0x101, // op v0, v1, v2
+            0x7E06_0280,               // v_mov_b32 v3, 0
+            0xD834_0000,
+            0x0000_0003, // ds_write_b32 v3, v0
+            S_ENDPGM,
+        ];
+        lowers(&words, 1 << 15).unwrap_or_else(|e| panic!("VOP2 {op:#x}: {e}"));
+    }
+}
+
+#[test]
+fn a_wave64_select_on_a_mask_set_by_halves_reads_its_high_dword() {
+    let lower_hi = |hi: u32| {
+        let words = [
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            hi,          // s_mov_b32 s11, ...
+            0xD765_0002,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v2, -1, 0
+            0xD501_0001,
+            0x0029_8280, // v_cndmask_b32 v1, 0, -1, s[10:11]
+            0xD834_0000,
+            0x0000_0102, // ds_write_b32 v2, v1
+            S_ENDPGM,
+        ];
+        lower_wave(&words, vec![], vec![], true).unwrap().dxil
+    };
+    let same = lower_hi(0xBE8B_03C1) == lower_hi(0xBE8B_0380);
+    assert!(!same, "lanes 32-63 tested s10's bits");
+}
+
 fn perm_features(selector: u32) -> u64 {
     // Synthetic compute shader:
     // v0 is the thread ID and can supply a dynamic selector.

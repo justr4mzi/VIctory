@@ -34,6 +34,10 @@ pub struct StaticSampler {
 impl Eq for StaticSampler {}
 
 impl StaticSampler {
+    pub fn make_comparison(&mut self) {
+        self.filter = self.filter & !0x180 | 0x80;
+    }
+
     /// The filter supported by the host device. Anisotropic point-mip
     /// filtering is optional (`D3D12_OPTIONS19`); older devices retain the
     /// previous linear-mip approximation. Comparison/min/max reduction
@@ -181,6 +185,22 @@ mod tests {
                 assert_eq!(s.filter_for_host(false), s.filter);
                 assert_eq!(s.filter_for_host(true), s.filter);
             }
+        }
+    }
+
+    #[test]
+    fn comparison_replaces_the_reduction() {
+        for (filter, want) in [
+            (0x00, 0x80),
+            (0x14, 0x94),
+            (0x115, 0x95),
+            (0x1D5, 0xD5),
+            (0x95, 0x95),
+        ] {
+            let mut s = StaticSampler::from_words([0, 0, 0, 0]);
+            s.filter = filter;
+            s.make_comparison();
+            assert_eq!(s.filter, want, "filter {filter:#x}");
         }
     }
 }

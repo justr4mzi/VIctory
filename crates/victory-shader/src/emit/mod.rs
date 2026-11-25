@@ -105,6 +105,8 @@ mod threading;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
+mod quad_tests;
+#[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
@@ -119,7 +121,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use link::{link_mesh, mesh_fits};
 pub use sampler::StaticSampler;
-pub use lower::set_host_max_wave;
+pub use lower::{set_host_max_wave, set_host_native16};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -258,6 +260,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.push(u8::from(lower::host_native16()));
     out
 }
 
@@ -1148,7 +1151,7 @@ fn emit_program(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    s.make_comparison();
                 }
                 s
             })

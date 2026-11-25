@@ -1,9 +1,200 @@
 //! 16-bit VALU and packed VOP3P lowering (`v_*_f16`, `v_*_u16`, `v_*_i16`, `v_pk_*`),
 //! a child module so it shares `Lower<'a>` state without growing `lower.rs`.
 
-use super::{Attr, Bin, Cast, Fields, Inst, Lower, Operand, Reg, V, Why, f16_nearest_on, pred};
+use super::{
+    Attr, Bin, Cast, Fields, Inst, Lower, Operand, Reg, V, Why, f16_nearest_on, host_native16, pred,
+};
 
 impl<'a> Lower<'a> {
+    /// Whether 16-bit float arithmetic is done in native `half` here.
+    fn native16(&self) -> bool {
+        host_native16()
+    }
+
+    /// The low 16 bits of `x` as a `half`.
+    fn as_half(&mut self, x: V) -> V {
+        let c = self.cur;
+        let i16t = self.s.m.int(16);
+        let t = self.s.m.cast(c, Cast::Trunc, x, i16t);
+        let ht = self.s.m.half();
+        self.s.m.cast(c, Cast::Bitcast, t, ht)
+    }
+
+    /// The bits of the `half` `h` in the low half of an i32, the high half zero.
+    fn half_bits(&mut self, h: V) -> V {
+        let c = self.cur;
+        let i16t = self.s.m.int(16);
+        let t = self.s.m.cast(c, Cast::Bitcast, h, i16t);
+        self.s.m.cast(c, Cast::ZExt, t, self.s.t.i32)
+    }
+
+    /// A `dx.op` on `half` operands given as bits (the low 16 of each), its result as bits.
+    fn half_op(&mut self, name: &str, op: u32, xs: &[V]) -> V {
+        let hs: Vec<V> = xs.iter().map(|&x| self.as_half(x)).collect();
+        let ht = self.s.m.half();
+        let r = self.s.op(self.cur, name, Attr::ReadNone, ht, op, &hs);
+        self.half_bits(r)
+    }
+
+    /// `a op b` in `half`, of f16 bits, as bits.
+    fn half_bin(&mut self, op: Bin, a: V, b: V) -> V {
+        let (a, b) = (self.as_half(a), self.as_half(b));
+        let r = self.s.m.bin(self.cur, op, a, b);
+        self.half_bits(r)
+    }
+
+    /// `a * b + c` of f16 bits in `half`, rounded once where the host fuses its 16-bit `FMad`.
+    fn fma16(&mut self, a: V, b: V, c: V) -> V {
+        self.half_op("tertiary.f16", 46, &[a, b, c])
+    }
+
+    /// [`Self::max_min`] of f16 bits (the high halves zero) in `half`: +0 unless both are -0 (max),
+    /// -0 unless neither (min); keeps 16-bit denormals.
+    fn max_min16(&mut self, max: bool, a: V, b: V) -> V {
+        let c = self.cur;
+        let r = self.half_op("binary.f16", if max { 35 } else { 36 }, &[a, b]);
+        let either = self.s.m.bin(c, Bin::Or, a, b);
+        let magnitude = self.s.m.i32(0x7FFF);
+        let either = self.s.m.bin(c, Bin::And, either, magnitude);
+        let zero = self.s.m.i32(0);
+        let zeros = self.s.m.cmp(c, pred::EQ, either, zero);
+        let op = if max { Bin::And } else { Bin::Or };
+        let sign = self.s.m.bin(c, op, a, b);
+        self.s.m.select(c, zeros, sign, r)
+    }
+
+    /// Whether the f16 bits `x` (the high half zero) are a NaN.
+    fn nan16(&mut self, x: V) -> V {
+        let c = self.cur;
+        let magnitude = self.s.m.i32(0x7FFF);
+        let a = self.s.m.bin(c, Bin::And, x, magnitude);
+        let inf = self.s.m.i32(0x7C00);
+        self.s.m.cmp(c, pred::IUGT, a, inf)
+    }
+
+    /// [`Self::med3`] of f16 bits in `half`.
+    fn med3_16(&mut self, a: V, b: V, third: V) -> V {
+        let c = self.cur;
+        let lo = self.max_min16(false, a, b);
+        let hi = self.max_min16(true, a, b);
+        let t = self.max_min16(false, hi, third);
+        let median = self.max_min16(true, lo, t);
+        let least = self.max_min16(false, lo, third);
+        let (na, nb, nc) = (self.nan16(a), self.nan16(b), self.nan16(third));
+        let nan = self.s.m.bin(c, Bin::Or, na, nb);
+        let nan = self.s.m.bin(c, Bin::Or, nan, nc);
+        self.s.m.select(c, nan, least, median)
+    }
+
+    /// Clamp of an f16 result (bits, the high half zero) to [0, 1]: +0 for NaN and -0.
+    fn clamp16(&mut self, x: V) -> V {
+        let c = self.cur;
+        let inf = self.s.m.i32(0x7C00);
+        let bad = self.s.m.cmp(c, pred::IUGT, x, inf);
+        let one = self.s.m.i32(0x3C00);
+        let big = self.s.m.cmp(c, pred::IUGE, x, one);
+        let r = self.s.m.select(c, big, one, x);
+        let zero = self.s.m.i32(0);
+        self.s.m.select(c, bad, zero, r)
+    }
+
+    /// An f16 source's bits (the high half zero) with its abs/neg modifiers.
+    fn half_bits_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let mut x = self.half_src(inst, k)?;
+        let c = self.cur;
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.i32(0x7FFF);
+            x = self.s.m.bin(c, Bin::And, x, m);
+        }
+        if v.neg >> k & 1 != 0 {
+            let m = self.s.m.i32(0x8000);
+            x = self.s.m.bin(c, Bin::Xor, x, m);
+        }
+        Ok(x)
+    }
+
+    /// The accumulator of `v_fmac_f16`/`v_mac_f16`: the destination's written half as bits.
+    fn mac_acc_bits(&mut self, inst: &Inst) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let c = self.cur;
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("an accumulator");
+        };
+        let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+        let x = if v.opsel >> 3 & 1 != 0 {
+            let k16 = self.s.m.i32(16);
+            self.s.m.bin(c, Bin::LShr, x, k16)
+        } else {
+            x
+        };
+        let m = self.s.m.i32(0xFFFF);
+        Ok(self.s.m.bin(c, Bin::And, x, m))
+    }
+
+    /// Native `half` lowering for f16 VALU ops without output modifiers (`omod == 0`).
+    fn valu16_native(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
+        const NATIVE: &[&str] = &[
+            "v_add_f16",
+            "v_sub_f16",
+            "v_subrev_f16",
+            "v_mul_f16",
+            "v_max_f16",
+            "v_min_f16",
+            "v_fma_f16",
+            "v_fmac_f16",
+            "v_max3_f16",
+            "v_min3_f16",
+            "v_med3_f16",
+        ];
+        let Fields::Valu(v) = &inst.fields else {
+            return None;
+        };
+        if v.omod != 0 || !self.native16() || !NATIVE.contains(&name) {
+            return None;
+        }
+        Some(self.valu16_native_op(inst, name, guard))
+    }
+
+    fn valu16_native_op(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let (a, b) = (self.half_bits_src(inst, 0)?, self.half_bits_src(inst, 1)?);
+        let r = match name {
+            "v_add_f16" => self.half_bin(Bin::Add, a, b),
+            "v_sub_f16" => self.half_bin(Bin::Sub, a, b),
+            "v_subrev_f16" => self.half_bin(Bin::Sub, b, a),
+            "v_mul_f16" => self.half_bin(Bin::Mul, a, b),
+            "v_max_f16" => self.max_min16(true, a, b),
+            "v_min_f16" => self.max_min16(false, a, b),
+            _ => {
+                let third = if name == "v_fmac_f16" {
+                    self.mac_acc_bits(inst)?
+                } else {
+                    self.half_bits_src(inst, 2)?
+                };
+                match name {
+                    "v_fma_f16" | "v_fmac_f16" => self.fma16(a, b, third),
+                    "v_max3_f16" => {
+                        let t = self.max_min16(true, a, b);
+                        self.max_min16(true, t, third)
+                    }
+                    "v_min3_f16" => {
+                        let t = self.max_min16(false, a, b);
+                        self.max_min16(false, t, third)
+                    }
+                    _ => self.med3_16(a, b, third),
+                }
+            }
+        };
+        let r = if v.clamp { self.clamp16(r) } else { r };
+        self.write_half(inst, r, guard)
+    }
     ///products are exact there and round once to f16 (f32 has the 2 x 11 +
     /// 2 bits that make double rounding harmless); `None` if `name` is none.
     pub(super) fn valu16(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
@@ -80,6 +271,9 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
+        if let Some(r) = self.valu16_native(inst, name, guard) {
+            return r;
+        }
         let c = self.cur;
         let i32t = self.s.t.i32;
         let f32t = self.s.t.f32;
@@ -130,18 +324,7 @@ impl<'a> Lower<'a> {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
             let acc = if matches!(name, "v_fmac_f16" | "v_mac_f16") {
                 // The accumulator is the destination's half that is written.
-                let Some(Operand::Vector { reg, .. }) = v.dst else {
-                    return Err("an accumulator");
-                };
-                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
-                let x = if v.opsel >> 3 & 1 != 0 {
-                    let k16 = self.s.m.i32(16);
-                    self.s.m.bin(c, Bin::LShr, x, k16)
-                } else {
-                    x
-                };
-                let m = self.s.m.i32(0xFFFF);
-                let x = self.s.m.bin(c, Bin::And, x, m);
+                let x = self.mac_acc_bits(inst)?;
                 self.s
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
             } else {
@@ -445,26 +628,43 @@ impl<'a> Lower<'a> {
         }
         let c = self.cur;
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let native = float && self.native16();
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
             for k in 0..n {
                 let h = self.packed_src(inst, k, high, float)?;
-                if float {
+                if native {
+                    let neg = if high { v.neg_hi } else { v.neg };
+                    xs.push(if neg >> k & 1 != 0 {
+                        let sign = self.s.m.i32(0x8000);
+                        self.s.m.bin(c, Bin::Xor, h, sign)
+                    } else {
+                        h
+                    });
+                } else if float {
                     let mut f = self
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
                     let neg = if high { v.neg_hi } else { v.neg };
                     if neg >> k & 1 != 0 {
-                        let z = self.s.m.f32(0x8000_0000);
-                        f = self.s.m.bin(c, Bin::Sub, z, f);
+                        f = self.fneg(f);
                     }
                     xs.push(f);
                 } else {
                     xs.push(h);
                 }
             }
-            let r = if float {
+            let r = if native {
+                let r = match op {
+                    "add_f16" => self.half_bin(Bin::Add, xs[0], xs[1]),
+                    "mul_f16" => self.half_bin(Bin::Mul, xs[0], xs[1]),
+                    "min_f16" => self.max_min16(false, xs[0], xs[1]),
+                    "max_f16" => self.max_min16(true, xs[0], xs[1]),
+                    _ => self.fma16(xs[0], xs[1], xs[2]),
+                };
+                if v.clamp { self.clamp16(r) } else { r }
+            } else if float {
                 let mut f = match op {
                     "add_f16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
                     "mul_f16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),

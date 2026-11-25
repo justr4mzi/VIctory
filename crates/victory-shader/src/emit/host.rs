@@ -607,6 +607,22 @@ impl Host {
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
 
+    /// Whether this device runs native 16-bit operations (D3D12
+    /// `Native16BitShaderOpsSupported`, SM 6.2 and up).
+    pub fn native16(&self) -> bool {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
+        // SAFETY: the query writes the structure of the given size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS4,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.Native16BitShaderOpsSupported.as_bool()
+    }
+
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
     /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
     /// does not, their results can differ in kind. Runs the lowered `v_fma_f32`

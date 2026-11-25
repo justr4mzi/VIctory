@@ -2548,7 +2548,7 @@ mod tests {
             let v1 = p.blocks.iter().enumerate().flat_map(|(b, blk)| blk.insts.iter().enumerate().map(move |(i, inst)| (b, i, inst)));
             let (b, i, _) = v1.into_iter().find(|(_, _, inst)| inst.name() == "v_mov_b32").expect("the guarded move");
             let guard = st.guards[b][i].expect("a guard");
-            st.bools.support(guard).iter().any(|a| matches!(a, crate::structure::Atom::Opaque(_)))
+            st.bools.support(guard).iter().any(|a| matches!(a, crate::structure::Atom::Opaque(..)))
         };
         assert!(!opaque(&alone), "site_pairs recovers the pair directly");
         assert!(!opaque(&shared), "the pair is the compare's mask");

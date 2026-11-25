@@ -741,6 +741,14 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
+        let mut o4 = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
+        let native16 = !std::env::var_os("VICTORY_F16_IN_F32").is_some_and(|v| v == "1")
+            && device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, (&raw mut o4).cast(), size_of_val(&o4) as u32)
+                .is_ok()
+            && o4.Native16BitShaderOpsSupported.as_bool();
+        tracing::info!(native = native16, "host native 16-bit float operations");
+        victory_shader::emit::set_host_native16(native16);
         // Whether the card's own memory can be mapped by the CPU ("GPU
         // upload heaps": the card's memory through a resizable BAR). With
         // it a host copy the CPU fills and shaders read needs one buffer,

@@ -100,6 +100,8 @@ pub(crate) struct Usage {
     pub atomic64: bool,
     /// A 64-bit float, as a result or an operand.
     pub doubles: bool,
+    /// Native 16-bit floats or integers, as a result or an operand.
+    pub native16: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -1208,7 +1210,7 @@ impl Module {
     fn is_scalar_ty(&self, ty: Ty) -> bool {
         matches!(
             self.types[ty.0 as usize],
-            TypeDef::Int(_) | TypeDef::Float | TypeDef::Double | TypeDef::Ptr(..)
+            TypeDef::Int(_) | TypeDef::Float | TypeDef::Half | TypeDef::Double | TypeDef::Ptr(..)
         )
     }
 
@@ -2390,6 +2392,7 @@ impl Module {
         let reached = self.reached();
         let wide = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
         let double = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Double;
+        let narrow = |ty: Ty| matches!(self.types[ty.0 as usize], TypeDef::Half | TypeDef::Int(16));
         // The first field of a handle's annotation: its kind, with the UAV
         // bit; the second: the component type and count.
         let annotation = |h: V| -> Option<(i64, i64)> {
@@ -2419,9 +2422,11 @@ impl Module {
                 let inst = &self.insts[i as usize];
                 u.int64 |= wide(inst.ty);
                 u.doubles |= double(inst.ty);
+                u.native16 |= narrow(inst.ty);
                 for_each_operand(&inst.op, |v| {
                     u.int64 |= wide(self.type_of(v));
                     u.doubles |= double(self.type_of(v));
+                    u.native16 |= narrow(self.type_of(v));
                 });
                 let Op::Call(f, args) = &inst.op else {
                     continue;

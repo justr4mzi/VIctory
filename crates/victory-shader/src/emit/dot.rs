@@ -180,24 +180,23 @@ impl<'a> Lower<'a> {
                 let mut f_s1_hi =
                     self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[s1_hi]);
 
-                let z = self.s.m.f32(0x8000_0000);
                 if v.neg & 1 != 0 {
-                    f_s0_lo = self.s.m.bin(c, Bin::Sub, z, f_s0_lo);
+                    f_s0_lo = self.fneg(f_s0_lo);
                     if !is_vop3p {
-                        f_s0_hi = self.s.m.bin(c, Bin::Sub, z, f_s0_hi);
+                        f_s0_hi = self.fneg(f_s0_hi);
                     }
                 }
                 if is_vop3p && (v.neg_hi & 1 != 0) {
-                    f_s0_hi = self.s.m.bin(c, Bin::Sub, z, f_s0_hi);
+                    f_s0_hi = self.fneg(f_s0_hi);
                 }
                 if (v.neg >> 1) & 1 != 0 {
-                    f_s1_lo = self.s.m.bin(c, Bin::Sub, z, f_s1_lo);
+                    f_s1_lo = self.fneg(f_s1_lo);
                     if !is_vop3p {
-                        f_s1_hi = self.s.m.bin(c, Bin::Sub, z, f_s1_hi);
+                        f_s1_hi = self.fneg(f_s1_hi);
                     }
                 }
                 if is_vop3p && ((v.neg_hi >> 1) & 1 != 0) {
-                    f_s1_hi = self.s.m.bin(c, Bin::Sub, z, f_s1_hi);
+                    f_s1_hi = self.fneg(f_s1_hi);
                 }
 
                 let mut acc = if name == "v_dot2c_f32_f16" {
@@ -216,7 +215,7 @@ impl<'a> Lower<'a> {
                     f(self, 2)?
                 };
                 if v.neg >> 2 & 1 != 0 {
-                    acc = self.s.m.bin(c, Bin::Sub, z, acc);
+                    acc = self.fneg(acc);
                 }
 
                 // Chained fused multiplies match RDNA2 rounding; write_f applies v.clamp and v.omod.

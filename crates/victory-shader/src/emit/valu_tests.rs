@@ -2925,3 +2925,125 @@ fn normalized_codes_truncate_back_to_themselves() {
         });
     }
 }
+
+#[test]
+fn native16_sfi0_and_hw_fma_rounding() {
+    let declares_native16 = |shader: &HostShader| -> bool {
+        let c = crate::dxbc::Container::parse(&shader.dxil).expect("container");
+        let sfi0 = c.part(crate::dxbc::FourCC::SFI0).expect("SFI0");
+        u64::from_le_bytes(sfi0.data[..8].try_into().expect("8 bytes")) & 0x4_0000 != 0
+    };
+
+    // Scalar/packed f16 ops declare NATIVE_LOW_PRECISION when native16 is enabled, and do not
+    // declare it when native16 is off or for pure f16<->f32 conversions.
+    let add = [vop2(0x32, 0, vgpr(0), 1)];
+    let pk_fma = vop3p(0x0E, 0, vgpr(0), vgpr(1), vgpr(2));
+    let cvt = [vop1(0x0A, 0, vgpr(0))];
+    for (name, body, want_native) in [
+        ("v_add_f16", &add[..], true),
+        ("v_pk_fma_f16", &pk_fma[..], true),
+        ("v_cvt_f16_f32", &cvt[..], false),
+    ] {
+        let s_f32 = lower::with_native16(false, || build_valu_cs(body));
+        assert!(!declares_native16(&s_f32), "{name}: f32 path");
+        let s_nat = lower::with_native16(true, || build_valu_cs(body));
+        assert_eq!(declares_native16(&s_nat), want_native, "{name}: native path");
+    }
+
+    // Hardware execution of single-rounding f16 FMA cases (#2384) and packed f16 FMA when the
+    // hardware adapter reports Native16BitShaderOpsSupported.
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no hardware adapter; skipped");
+        return;
+    };
+    if !host.native16() {
+        eprintln!("hardware adapter has no native 16-bit ops; skipped");
+        return;
+    }
+    let fma_shader = lower::with_native16(true, || {
+        build_valu_cs(&vop3(0x34B, 0, vgpr(1), vgpr(2), vgpr(3))) // v_fma_f16 v0, v1, v2, v3
+    });
+    let pk_shader = lower::with_native16(true, || {
+        build_valu_cs(&vop3p(0x0E, 0, vgpr(1), vgpr(2), vgpr(3)))
+    });
+    drop(_one);
+    let cases: &[[u32; 4]] = &[
+        [0x3C01, 0x3E00, 0x8001, 0x3E01],
+        [0x3C03, 0x3E00, 0x0001, 0x3E05],
+        [0x3C01, 0x3E00, 0xBE00, 0x1600],
+    ];
+    let hw = &[("hardware", false)];
+    let scalar_cases: Vec<[u32; 4]> = cases.iter().map(|&[a, b, c, _]| [a, b, c, 0]).collect();
+    run_cases_on(&fma_shader, &scalar_cases, hw, |backend, idx, _, got| {
+        assert_eq!(got & 0xFFFF, cases[idx][3], "{backend} v_fma_f16 case {idx}");
+    });
+    let pk_cases: Vec<[u32; 4]> = cases
+        .iter()
+        .map(|&[a, b, c, _]| [a | (a << 16), b | (b << 16), c | (c << 16), 0])
+        .collect();
+    run_cases_on(&pk_shader, &pk_cases, hw, |backend, idx, _, got| {
+        let w = cases[idx][3];
+        assert_eq!(got, w | (w << 16), "{backend} v_pk_fma_f16 case {idx}");
+    });
+}
+
+fn mul24(a: u32, b: u32, signed: bool, hi: bool) -> u32 {
+    let ext = |x: u32| {
+        if signed {
+            i64::from(((x << 8) as i32) >> 8)
+        } else {
+            i64::from(x & 0xFF_FFFF)
+        }
+    };
+    let p = ext(a) * ext(b);
+    (if hi { p >> 32 } else { p }) as u32
+}
+
+#[test]
+fn mul24_model_follows_the_isa() {
+    assert_eq!(mul24(0xFF_FFFF, 0xFF_FFFF, false, true), 0xFFFF);
+    assert_eq!(mul24(0xFF_FFFF, 0xFF_FFFF, false, false), 0xFE00_0001);
+    assert_eq!(mul24(0xFF_FFFF, 0xFF_FFFF, true, true), 0);
+    assert_eq!(mul24(0x80_0000, 1, true, true), u32::MAX);
+    assert_eq!(mul24(0xAB80_0000, 0xCD80_0000, false, true), 0x4000);
+}
+
+#[test]
+fn mul_hi_24_bit_products() {
+    let inputs: Vec<[u32; 4]> = [
+        (0, 0),
+        (0xFF_FFFF, 0xFF_FFFF),
+        (0x80_0000, 0x80_0000),
+        (0x80_0000, 1),
+        (0x7F_FFFF, 0x80_0001),
+        (0xFF12_3456, 0x00AB_CDEF),
+        (0x1234_5678, 0x9ABC_DEF0),
+    ]
+    .iter()
+    .map(|&(a, b)| [a, b, 0, 0])
+    .collect();
+    for (op, signed, what) in [
+        (0x0A, true, "v_mul_hi_i32_i24"),
+        (0x0C, false, "v_mul_hi_u32_u24"),
+    ] {
+        let shader = build_valu_cs(&[vop2(op, 0, vgpr(1), 2)]);
+        run_cases(&shader, &inputs, |backend, i, x, got| {
+            let want = mul24(x[0], x[1], signed, true);
+            assert_eq!(
+                got, want,
+                "{backend}: {what} case {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
+}
+
+#[test]
+fn fneg_flips_sign_bit_via_v_add_f32_neg() {
+    // VOP3 v_add_f32 (0x103) v0, -v1, v2: -(+0.0) + (-0.0) == -0.0 (0x8000_0000), verifying
+    // bit-31 XOR negation (`Lower::fneg`) preserves the IEEE sign bit cleanly.
+    let shader_add = build_valu_cs(&vop3_mod(0x103, 0, vgpr(1), vgpr(2), 0, 0, 1, 0, false));
+    run_cases(&shader_add, &[[0x0000_0000, 0x8000_0000, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, 0x8000_0000, "{backend}: fneg(+0.0) + (-0.0)");
+    });
+}

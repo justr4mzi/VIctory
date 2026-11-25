@@ -748,7 +748,7 @@ fn lane_constant_masks(st: &Structured) -> bool {
         }
         for a in st.bools.support(g) {
             match a {
-                Atom::Opaque(_) | Atom::Constant(_) => return true,
+                Atom::Opaque(..) | Atom::Constant(_) => return true,
                 Atom::Phi(id) if joins.insert(id) => {
                     if let Some(edges) = st.phi_masks.get(&id) {
                         work.extend(edges.iter().copied());
@@ -769,6 +769,42 @@ static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 /// code stays inside 32-lane halves run in waves of 32 instead of being refused.
 pub fn set_host_max_wave(lanes: u32) {
     HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the host GPU executes native 16-bit float operations (SM 6.2
+/// `Native16BitShaderOpsSupported`, unless `VICTORY_F16_IN_F32=1`); see
+/// [`set_host_native16`].
+static HOST_NATIVE16: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enables native 16-bit `half` arithmetic in shader translation when `native` is `true`.
+pub fn set_host_native16(native: bool) {
+    HOST_NATIVE16.store(native, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(super) fn host_native16() -> bool {
+    #[cfg(test)]
+    if let Some(native) = TEST_NATIVE16.get() {
+        return native;
+    }
+    HOST_NATIVE16.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's override for [`host_native16`], for its thread only.
+    pub(super) static TEST_NATIVE16: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_native16<R>(native: bool, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_NATIVE16.set(self.0);
+        }
+    }
+    let _reset = Reset(TEST_NATIVE16.replace(Some(native)));
+    f()
 }
 
 thread_local! {
@@ -3530,10 +3566,18 @@ impl<'a> Lower<'a> {
             f = self.unary(6, f);
         }
         if v.neg >> k & 1 != 0 {
-            let z = self.s.m.f32(0x8000_0000);
-            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
+            f = self.fneg(f);
         }
         Ok(f)
+    }
+
+    /// `-x` as the `neg` input modifier computes it: bit 31 flipped, a NaN's
+    /// sign too. `-0.0 - x` leaves a NaN's sign to the host (WARP keeps it).
+    pub(in crate::emit) fn fneg(&mut self, f: V) -> V {
+        let x = self.as_int(f);
+        let sign = self.s.m.i32(0x8000_0000);
+        let x = self.s.m.bin(self.cur, Bin::Xor, x, sign);
+        self.as_float(x)
     }
 
     fn src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
@@ -3932,10 +3976,13 @@ impl<'a> Lower<'a> {
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
-                    Some(h) => Some(self.get(h)?),
-                    None => None,
+            Atom::Opaque(v, h) if self.console_lanes => {
+                // The pair as read where the mask is used: its dwords may
+                // come from separate writes.
+                let hi = if self.x.native.wave64 {
+                    Some(self.get(h)?)
+                } else {
+                    None
                 };
                 let lo = self.get(v)?;
                 let word = |w: Val| match w {
@@ -3951,7 +3998,7 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
-            Atom::Opaque(_) => Err("an opaque lane mask"),
+            Atom::Opaque(..) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
     }
@@ -4292,38 +4339,6 @@ impl<'a> Lower<'a> {
         let t = self.s.m.bin(at, Bin::LShr, word, sh);
         let t = self.s.m.bin(at, Bin::And, t, one);
         self.s.m.cmp(at, pred::NE, t, z)
-    }
-
-    /// The value of the high dword of the wave64 register pair whose low
-    /// dword holds `lo` (none in wave32).
-    fn pair_high(&self, lo: Value) -> Option<Value> {
-        if !self.x.native.wave64 {
-            return None;
-        }
-        let p = self.x.p;
-        let pick = |reg: Reg| match reg {
-            Reg::S(c) => Some(Reg::S(c + 1)),
-            _ => None,
-        };
-        if let Some(&(reg, _)) = p.inputs.iter().find(|i| i.1 == lo) {
-            let h = pick(reg)?;
-            return p.inputs.iter().find(|i| i.0 == h).map(|i| i.1);
-        }
-        if let Some(&(b, i)) = self.phi_at.get(&lo) {
-            let h = pick(p.blocks[b].phis[i].reg)?;
-            return p.blocks[b]
-                .phis
-                .iter()
-                .find(|q| q.reg == h)
-                .map(|q| q.value);
-        }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
-        let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -4690,10 +4705,40 @@ impl<'a> Lower<'a> {
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
-    /// lane must be a constant.
-    fn quad_pick(&mut self, x: V, src: V) -> V {
+    /// lane must be a constant. `pattern`, a quad permutation every quad
+    /// uses (two bits per lane), lets a broadcast or an exchange take one
+    /// quad operation instead of a read of each lane.
+    fn quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
+        match pattern {
+            Some(0xE4) => return x,
+            Some(p @ (0x00 | 0x55 | 0xAA | 0xFF)) => {
+                let lane = self.s.m.i32(u32::from(p & 3));
+                return self.s.op(
+                    c,
+                    "quadReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    122,
+                    &[x, lane],
+                );
+            }
+            Some(p @ (0xB1 | 0x4E | 0x1B)) => {
+                // Lane 0 reads lane 1, 2 or 3: across x, across y or the
+                // diagonal (QuadOp 0, 1, 2), every lane its partner.
+                let direction = self.s.m.i8((p & 3) - 1);
+                return self.s.op(
+                    c,
+                    "quadOp.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    123,
+                    &[x, direction],
+                );
+            }
+            _ => {}
+        }
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
         let mut r = x;
@@ -4834,7 +4879,8 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
             let r = if mesh_quad || (self.s.pixel && quad) {
-                self.quad_pick(x, src)
+                let pattern = (offset & 0x8000 != 0).then_some(offset as u8);
+                self.quad_pick(x, src, pattern)
             } else if self.s.threads.is_some()
                 && self.s.mesh.is_none()
                 && self.exchange.is_none()
@@ -7171,8 +7217,12 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        // Quad permutations, and DPP8 where every lane picks a lane of its
+        // own quad, stay in groups the pixel layout shares.
+        let quad = match dpp {
+            Dpp::Row { ctrl, .. } => ctrl <= 0xFF,
+            Dpp::Lanes { sel, .. } => (0..8).all(|i| ((sel >> (3 * i)) ^ i) & 4 == 0),
+        };
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
@@ -7253,7 +7303,11 @@ impl<'a> Lower<'a> {
             }
         };
         let mut r = if mesh_quad || (self.s.pixel && quad) {
-            self.quad_pick(x, src)
+            let pattern = match dpp {
+                Dpp::Row { ctrl, .. } => Some(ctrl as u8),
+                Dpp::Lanes { .. } => None,
+            };
+            self.quad_pick(x, src, pattern)
         } else {
             self.read_lane(x, src)
         };
@@ -7857,8 +7911,7 @@ impl<'a> Lower<'a> {
                         x = self.unary(6, x);
                     }
                     if v.neg >> i & 1 != 0 {
-                        let z = self.s.m.f32(0x8000_0000);
-                        x = self.s.m.bin(c, Bin::Sub, z, x);
+                        x = self.fneg(x);
                     }
                     xs.push(x);
                 }
@@ -8315,8 +8368,7 @@ impl<'a> Lower<'a> {
             f = self.unary(6, f);
         }
         if v.neg >> k & 1 != 0 {
-            let z = self.s.m.f32(0x8000_0000);
-            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
+            f = self.fneg(f);
         }
         Ok(f)
     }
@@ -8457,6 +8509,18 @@ impl<'a> Lower<'a> {
                 let b = self.s.m.bin(c, Bin::Shl, b, sh);
                 let b = self.s.m.bin(c, op, b, sh);
                 self.s.m.bin(c, Bin::Mul, a, b)
+            }
+            "v_mul_hi_u32_u24" | "v_mul_hi_i32_i24" => {
+                // The high dword of the same 48-bit product: the low 24 bits
+                // of each operand, zero- or sign-extended, multiplied.
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let signed = name == "v_mul_hi_i32_i24";
+                let (sh, op) = (k(self, 8), if signed { Bin::AShr } else { Bin::LShr });
+                let a = self.s.m.bin(c, Bin::Shl, a, sh);
+                let a = self.s.m.bin(c, op, a, sh);
+                let b = self.s.m.bin(c, Bin::Shl, b, sh);
+                let b = self.s.m.bin(c, op, b, sh);
+                self.mul_hi(a, b, signed)
             }
             "v_bfe_u32" | "v_bfe_i32" => {
                 let (a, off, w) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
@@ -10073,11 +10137,7 @@ impl<'a> Lower<'a> {
         let u = self.s.m.bin(c, Bin::Sub, u, three);
         let v = self.s.m.bin(c, Bin::Mul, t, two);
         let v = self.s.m.bin(c, Bin::Sub, v, three);
-        let z = self.s.m.f32(0x8000_0000);
-        let (nu, nv) = (
-            self.s.m.bin(c, Bin::Sub, z, u),
-            self.s.m.bin(c, Bin::Sub, z, v),
-        );
+        let (nu, nv) = (self.fneg(u), self.fneg(v));
         let (one, mone) = (k(self, 1.0), k(self, -1.0));
         let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
         // Per face +x, -x, +y, -y, +z, -z.

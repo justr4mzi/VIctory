@@ -126,9 +126,8 @@ fn has_only_masked_uses(
     }
     let controls_read_derived = |b| {
         parts.st.bools.support(b).iter().any(|atom| match *atom {
-            Atom::Lane(v) | Atom::Uniform(v) | Atom::Phi(v) | Atom::Quad(v) | Atom::Opaque(v) => {
-                derived.contains(&v)
-            }
+            Atom::Lane(v) | Atom::Uniform(v) | Atom::Phi(v) | Atom::Quad(v) => derived.contains(&v),
+            Atom::Opaque(lo, hi) => derived.contains(&lo) || derived.contains(&hi),
             Atom::Constant(_) => false,
         })
     };

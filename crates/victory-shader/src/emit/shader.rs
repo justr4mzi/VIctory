@@ -82,6 +82,9 @@ pub const USER_GROUP_BASE: u32 = 0x104;
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// 16-bit types are used; with [`NATIVE_LOW_PRECISION`], as native
+    /// 16-bit ones (SM 6.2), not minimum precision.
+    pub const LOW_PRECISION: u64 = 1 << 5;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     /// UAVs in a vertex, geometry or mesh program.
@@ -90,6 +93,7 @@ pub(crate) mod flags {
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
+    pub const NATIVE_LOW_PRECISION: u64 = 1 << 23;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
@@ -482,7 +486,9 @@ impl Shader {
         let passes = super::shader_opt() & super::bitcode::opt::MODULE;
         if passes != 0 {
             self.m.optimise(passes);
-            let used = self.m.usage();
+        }
+        let used = self.m.usage();
+        if passes != 0 {
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::INT64, used.int64),
@@ -498,6 +504,13 @@ impl Shader {
                 }
             }
         }
+        for (flag, used) in [(
+            flags::LOW_PRECISION | flags::NATIVE_LOW_PRECISION,
+            used.native16,
+        )] {
+            self.flags = if used { self.flags | flag } else { self.flags & !flag };
+        }
+        self.m.native16 = used.native16;
         // UAVs outside pixel and compute programs (in vertex, geometry and
         // mesh programs), as DXC counts them: declared UAV ranges, not
         // UAVs indexed from the heap.
@@ -837,6 +850,9 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::NATIVE_LOW_PRECISION != 0 {
+            features |= 0x4_0000;
         }
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;
