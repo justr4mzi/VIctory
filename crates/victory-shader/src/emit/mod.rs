@@ -520,6 +520,75 @@ pub fn emit(
             }
         }
     }
+    // Native wave64 compute (`host_max_wave() != 32`) whose cross-lane code
+    // (`half_sum`, or a lane mask holding lanes outside EXEC) sits where not
+    // every lane runs: retry without early-outs/skips and, if still needed,
+    // with enclosing per-lane branches taken wave-wide (`widen`). Unlike
+    // two-wave32 emulation, every console wave is already one host wave, so
+    // none of these forms adds a group barrier.
+    let original = if stuck
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() != 32
+        && matches!(&original, Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what))
+    {
+        let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
+        let form = |p: Option<ir::Program>| {
+            p.and_then(|p| {
+                let st = structure::structure(&p).ok()?;
+                let io = io::raise(&p, native).ok()?;
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+                Some((p, st, io, res))
+            })
+        };
+        let mut out = original;
+        let forms = [
+            ("without early-outs", form(ir::without_early_outs(p))),
+            ("without skips", form(ir::without_skips(p, false))),
+            (
+                "without skips, scalars followed",
+                if deep_on { form(ir::without_skips(p, true)) } else { None },
+            ),
+        ];
+        for (name, f) in &forms {
+            if let Some((fp, fst, fio, fres)) = f {
+                lower::take_needs();
+                let again = emit_program(c, native, fp, fst, fio, fres);
+                if why {
+                    match &again {
+                        Ok((_, wave)) => eprintln!("WAVE64-NATIVE-RETRY {name}: wave {wave:?}"),
+                        Err(e) => eprintln!("WAVE64-NATIVE-RETRY {name}: {e}"),
+                    }
+                }
+                if again.is_ok() {
+                    out = again;
+                    break;
+                }
+            }
+        }
+        if out.is_err() && wide_on {
+            let base = forms
+                .iter()
+                .rev()
+                .find_map(|(_, f)| f.as_ref().map(|x| &x.0))
+                .unwrap_or(p);
+            let again = widen(c, native, base, why);
+            if why {
+                match &again {
+                    Ok((_, wave)) => eprintln!("WAVE64-NATIVE-RETRY wave-wide branches: wave {wave:?}"),
+                    Err(e) => eprintln!("WAVE64-NATIVE-RETRY wave-wide branches: {e}"),
+                }
+            }
+            if again.is_ok() {
+                out = again;
+            }
+        }
+        out
+    } else {
+        original
+    };
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
     // lowering has named the skipped blocks).

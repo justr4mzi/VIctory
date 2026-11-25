@@ -531,6 +531,7 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
 
+<<<<<<< HEAD
 /// The prefix of wave totals the console's structure builder computes (issue #4): each console
 /// wave of a 256-thread group writes its total (10 + its index) to LDS, then, under
 /// `if (id >> 6 != 0)`, loops over the totals of the waves before it with lanes leaving at their
@@ -631,4 +632,121 @@ fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
         assert_eq!(got[t as usize], expected(t), "thread {t}: {got:?}");
     }
     eprintln!("ran on the hardware device: every console wave got the sum of the waves before it");
+}
+
+/// A 64-lane console compute shader on a native wave64 host (`HOST_MAX_WAVE = 64`):
+/// a 16-bit float wave sum (`half_sum`) after an early-out per-lane guard. On wave32
+/// hosts `emit()` already retried without early-outs; native wave64 hosts must take the
+/// same barrier-free retry path so `half_sum` sees all 64 lanes active.
+#[test]
+fn native_wave64_half_sum_inside_early_out_translates_and_runs_exact() {
+    let mut words = vec![
+        0x340C_0085, // v_lshlrev_b32 v6, 5, v0
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0x4A0E_0F06, // v_add_nc_u32 v7, v6, v7
+        0x4A0E_0F00, // v_add_nc_u32 v7, v0, v7
+        0x4A0E_0EFF,
+        0x0000_3C00, // v_add_nc_u32 v7, 0x3c00, v7
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0017, // s_cbranch_execz +23 (past the 20-word reduction + 3-word store to s_endpgm)
+    ];
+    words.extend(
+        super::wave::WAVE_OR_V7_TO_S7
+            .iter()
+            .map(|&w| if w >> 25 == 28 { w & 0x01FF_FFFF | 50 << 25 } else { w }),
+    );
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ]);
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = crate::dxbc::Container::parse(&bytes).expect("empty container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(64));
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("native wave64 emit with early-out retry");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let wide = |h: u16| {
+        if h == 0 {
+            0.0f32
+        } else {
+            f32::from_bits((u32::from(h >> 10) + 112) << 23 | u32::from(h & 0x3FF) << 13)
+        }
+    };
+    let narrow = |f: f32| {
+        if f == 0.0 {
+            return 0u16;
+        }
+        let b = f.to_bits();
+        let h = ((b >> 23) - 112) << 10 | (b >> 13 & 0x3FF);
+        let rest = b & 0x1FFF;
+        (h + u32::from(rest > 0x1000 || rest == 0x1000 && h & 1 == 1)) as u16
+    };
+    let add = |a: u16, b: u16| narrow(wide(a) + wide(b));
+    let expected_for = |below: u32| -> u32 {
+        let mut tree: Vec<u16> = (0..64u16)
+            .map(|t| if u32::from(t) < below { 0x3C00 + 37 * t } else { 0 })
+            .collect();
+        while tree.len() > 1 {
+            tree = tree.chunks(2).map(|c| add(c[0], c[1])).collect();
+        }
+        u32::from(tree[0])
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for below in [64u32, 37, 13, 1] {
+        let Some(got) = on_the_card(&shader, [below, 0]) else { return };
+        assert_eq!(got, expected_for(below), "native wave64 half_sum for {below} active lanes");
+    }
+    eprintln!("ran on the hardware device: native wave64 half_sum inside early-out matches console tree");
+}
+
+/// A 64-lane console compute shader on a native wave64 host (`HOST_MAX_WAVE = 64`):
+/// inside a per-lane branch, `s_not_b64` builds a lane mask holding lanes outside `EXEC`
+/// and `s_bcnt1_i32_b64` reads it as data. Native wave64 computes full 64-lane waves, so
+/// retrying with every lane running the block produces the exact count of inactive lanes
+/// with no group barriers.
+#[test]
+fn native_wave64_mask_outside_exec_inside_branch_translates_and_runs_exact() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0005, // s_cbranch_execz +5 (past body to restore)
+        0xBE8E_087E, // s_not_b64 s[14:15], exec
+        0xBE87_100E, // s_bcnt1_i32_b64 s7, s[14:15]
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = crate::dxbc::Container::parse(&bytes).expect("empty container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(64));
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("native wave64 emit with mask outside EXEC");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (below, expected) in [(64u32, 0u32), (37, 27), (13, 51), (1, 63)] {
+        let Some(got) = on_the_card(&shader, [below, 0]) else { return };
+        assert_eq!(got, expected, "native wave64 ~exec popcount for {below} active lanes");
+    }
+    eprintln!("ran on the hardware device: native wave64 mask outside EXEC matches console popcount");
 }
