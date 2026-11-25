@@ -151,6 +151,14 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                if idle_without_rays(&self.container) {
+                    tracing::info!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        "ray-activation shader skipped while BVH builder is off"
+                    );
+                    return None;
+                }
                 let done = translate(&self.full_hash, &self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
@@ -186,6 +194,16 @@ impl Shader {
             })
             .as_ref()
     }
+}
+
+/// Whether a container's program only activates ray-tracing screen probes
+/// when the BVH builder is disabled (`VICTORY_BVH_BUILDER` unset): running it
+/// without active rays causes missing lighting and reflections.
+#[cfg(windows)]
+fn idle_without_rays(container: &[u8]) -> bool {
+    const NAME: &[u8] = b"CS_ScreenProbes_ActivateRays";
+    !std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")
+        && container.windows(NAME.len()).any(|w| w == NAME)
 }
 
 #[cfg(windows)]

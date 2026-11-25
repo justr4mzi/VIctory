@@ -1,4 +1,5 @@
-use std::io::Write;
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -66,12 +67,34 @@ impl Cache {
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
+        if let Err(error) = published {
             let _ = std::fs::remove_file(&tmp);
+            // A concurrent writer may have published while we converted.
+            // Windows can refuse replacement while a reader holds that file.
+            if !same_output(&path, &output).unwrap_or(false) {
+                return Err(error.into());
+            }
         }
-        published?;
         Ok(path)
     }
+}
+
+fn same_output(path: &Path, output: &[u8]) -> io::Result<bool> {
+    let mut published = File::open(path)?;
+    let metadata = published.metadata()?;
+    if !metadata.is_file() || metadata.len() != output.len() as u64 {
+        return Ok(false);
+    }
+    let mut buffer = [0; 8192];
+    for expected in output.chunks(buffer.len()) {
+        let actual = &mut buffer[..expected.len()];
+        published.read_exact(actual)?;
+        if actual != expected {
+            return Ok(false);
+        }
+    }
+    let mut extra = [0];
+    Ok(published.read(&mut extra)? == 0)
 }
 
 fn tempfile_in(dir: &Path) -> PathBuf {
@@ -117,6 +140,84 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_open_concurrent_cache_entry_wins_only_if_identical() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+
+        struct Paused {
+            inner: Upper,
+            entered: mpsc::Sender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl Converter for Paused {
+            fn id(&self) -> &'static str {
+                self.inner.id()
+            }
+
+            fn version(&self) -> u32 {
+                self.inner.version()
+            }
+
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                self.entered.send(())?;
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))?;
+                self.inner.convert(input)
+            }
+        }
+
+        let publish = |winning_bytes: &[u8]| {
+            let tmp = tempfile::tempdir().unwrap();
+            let cache = Cache::open(tmp.path().join("cache")).unwrap();
+            let (entered, converting) = mpsc::channel();
+            let (resume, resumed) = mpsc::channel();
+            let delayed = Paused {
+                inner: Upper {
+                    version: 1,
+                    runs: AtomicUsize::new(0),
+                },
+                entered,
+                resume: Mutex::new(resumed),
+            };
+            let winner = Upper {
+                version: 1,
+                runs: AtomicUsize::new(0),
+            };
+            std::thread::scope(|scope| {
+                let pending = scope.spawn(|| cache.get_or_convert(&delayed, b"abc"));
+                converting.recv_timeout(Duration::from_secs(10)).unwrap();
+
+                let published = cache.get_or_convert(&winner, b"abc").unwrap();
+                std::fs::write(&published, winning_bytes).unwrap();
+                let guard = std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(&published)
+                    .unwrap();
+                resume.send(()).unwrap();
+                let result = pending.join().unwrap();
+                assert_eq!(std::fs::read(&published).unwrap(), winning_bytes);
+                assert_eq!(
+                    std::fs::read_dir(published.parent().unwrap())
+                        .unwrap()
+                        .count(),
+                    1
+                );
+                drop(guard);
+                result.map(|path| assert_eq!(path, published))
+            })
+        };
+        assert!(publish(b"XYZ").is_err(), "different bytes");
+        assert!(publish(b"ABCD").is_err(), "extra bytes");
+        publish(b"ABC").expect("identical output was published");
     }
 
     #[test]

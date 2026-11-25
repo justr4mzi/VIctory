@@ -44,6 +44,27 @@ pub(crate) struct VertexView {
     stride: u32,
 }
 
+fn rectangle_vertex_range(v: VertexView, count: u32, first: u32) -> Option<(u64, u64, u32)> {
+    if v.address == 0 || v.stride == 0 {
+        return None;
+    }
+    let stride = u64::from(v.stride);
+    let end_bytes = (u64::from(first) + u64::from(count)).checked_mul(stride)?;
+    if end_bytes > u64::from(v.size) {
+        return None;
+    }
+    let from = v.address.checked_add(u64::from(first) * stride)?;
+    let rects = u64::from(count / 3);
+    let src_bytes = rects.checked_mul(3)?.checked_mul(stride)?;
+    from.checked_add(src_bytes)?;
+    let dst_bytes = u32::try_from(rects.checked_mul(6)?.checked_mul(stride)?).ok()?;
+    Some((from, src_bytes, dst_bytes))
+}
+
+fn expanded_rectangle_vertices(vertices: u32) -> Option<u32> {
+    (vertices / 3).checked_mul(6)
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IndexView {
@@ -3150,14 +3171,16 @@ impl State {
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
         let rects = self.topology == RECTANGLES && !self.completes_rects();
-        let ran = ready && (!rects || self.rectangles(list, vertices, first));
-        if ran {
+        let count = if rects {
+            expanded_rectangle_vertices(vertices)
+        } else {
+            Some(vertices)
+        };
+        let ran = ready
+            && (!rects || (count.is_some() && self.rectangles(list, vertices, first)));
+        if let Some(count) = count.filter(|_| ran) {
             // Rectangles were expanded into their own vertex buffers.
-            let (count, from) = if rects {
-                (vertices / 3 * 6, 0)
-            } else {
-                (vertices, first)
-            };
+            let from = if rects { 0 } else { first };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -3185,7 +3208,6 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
-        let rects = u64::from(count / 3);
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
                 .inputs
@@ -3197,21 +3219,16 @@ impl State {
                 continue;
             }
             let v = self.vertex[slot as usize];
-            let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
+            let Some((from, src_bytes, dst_bytes)) = rectangle_vertex_range(v, count, first)
+                .filter(|&(from, src_bytes, _)| crate::shadow::find(from, src_bytes).is_some())
+            else {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
-            }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            };
+            let Some((gpu, to)) = list.scratch(u64::from(dst_bytes)) else {
                 return false;
             };
-            let (from, to, stride) = (from as usize, to as usize, stride as usize);
-            let n = rects as usize;
+            let (from, to, stride) = (from as usize, to as usize, v.stride as usize);
             list.defer_host(move || {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
@@ -3221,15 +3238,15 @@ impl State {
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {
                     (
-                        std::slice::from_raw_parts(from as *const u8, n * 3 * stride),
-                        std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
+                        std::slice::from_raw_parts(from as *const u8, src_bytes as usize),
+                        std::slice::from_raw_parts_mut(to as *mut u8, dst_bytes as usize),
                     )
                 };
                 crate::primitive::expand_rects(src, dst, stride, &elements);
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: dst_bytes,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -4020,6 +4037,66 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RECTANGLE_VIEW: VertexView = VertexView {
+        address: 0x1000_0000,
+        size: 96,
+        stride: 16,
+    };
+
+    #[test]
+    fn rectangle_vertex_range_valid() {
+        assert_eq!(
+            rectangle_vertex_range(RECTANGLE_VIEW, 3, 1),
+            Some((0x1000_0010, 48, 96))
+        );
+    }
+
+    #[test]
+    fn rectangle_vertex_range_rejects_vertex_index_overflow() {
+        assert_eq!(rectangle_vertex_range(RECTANGLE_VIEW, 3, u32::MAX - 2), None);
+        assert_eq!(rectangle_vertex_range(RECTANGLE_VIEW, u32::MAX, 1), None);
+    }
+
+    #[test]
+    fn rectangle_vertex_range_rejects_address_overflow() {
+        let view = VertexView {
+            address: u64::MAX - 15,
+            ..RECTANGLE_VIEW
+        };
+        assert_eq!(rectangle_vertex_range(view, 3, 1), None);
+        assert_eq!(rectangle_vertex_range(view, 3, 0), None);
+    }
+
+    #[test]
+    fn rectangle_vertex_range_rejects_byte_offset_overflow() {
+        let view = VertexView {
+            size: u32::MAX,
+            stride: u32::MAX,
+            ..RECTANGLE_VIEW
+        };
+        assert_eq!(rectangle_vertex_range(view, u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn rectangle_vertex_range_rejects_oversized_buffers() {
+        for stride in [0x8000_0000, 0x4000_0000] {
+            let view = VertexView {
+                size: u32::MAX,
+                stride,
+                ..RECTANGLE_VIEW
+            };
+            assert_eq!(rectangle_vertex_range(view, 3, 0), None);
+        }
+    }
+
+    #[test]
+    fn expanded_rectangle_vertices_rejects_overflow() {
+        let max_rects = u32::MAX / 6;
+        assert_eq!(expanded_rectangle_vertices(max_rects * 3), Some(max_rects * 6));
+        assert_eq!(expanded_rectangle_vertices((max_rects + 1) * 3), None);
+        assert_eq!(expanded_rectangle_vertices(u32::MAX), None);
+    }
 
     #[test]
     fn a_lone_record_opens_a_window_at_the_remembered_step() {

@@ -9027,14 +9027,21 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            // A texture already a copy source takes no barrier (upstream #2545).
+            let source = state != D3D12_RESOURCE_STATE_COPY_SOURCE;
+            let to_dest = transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            if source {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    to_dest,
+                ]);
+            } else {
+                list.ResourceBarrier(&[to_dest]);
+            }
             list.CopyResource(&back, texture);
             // The frame rate, into the corner of what is shown (not of the
             // title's own frame, which the lines below read back).
@@ -9057,14 +9064,15 @@ impl Host {
             });
             let mut drawn = false;
             if let Some((plane, was, plane_format)) = over {
-                let mut barriers = vec![
-                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                    transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    ),
-                ];
+                let mut barriers = Vec::with_capacity(3);
+                if source {
+                    barriers.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+                }
+                barriers.push(transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                ));
                 let moved = was.0 & readable.0 == 0;
                 if moved {
                     barriers.push(transition(plane, was, readable));
@@ -9089,14 +9097,19 @@ impl Host {
                 }
                 list.ResourceBarrier(&barriers);
             } else {
-                list.ResourceBarrier(&[
-                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                    transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_PRESENT,
-                    ),
-                ]);
+                let to_present = transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                );
+                if source {
+                    list.ResourceBarrier(&[
+                        transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                        to_present,
+                    ]);
+                } else {
+                    list.ResourceBarrier(&[to_present]);
+                }
             }
             let _ = drawn;
             copy.close();
