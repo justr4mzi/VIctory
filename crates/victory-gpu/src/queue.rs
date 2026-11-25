@@ -568,8 +568,9 @@ fn join_parts() -> bool {
     let mode = *MODE.get_or_init(|| {
         let mode = match std::env::var("VICTORY_JOIN_PARTS").as_deref() {
             Ok("1") => 1,
+            Ok("0") => 0,
             Ok("alt") => 2,
-            _ => 0,
+            _ => u8::from(!cfg!(test)),
         };
         if mode != 0 {
             tracing::info!(

@@ -550,8 +550,9 @@ pub(crate) fn back_own() -> bool {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_BACK_OWN_VIEW").as_deref() {
         Ok("1") => 1,
+        Ok("0") => 0,
         Ok("alt") => 2,
-        _ => 0,
+        _ => u8::from(!cfg!(test)),
     }) {
         0 => false,
         1 => true,

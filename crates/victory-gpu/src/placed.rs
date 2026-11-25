@@ -160,7 +160,7 @@ unsafe extern "system" fn ticket_release(this: *mut c_void) -> u32 {
 /// Whether such textures are placed (`VICTORY_PLACED_TEX=1`; off by default).
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_TEX").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_TEX").map_or(!cfg!(test), |v| v != "0"))
 }
 
 /// A texture as `desc` says (no target, depth or unordered access; in

@@ -1646,7 +1646,9 @@ impl HostHeap {
     /// from the global heap buffer tracking (`VICTORY_HEAP_BUF_SKIP_TABLED=1`).
     fn skip_tabled_buffers() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_BUF_SKIP_TABLED").is_some_and(|v| v == "1"))
+        *ON.get_or_init(|| {
+            std::env::var_os("VICTORY_HEAP_BUF_SKIP_TABLED").map_or(!cfg!(test), |v| v != "0")
+        })
     }
 
     /// Records what title slot `index` now holds for shaders that pick

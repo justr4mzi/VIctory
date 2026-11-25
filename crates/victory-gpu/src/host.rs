@@ -1749,7 +1749,7 @@ fn inflight_fetch() -> bool {
     *ON.get_or_init(|| {
         relay()
             && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT")
-                .map_or(!cfg!(test), |v| v != "0")
+                .is_some_and(|v| v == "1")
     })
 }
 
