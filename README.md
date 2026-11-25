@@ -318,6 +318,11 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+If the keys do nothing, the title's window probably does not have the focus: click
+it. With `VICTORY_LOG=info` the log says once when a key of this table is down while
+the keyboard is not being read. `VICTORY_KEYS_ANYWHERE=1` reads the keyboard whichever
+window has the focus (typing in another window then reaches the title too).
+
 ## Commands
 
 ```

@@ -1166,7 +1166,7 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
-            if focused() {
+            if focused() || anywhere() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
@@ -1175,6 +1175,8 @@ mod host {
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
                 down.extend(held);
+            } else {
+                unfocused_key_hint();
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -1237,6 +1239,42 @@ mod host {
             .collect()
     }
 
+    /// `VICTORY_KEYS_ANYWHERE=1`: the keyboard is read whichever window has
+    /// the focus. For a setup where the title's window never reports the
+    /// focus; typing in another window then reaches the title too.
+    fn anywhere() -> bool {
+        static ANYWHERE: LazyLock<bool> =
+            LazyLock::new(|| switch_on(std::env::var("VICTORY_KEYS_ANYWHERE").ok().as_deref()));
+        *ANYWHERE
+    }
+
+    /// A switch is on when it is set to something other than nothing or 0.
+    fn switch_on(value: Option<&str>) -> bool {
+        value.is_some_and(|v| !v.is_empty() && v != "0")
+    }
+
+    /// Says once, in the log, that a key of the stand-in pad is down while
+    /// the keyboard is not being read: the usual reason is that the title's
+    /// window does not have the focus.
+    fn unfocused_key_hint() {
+        static HINT: std::sync::Once = std::sync::Once::new();
+        if HINT.is_completed() {
+            return;
+        }
+        let used = super::FALLBACK_BUTTONS
+            .iter()
+            .map(|&(vk, _)| vk)
+            .chain(*b"WASDIJKLZC");
+        // SAFETY: plain queries.
+        if used.into_iter().any(|vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0) {
+            HINT.call_once(|| {
+                tracing::info!(
+                    "a key of the stand-in pad is down, but the foreground window is not the title's:                      click the title's window, or set VICTORY_KEYS_ANYWHERE=1 to read the keyboard                      whichever window has the focus"
+                );
+            });
+        }
+    }
+
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
         let mut process = 0;
@@ -1245,6 +1283,15 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    #[test]
+    fn a_switch_is_on_unless_unset_empty_or_zero() {
+        assert!(!switch_on(None));
+        assert!(!switch_on(Some("")));
+        assert!(!switch_on(Some("0")));
+        assert!(switch_on(Some("1")));
+        assert!(switch_on(Some("yes")));
     }
 
     #[test]
