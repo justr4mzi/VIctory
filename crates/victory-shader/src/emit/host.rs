@@ -96,9 +96,11 @@ impl Host {
                         CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                     if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
                         && let Ok(desc) = adapter.GetDesc1()
-                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
                     {
-                        return Err("the default device is the software adapter".to_owned());
+                        if desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c) {
+                            return Err("the default device is the software adapter".to_owned());
+                        }
+                        super::set_host_vendor(desc.VendorId);
                     }
                 }
             }
