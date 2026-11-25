@@ -1387,6 +1387,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // Textures already uploaded from there must be uploaded again, or the
     // next list that samples them reads their old contents.
     crate::texture::remapped(at, len);
+    // Placed filled textures whose backing overlaps the unmapped/moved pages
+    // can free their host copies immediately.
+    crate::resource::evict_placed_in(at as u64, len as u64);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
