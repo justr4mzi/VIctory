@@ -550,6 +550,7 @@ fn wait(p: &Pending, frame: u64) {
     if shared && left.is_zero() && !own_waited && p.made.get().is_none() && !slow(p) {
         refused(compute);
     }
+    crate::framelog::add(crate::framelog::T::PipelineWaitUs, entered.elapsed().as_micros() as u64);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
