@@ -1,8 +1,19 @@
-# Fork: `justr4mzi/VIctory` (`v10-final` RX 6700 XT Edition, AI-assisted)
+# Fork: `justr4mzi/VIctory` (`v11-ready` RX 6700 XT Edition, AI-assisted)
 
-Personal fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (rebased onto [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) and updated through upstream `465b94f`, PRs `#901`–`#903`, `#1002`, `#1005`, `#1006`, `#1015`, `#1019`, `#1023`, `#1024`, `#1026`, `#1030`, `#1031`, and local RX 6700 XT fixes). Branches `v9-rx6700xt`, `ultimate-rx6700xt`, and `main` (mirrored) target **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64)** with 48 GB system RAM.
+Personal fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (rebased onto [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) through `d510ee4a` with curated community PRs `#768`, `#901`–`#903`, `#927`, `#948`, `#951`, `#957`, `#959` audio, `#989`, `#1002`, `#1005`–`#1068`, upstream `Marvisak` shader fixes `4015a182` / `a1a2077a` / `da82e444`, and local RX 6700 XT fixes). Branches `v11-rx6700xt`, `v9-rx6700xt`, `ultimate-rx6700xt`, and `main` target **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64)** with 48 GB system RAM.
 
-Nothing here is upstream-approved; please direct upstream feedback to the original repositories and PR authors. **Zero game data, filenames, executables, hashes, or offsets are included** (`cargo xtask policy` verified: **`195 files ok`**). This fork, its conflict resolutions, and its local fixes/defaults are **AI-assisted**.
+Nothing here is upstream-approved; please direct upstream feedback to the original repositories and PR authors. **Zero game data, filenames, executables, hashes, or offsets are included** (`cargo xtask policy` verified: **`199 files ok`**). This fork, its conflict resolutions, and its local fixes/defaults are **AI-assisted**.
+
+## `v11` (`v11-ready`, `50b537b4`) Changelog & Verification
+
+- **Verified offline tests (`cargo test --workspace -- --test-threads=1`):** **724 passed, 0 failed, 15 ignored** (`victory-gpu --features diagnostics`: **262 passed, 0 failed, 7 ignored**; `cargo xtask policy`: **199 files ok**; `lower.rs`: `518,390` B <= `524,288` B).
+- **Release build (Thin LTO, `codegen-units = 1`):** `8,843,776` B (`SHA-256: 4E829DAFCC30F8D83E0E24DA8F4C93E20CD8E88A631B6C70DC3365CF6B9ED1C3`).
+- **Wave A (`8a3f9518`):** Merged `fxceless/main` (`d510ee4a`), restored `!cfg!(test)` default `VICTORY_TEXTURE_DROP_MIPS=0`, enabled Thin LTO + `codegen-units = 1`, added mirror fast path.
+- **Wave B (`425460c9`):** `#1043`, `#1068`, `#1032`, `#1058`, `#1059`, `#1066`, `#1044`, `#1063`, `#768`, shader-meta VSM2, `bind_pipeline` updates, plus `v10` session log fixes for `exact`-leak & `wide-textures`.
+- **Wave C (`50b537b4`):**
+  - `Belobug 86292110` log fix: disable blend enable on integer render targets in graphics & mesh PSOs (`crates/victory-gpu/src/pipeline/host.rs`).
+  - Runtime & GPU PRs: `#1039` (crash-isolated shader compiler + worker respawn), `#959` audio (`audio.rs` XMA ring-buffer wrap & loop skip), `#1054` (descriptor slot log `Once` throttle), `#1055` (volume slice overlap check), `#1048` (`StageBudget` clamp), `#1035` (capture 512 MiB cap), `#989` (staging subresource padding bounds check).
+  - Shader / 16-bit / precision PRs & upstream commits: `#927` (`emit/halves.rs` 16-bit half views), `#1036` (16-bit compare `opsel`), `#1040` (`v_div_fixup_f16`), `#1042` (packed int16 clamp saturation), `#957` (2D `image_get_resinfo` depth), `#951` (signed `s_add_i32`/`s_sub_i32` SCC), `#948` (VOP3 unsigned add/sub clamp), `#1041` (`reverse_postorder`), `Marvisak 4015a182` (mesh quad check), `a1a2077a` (`UAVS_EVERY_STAGE` outside pixel/compute), `da82e444` (`emit/norm.rs` exact `Unorm`/`Snorm` loads with `-1.0` `at_low` clamp).
 
 ## Status & Live Testing History (RX 6700 XT, Windows 11)
 

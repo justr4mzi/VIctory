@@ -1,9 +1,23 @@
-# `justr4mzi/VIctory` — `v10-final` RX 6700 XT Edition (`AI-assisted`)
+# `justr4mzi/VIctory` — `v11-ready` RX 6700 XT Edition (`AI-assisted`)
 
-> **Personal fork (`AI-assisted`)** built on [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) (merged through `465b94f` + curated community PRs `#901`–`#903`, `#1002`, `#1005`, `#1006`, `#1015`, `#1019`, `#1023`, `#1024`, `#1026`, `#1030`, `#1031`), local GPU/unwinder bug fixes, and validated `!cfg!(test)` defaults for **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64) + 48 GB RAM**.
-> Previous milestones are preserved on `backup-v6-final`, `backup-v7-final`, `backup-v8-final`, and `backup-v9-base2`.
+> **Personal fork (`AI-assisted`)** built on [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) (`d510ee4a`), curated PRs (`#768`, `#901`–`#903`, `#927`, `#948`, `#951`, `#957`, `#959` audio, `#989`, `#1002`, `#1005`–`#1068`), upstream `Marvisak/VIctory` shader fixes (`4015a182`, `a1a2077a`, `da82e444`), and validated `!cfg!(test)` defaults for **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64) + 48 GB RAM**.
+> Previous milestones are preserved on `backup-v6-final`, `backup-v7-final`, `backup-v8-final`, `backup-v9-base2`, and `v10-final`.
 > Full changelog and PR comparison ledger: see **[FORK.md](FORK.md)**.
-> Zero game files, assets, filenames, hashes, or offsets are included (`cargo xtask policy`: **195 files ok**).
+> Zero game files, assets, filenames, hashes, or offsets are included (`cargo xtask policy`: **199 files ok**).
+
+## `v11` Highlights & Verified Checks
+
+- **Workspace & GPU tests:**
+  - `cargo test --workspace -- --test-threads=1`: **724 passed, 0 failed, 15 ignored**.
+  - `cargo test -p victory-gpu --features diagnostics -- --test-threads=1`: **262 passed, 0 failed, 7 ignored**.
+  - `cargo xtask policy`: **199 files ok** (`lower.rs` = `518,390` B <= `524,288` B without changing `xtask/src/policy.rs`).
+- **Release build (Thin LTO + `codegen-units = 1`):** `8,843,776` B (`SHA-256: 4E829DAFCC30F8D83E0E24DA8F4C93E20CD8E88A631B6C70DC3365CF6B9ED1C3`).
+- **Key improvements over `v10-final`:**
+  - **Wave A (`8a3f9518`):** Merged `fxceless/main` (`d510ee4a`), set `!cfg!(test)` default `VICTORY_TEXTURE_DROP_MIPS=0` (full mip clarity instead of forced half-res drop), enabled Thin LTO + `codegen-units = 1`, added mirror fast path.
+  - **Wave B (`425460c9`):** Curated PRs `#1043`, `#1068`, `#1032`, `#1058`, `#1059`, `#1066`, `#1044`, `#1063`, `#768`, shader-meta VSM2, `bind_pipeline` updates, plus `v10` session log fixes for exact-leak & `wide-textures`.
+  - **Wave C (`50b537b4`):** `Belobug 86292110` integer render-target blend disable in graphics & mesh PSOs, `#1039` crash-isolated shader compiler + worker respawn, `#959` XMA audio ring-buffer/loop-skip fix, `#927` 16-bit half texture/descriptor views (`emit/halves.rs`), `#948`/`#951`/`#957`/`#989`/`#1035`/`#1036`/`#1040`/`#1041`/`#1042`/`#1048`/`#1054`/`#1055`, and `Marvisak` `4015a182`, `a1a2077a`, `da82e444` (`emit/norm.rs` exact `Unorm`/`Snorm` loads with `-1.0` clamp).
+
+---
 
 ## `v10-final` Verified Performance & Fixes
 
