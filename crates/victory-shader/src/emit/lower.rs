@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, Ty, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
@@ -210,6 +210,17 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// Immediate sampler handles that stand for a sampler chosen by control
+    /// flow among immediate ones and a table's ([`Lower::sampler_choice`]):
+    /// per such handle, which choice was taken (i32), the table's heap
+    /// index where one is a choice, the handles' properties, and per
+    /// choice its immediate sampler's handle (`None`: the table's).
+    /// A sample through such a handle branches ([`Lower::sample_op`]).
+    chosen_samplers: HashMap<V, (V, Option<V>, (u32, u32), Vec<Option<V>>)>,
+    /// The four channels of a sample through such a sampler, joined one by
+    /// one (WARP removes the device for a join of the whole result), by
+    /// the value [`Lower::sample_op`] returns for it.
+    sampled_channels: HashMap<V, [V; 4]>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1657,6 +1668,8 @@ impl<'a> Lower<'a> {
             },
             handles: HashMap::new(),
             strides: HashMap::new(),
+            chosen_samplers: HashMap::new(),
+            sampled_channels: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -6454,6 +6467,11 @@ impl<'a> Lower<'a> {
                     _ => Err("a typed root view"),
                 }
             }
+            Source::Phi { block, args }
+                if sampler && args.iter().any(|a| matches!(a, Source::Constant(_))) =>
+            {
+                self.sampler_choice(site, *block, args, props)
+            }
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
@@ -6485,6 +6503,121 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// A sampler chosen by control flow where a path builds it from
+    /// constants (an immediate sampler, which has no heap index): the
+    /// title's material shaders pick a linear sampler that clamps or one
+    /// that wraps, both built in the code (PS_TexturedLit_8,
+    /// PS_TexturedLit_ReflectionMap and others), and a path may take one
+    /// from a table too. DXIL joins no handles, so the join gets which of
+    /// the choices was taken (and the table's heap index, where one is), a
+    /// handle of the first immediate sampler stands for the choice, and a
+    /// sample through it branches to the one taken ([`Lower::sample_op`]):
+    /// the heap's handle is only made where the table's sampler was taken.
+    fn sampler_choice(&mut self, site: Site, block: usize, args: &[Source], props: (u32, u32)) -> Result<V, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let p = self.x.p;
+        // The choices: immediate samplers' words, `None` for a table's.
+        let mut choices: Vec<Option<Vec<u32>>> = Vec::new();
+        let (mut which, mut indices) = (Vec::new(), Vec::new());
+        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let (choice, index) = match arg {
+                Source::Constant(w) => (Some(w.clone()), self.s.m.undef(self.s.t.i32)),
+                Source::Loaded { load, first } => {
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let index = self.heap_index(*load, *first, true);
+                    self.cur = here;
+                    (None, index?)
+                }
+                _ => return Err(WHY),
+            };
+            let k = match choices.iter().position(|c| *c == choice) {
+                Some(k) => k,
+                None => {
+                    choices.push(choice);
+                    choices.len() - 1
+                }
+            };
+            which.push((self.s.m.i32(k as u32), at));
+            indices.push((index, at));
+        }
+        let join = self.block[block].ok_or(WHY)?;
+        let chosen = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(chosen, which);
+        let index = if choices.contains(&None) {
+            let phi = self.s.m.phi(join, self.s.t.i32);
+            self.s.m.set_phi(phi, indices);
+            Some(phi)
+        } else {
+            None
+        };
+        // Each immediate sampler's handle (made here: they need no choice).
+        let mut handles = Vec::new();
+        for choice in &choices {
+            handles.push(match choice {
+                Some(words) => Some(self.handle(site, &Source::Constant(words.clone()), true, props)?),
+                None => None,
+            });
+        }
+        let stands = handles.iter().flatten().next().copied().ok_or(WHY)?;
+        self.chosen_samplers.insert(stands, (chosen, index, props, handles));
+        Ok(stands)
+    }
+
+    /// A sample op (`self.s.op` with the sampler handle as `args[1]`): one
+    /// op, or with a sampler chosen by control flow ([`Lower::sampler_choice`])
+    /// a branch to the choice taken, each sampling through its own sampler
+    /// (an immediate one's handle, or the heap's made in its branch),
+    /// joined; code goes on in the join.
+    fn sample_op(&mut self, c: usize, name: &str, attr: Attr, ty: Ty, opcode: u32, args: &[V]) -> V {
+        let Some((chosen, index, props, handles)) = args.get(1).and_then(|h| self.chosen_samplers.get(h)).cloned() else {
+            return self.s.op(c, name, attr, ty, opcode, args);
+        };
+        let join = self.s.m.new_block();
+        let mut results = Vec::new();
+        let mut test = c;
+        let last = handles.len() - 1;
+        for (k, handle) in handles.into_iter().enumerate() {
+            let here = self.s.m.new_block();
+            if k < last {
+                let next = self.s.m.new_block();
+                let kv = self.s.m.i32(k as u32);
+                let is = self.s.m.cmp(test, pred::EQ, chosen, kv);
+                self.s.m.terminate(test, Term::CondBr(is, here, next));
+                test = next;
+            } else {
+                self.s.m.terminate(test, Term::Br(here));
+            }
+            let h = match (handle, index) {
+                (Some(h), _) => h,
+                (None, Some(index)) => self.s.heap_handle(here, index, true, false, props),
+                (None, None) => unreachable!("a table's choice has its index"),
+            };
+            let mut these = args.to_vec();
+            these[1] = h;
+            let r = self.s.op(here, name, attr, ty, opcode, &these);
+            let channels: [V; 4] = std::array::from_fn(|ch| self.s.m.extract(here, r, ch as u32));
+            self.s.m.terminate(here, Term::Br(join));
+            results.push((r, channels, here));
+        }
+        // Joined by channel: the result itself is only read by channel
+        // (`image`), and WARP removes the device for a phi of the struct.
+        let f32t = self.s.t.f32;
+        let joined: [V; 4] = std::array::from_fn(|ch| {
+            let phi = self.s.m.phi(join, f32t);
+            self.s.m.set_phi(phi, results.iter().map(|&(_, c, at)| (c[ch], at)).collect());
+            phi
+        });
+        let stands = results[0].0;
+        self.sampled_channels.insert(stands, joined);
+        self.cur = join;
+        stands
     }
 
     /// The heap index a descriptor phi picks. Each predecessor computes its
@@ -9798,6 +9931,11 @@ impl<'a> Lower<'a> {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
             let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            // A sampler chosen by control flow is joined at sample ops
+            // (`sample_op`) only: not for a gather or a level query.
+            if self.chosen_samplers.contains_key(&sh) && !matches!(op, 60..=65) {
+                return Err("a descriptor chosen by control flow");
+            }
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -9916,7 +10054,7 @@ impl<'a> Lower<'a> {
                 60 if !self.s.pixel => {
                     args.extend(&os);
                     args.push(self.s.m.f32(0));
-                    self.s.op(
+                    self.sample_op(
                         c,
                         "sampleLevel.f32",
                         Attr::ReadOnly,
@@ -9949,8 +10087,7 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os);
                     args.push(clamp);
-                    self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    self.sample_op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
                     // With a16 the bias is an f16 in the low half of its
@@ -9966,7 +10103,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     if self.s.pixel {
                         args.extend([bias, clamp]);
-                        self.s.op(
+                        self.sample_op(
                             c,
                             "sampleBias.f32",
                             Attr::ReadOnly,
@@ -9977,7 +10114,7 @@ impl<'a> Lower<'a> {
                     } else {
                         // As above: the bias is the level.
                         args.push(bias);
-                        self.s.op(
+                        self.sample_op(
                             c,
                             "sampleLevel.f32",
                             Attr::ReadOnly,
@@ -10023,7 +10160,7 @@ impl<'a> Lower<'a> {
                     let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
                     args.extend(&os);
                     args.push(lod);
-                    self.s.op(
+                    self.sample_op(
                         c,
                         "sampleLevel.f32",
                         Attr::ReadOnly,
@@ -10043,7 +10180,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.extend(g);
                     args.push(clamp);
-                    self.s.op(
+                    self.sample_op(
                         c,
                         "sampleGrad.f32",
                         Attr::ReadOnly,
@@ -10063,8 +10200,7 @@ impl<'a> Lower<'a> {
                     } else {
                         "sampleCmpLevelZero.f32"
                     };
-                    self.s
-                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
+                    self.sample_op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
@@ -10075,7 +10211,7 @@ impl<'a> Lower<'a> {
                     };
                     args.extend(&os);
                     args.push(lod);
-                    self.s.op(
+                    self.sample_op(
                         c,
                         "sampleLevel.f32",
                         Attr::ReadOnly,
@@ -10201,6 +10337,9 @@ impl<'a> Lower<'a> {
                 &args,
             )
         };
+        // A sample through a sampler chosen by control flow ends in its
+        // join (`sample_op`): what follows goes there.
+        let c = self.cur;
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
@@ -10213,7 +10352,11 @@ impl<'a> Lower<'a> {
         for ch in channels {
             let x = match gathered {
                 Some(g) => g[ch as usize],
-                None => self.s.m.extract(c, r, ch),
+                // Joined by channel after a sampler chosen by control flow.
+                None => match self.sampled_channels.get(&r) {
+                    Some(joined) => joined[ch as usize],
+                    None => self.s.m.extract(c, r, ch),
+                },
             };
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to

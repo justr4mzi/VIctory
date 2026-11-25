@@ -16,6 +16,12 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_with(words, buffers, 1, false)
+}
+
+/// [`build`], with `nonuniform` heap accesses that take each lane's own
+/// index, and wave operations or not.
+fn build_with(words: &[u32], buffers: bool, nonuniform: u32, wave_ops: bool) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -71,15 +77,16 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
-    assert!(!lowered.wave_ops);
+    // As many accesses with each lane's own heap index, no wave operation.
+    assert_eq!(lowered.nonuniform_handles, nonuniform);
+    assert_eq!(lowered.wave_ops, wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
+        samplers: lowered.samplers.clone(),
+        // Immediate samplers as the host's static ones, as `emit` makes them.
+        static_samplers: lowered.samplers.iter().map(|&w| super::StaticSampler::from_words(w)).collect(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
@@ -246,6 +253,67 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         assert!(!results.is_empty());
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
+        }
+    }
+}
+
+/// A sampler chosen by a branch between two the program builds from
+/// constants (the title's material shaders: a linear sampler that clamps,
+/// dword 0 = 0x92, or one that wraps, 0): `scc1` takes the clamping one,
+/// the table at s0 being at heap index 0, with `s_cmp_eq_u32` (`eq`), the
+/// wrapping one with `s_cmp_lg_u32` (a condition every wave of WARP's
+/// shares). Each lane samples entry 0 at (1.25, 0.5) and stores red.
+fn sampler_by_branch(eq: bool) -> Vec<u32> {
+    vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        if eq { 0xBF06_8000 } else { 0xBF07_8000 }, // s_cmp_eq_u32 / s_cmp_lg_u32 s0, 0
+        0xBF85_0007, // s_cbranch_scc1 -> clamp
+        0xBE88_0380, // s_mov_b32 s8, 0 (wrap)
+        0xBE89_03FF,
+        0x00C0_0000, // s_mov_b32 s9, 0xc00000
+        0xBE8A_03FF,
+        0x1850_0000, // s_mov_b32 s10, 0x18500000
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xBF82_0007, // s_branch -> join
+        0xBE88_03FF,
+        0x0000_0092, // clamp: s_mov_b32 s8, 0x92
+        0xBE89_03FF,
+        0x00C0_0000, // s_mov_b32 s9, 0xc00000
+        0xBE8A_03FF,
+        0x1850_0000, // s_mov_b32 s10, 0x18500000
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0x7E04_02FF,
+        0x3FA0_0000, // join: v_mov_b32 v2, 1.25
+        0x7E06_02F0, // v_mov_b32 v3, 0.5
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]
+}
+
+#[test]
+fn a_sampler_chosen_by_a_branch_between_immediate_ones_samples_as_the_one_taken() {
+    let texels = [[1.0f32, 0.0, 0.0, 1.0], [2.0, 0.0, 0.0, 1.0]];
+    for (eq, want) in [(true, 2.0f32), (false, 1.0)] {
+        let shader = build_with(&sampler_by_branch(eq), false, 0, false);
+        assert_eq!(shader.static_samplers.len(), 2);
+        let views = [View::Texture(2, 1, &texels), View::Texture(2, 1, &texels), View::RawUav(32)];
+        let results = run(&shader, &views);
+        assert!(!results.is_empty());
+        for (label, words) in results {
+            let red: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
+            // Clamped, 1.25 reads the last texel; wrapped, 0.25 the first.
+            assert_eq!(red, vec![want; 32], "{label}, eq {eq}");
         }
     }
 }
