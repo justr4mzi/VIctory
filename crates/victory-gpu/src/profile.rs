@@ -1206,6 +1206,8 @@ unsafe fn frame_fits(
         let mut save_end = 0usize;
         // Bases other than the stack pointer: frame pointers set up.
         let mut bases = [0usize; 4];
+        let rip_rva = context.Rip.wrapping_sub(image);
+        let mut in_v2_epilog = false;
         let mut based = 0;
         for part in 0..8 {
             if data & 1 != 0 {
@@ -1224,6 +1226,7 @@ unsafe fn frame_fits(
             let count = usize::from(count);
             let slot = |i: usize| codes.add(2 * i).cast::<u16>().read_unaligned();
             let mut i = 0;
+            let mut epilog_size = 0u64;
             let (mut found, mut set) = (false, false);
             while i < count {
                 let [offset, op] = codes.add(2 * i).cast::<[u8; 2]>().read();
@@ -1280,7 +1283,30 @@ unsafe fn frame_fits(
                         3
                     }
                     // Epilogue note (version 2) and spare code.
-                    6 => 1,
+                    6 => {
+                        if part == 0 && (version & 7) == 2 {
+                            if i == 0 {
+                                epilog_size = u64::from(offset);
+                                if op_info & 1 != 0 {
+                                    let ep_start = u64::from(finish).saturating_sub(epilog_size);
+                                    if rip_rva >= ep_start && rip_rva < u64::from(finish) {
+                                        in_v2_epilog = true;
+                                    }
+                                }
+                            } else if epilog_size > 0 {
+                                let off = ((op_info as u64) << 8) | u64::from(offset);
+                                if off != 0 {
+                                    let ep_start = u64::from(finish).saturating_sub(off);
+                                    if rip_rva >= ep_start
+                                        && rip_rva < ep_start.saturating_add(epilog_size)
+                                    {
+                                        in_v2_epilog = true;
+                                    }
+                                }
+                            }
+                        }
+                        1
+                    }
                     7 => {
                         if i + 2 > count {
                             return false;
@@ -1345,7 +1371,7 @@ unsafe fn frame_fits(
                     && bases[..based]
                         .iter()
                         .all(|&base| base.checked_add(reach).is_some_and(|top| top <= limit))
-                    && epilogue_fits(context, code as usize, pointer, start, end);
+                    && epilogue_fits(context, code as usize, pointer, in_v2_epilog, start, end);
             }
             let parent = codes
                 .add(2 * ((count + 1) & !1))
@@ -1377,9 +1403,11 @@ unsafe fn epilogue_fits(
     context: &CONTEXT,
     code: usize,
     pointer: u8,
+    force_epilog: bool,
     start: usize,
     end: usize,
 ) -> bool {
+    let _ = pointer;
     let rip = context.Rip as *const u8;
     // Past the function's end reads as a breakpoint: nothing of an epilogue.
     let byte = |i: usize| {
@@ -1402,18 +1430,43 @@ unsafe fn epilogue_fits(
         // add rsp, n.
         rsp = moved(context.Rsp, number(3));
         at = 7;
-    } else if byte(0) & 0xfe == 0x48 && byte(1) == 0x8d {
-        // lea rsp, [register + n]: taken only from the frame register.
-        let register = (byte(0) & 1) << 3 | byte(2) & 7;
-        let (near, far) = (byte(2) & 0xf8 == 0x60, byte(2) & 0xf8 == 0xa0);
-        if register != 0 && register == pointer && (near || far) {
-            let by = if near {
-                i32::from(byte(3) as i8)
-            } else {
-                number(3)
-            };
-            rsp = moved(gpr(context, register), by);
-            at = if near { 4 } else { 7 };
+    } else if byte(0) & 0xfe == 0x48 && byte(1) == 0x8d && byte(2) & 0x38 == 0x20 {
+        // lea rsp, [reg + disp] (`48/49 8d`, `ModRM.reg == 4`).
+        let mod_bits = byte(2) & 0xc0;
+        let rm = byte(2) & 7;
+        if rm == 4 {
+            if byte(3) != 0x24 {
+                return false;
+            }
+            match mod_bits {
+                0x00 => at = 4,
+                0x40 => {
+                    rsp = moved(context.Rsp, i32::from(byte(4) as i8));
+                    at = 5;
+                }
+                0x80 => {
+                    rsp = moved(context.Rsp, number(4));
+                    at = 8;
+                }
+                _ => return false,
+            }
+        } else {
+            let register = (byte(0) & 1) << 3 | rm;
+            match mod_bits {
+                0x00 if rm != 5 => {
+                    rsp = gpr(context, register) as usize;
+                    at = 3;
+                }
+                0x40 => {
+                    rsp = moved(gpr(context, register), i32::from(byte(3) as i8));
+                    at = 4;
+                }
+                0x80 => {
+                    rsp = moved(gpr(context, register), number(3));
+                    at = 7;
+                }
+                _ => {}
+            }
         }
     }
     // The `pop`s.
@@ -1436,9 +1489,9 @@ unsafe fn epilogue_fits(
     // A return or a jump: only then are the instructions before it run.
     let leaves = matches!(byte(at), 0xc3 | 0xc2 | 0xeb | 0xe9)
         || byte(at) == 0xf3 && byte(at + 1) == 0xc3
-        || byte(at) == 0xff && byte(at + 1) == 0x25
+        || byte(at) == 0xff && byte(at + 1) & 0x38 == 0x20
         || byte(at) & 0xf0 == 0x40 && byte(at + 1) == 0xff && byte(at + 2) & 0x38 == 0x20;
-    !leaves
+    !(leaves || force_epilog)
         || (!pops_rsp
             && pops < 64
             && rsp >= start

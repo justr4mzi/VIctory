@@ -1122,21 +1122,40 @@ fn epilogue_fits_recognizes_bnd_prefixed_epilogues() {
             "add rsp, 0x200; bnd rep ret",
             &[0x48, 0x81, 0xc4, 0x00, 0x02, 0x00, 0x00, 0xf2, 0xf3, 0xc3],
         ),
+        (
+            "add rsp, 0x200; jmp rax",
+            &[0x48, 0x81, 0xc4, 0x00, 0x02, 0x00, 0x00, 0xff, 0xe0],
+        ),
+        (
+            "lea rsp, [rsp + 0x200]; ret",
+            &[0x48, 0x8d, 0xa4, 0x24, 0x00, 0x02, 0x00, 0x00, 0xc3],
+        ),
+        (
+            "lea rsp, [rax + 0x200]; ret",
+            &[0x48, 0x8d, 0xa0, 0x00, 0x02, 0x00, 0x00, 0xc3],
+        ),
     ];
     for &(name, code) in bad {
         ctx.Rip = code.as_ptr() as u64;
         assert!(
-            !unsafe { epilogue_fits(&ctx, code.len(), 0, start, end) },
+            !unsafe { epilogue_fits(&ctx, code.len(), 0, false, start, end) },
             "{name} must be rejected"
         );
     }
+
+    let forced_bad: &[u8] = &[0x48, 0x81, 0xc4, 0x00, 0x02, 0x00, 0x00, 0x5b, 0x90];
+    ctx.Rip = forced_bad.as_ptr() as u64;
+    assert!(
+        !unsafe { epilogue_fits(&ctx, forced_bad.len(), 0, true, start, end) },
+        "forced v2 epilog without terminator must still validate rsp bounds"
+    );
 
     // An in-bounds `add rsp, 0x10; bnd ret` must still fit, and real
     // `RtlVirtualUnwind` executes it as an epilogue (`rsp_delta = 0x18`).
     let ok = [0x48u8, 0x83, 0xc4, 0x10, 0xf2, 0xc3];
     ctx.Rip = ok.as_ptr() as u64;
     assert!(
-        unsafe { epilogue_fits(&ctx, ok.len(), 0, start, end) },
+        unsafe { epilogue_fits(&ctx, ok.len(), 0, false, start, end) },
         "in-bounds add rsp, 0x10; bnd ret must fit"
     );
 
