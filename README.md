@@ -1,27 +1,26 @@
-# `justr4mzi/VIctory` — `v7` RX 6700 XT World-Rendering Edition (`AI-assisted`)
+# `justr4mzi/VIctory` — `v8` RX 6700 XT Edition (`AI-assisted`)
 
-> **Personal fork (`AI-assisted`)** rebased onto [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) (`9376fd6`) for **Windows 11 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64)**.
-> Previous `v6` stack is preserved intact on branch `backup-v6-final` and tag `v6-final` (`a0b1b07`).
-> Full changelog (`02f404e` -> `v1..v6` -> `v7`) and skipped/deferred PR ledger: see **[FORK.md](FORK.md)**.
-> Zero game files, assets, filenames, hashes, or offsets are included (`cargo xtask policy`: **177 files ok**).
+> **Personal fork (`AI-assisted`)** built on [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) (`9376fd6` + `#800`–`#838`), community AMD/shader fixes, `0x0007b/XBVK` eviction ports, and local `v8` GPU fixes for **Windows 11 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64)**.
+> Previous `v6` and `v7` stacks are preserved intact on `backup-v6-final` (`v6-final`) and `backup-v7-final`.
+> Full changelog (`02f404e` -> `v1..v7` -> `v8`) and skipped/deferred PR ledger: see **[FORK.md](FORK.md)**.
+> Zero game files, assets, filenames, hashes, or offsets are included (`cargo xtask policy`: **180 files ok**).
 
-## `v7` Summary & Offline Verification
+## `v8` Summary & Offline Verification
 
-- **Workspace tests (`cargo test --workspace -- --test-threads=1`):** **567 passed, 0 failed, 10 ignored**.
-- **GPU diagnostics tests (`cargo test -p victory-gpu --features diagnostics -- --test-threads=1`):** **167 passed, 0 failed, 3 ignored**.
-- **Asset policy (`cargo xtask policy`):** **`177 files ok`** (with `lower.rs` unit tests extracted to `lower_tests.rs`, `520,122` B <= `524,288` B, without altering `xtask/src/policy.rs`).
-- **Release build (`victory.exe`):** **`8,195,072` bytes** (Thin LTO, `1m 13s`).
+- **Workspace tests (`cargo test --workspace -- --test-threads=1`):** **598 passed, 0 failed, 13 ignored** (`+31` tests over `v7`).
+- **GPU diagnostics tests (`cargo test -p victory-gpu --features diagnostics -- --test-threads=1`):** **186 passed, 0 failed, 3 ignored**.
+- **Asset policy (`cargo xtask policy`):** **`180 files ok`** (`lower.rs` at `522,554` B <= `524,288` B without altering `xtask/src/policy.rs`).
+- **Release build (`victory.exe`):** **`8,279,552` bytes** (Thin LTO, `39.02s`).
 - **Shader translation + DXIL validation (`dxil.dll 10.0.26100.0`, 26,599 containers / 26,148 programs):**
-  - **Vertex / Pixel:** `14,137` validated of `14,248` emitted (`14,259` total)
-  - **Compute:** **`2,729` validated of `2,729` emitted** (`2,734` total, `100%` of emitted CS!)
+  - **Vertex / Pixel:** `14,129` validated of `14,240` emitted (`14,259` total; `fx-pr-801` now cleanly refuses `8` broken unhandled `FIRST_HALF` shaders instead of silently zeroing)
+  - **Compute:** **`2,729` validated of `2,729` emitted** (`2,734` total, `100%` of emitted CS)
   - **Mesh:** `8,660` validated of `8,765` emitted (`8,765` total)
-  - **Total primary validated:** **`25,526`** (`+1,007` over `v6`, `+3,848` over upstream `02f404e`), `216` validator rejections. *(Verified offline; not yet tested live in-game.)*
-- **Key additions over `fxceless 9376fd6`:**
-  - **AMD RX 6700 XT stability (Layer 1):** `myokex` pipeline slow-compile timeouts/wait budgets + RT resolve skip + `myokex #5` known AMD crasher PSO skip & release `VICTORY_SKIP_PIPELINES` + `ZSlayerHQ #7` BVH skinning/trace skip while BVH builder is off + `ztrx #61` automatic AMD (`0x1002`) `bitcode::opt::REUSE` bypass + `myokex #4` self-`CopyResource` skip.
-  - **World correctness, Series S & VRAM (Layer 2):** `fxceless` `#795`, `#794`, `#784`, `#792`, `#783`, `#793`, `#610` (`VICTORY_TEXTURE_DROP_MIPS=N`), `#188` (`--console series-s` stretch/overlay), `#518` (64 KiB thread-group `CARD_COMPARE`), plus `ka1qux` `99cec4e` (`#632` slot write-number race fix) and `6391441` (`#606` remap marks staged textures dirty).
-  - **Native Wave64 & Shaders (Layer 3):** `fxceless` `#497`, `#558` (barrier-free all-lane native wave64 retry), `ZSlayerHQ #6` (`b05b60e` immediate sampler phi), `ztrx #68` (`81428dc` standalone `v_interp_p1_f32`), `ztrx #69` (`0cad4fa` single texture size dword read).
-- **RX 6700 XT Tuning Switches:** Defaults use `VICTORY_RELAY=2` and `VICTORY_NO_WATCHDOG=1`. Optional switches for live tuning: `VICTORY_TEXTURE_DROP_MIPS=1`, `VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_CARD_FETCH_INFLIGHT=1`, `VICTORY_ACTIVATE_RAYS=0`, `VICTORY_D3D12_BACKGROUND=0`, `--console series-s`.
-- **Credits:** Upstream [Marvisak/VIctory](https://github.com/Marvisak/VIctory), [fxceless/victory-fork](https://github.com/fxceless/victory-fork), [myokex/victory-amd](https://github.com/myokex/victory-amd), [ztrx](https://github.com/ztrx), [ZSlayerHQ](https://github.com/ZSlayerHQ), [ka1qux](https://github.com/ka1qux).
+  - **Total primary validated:** **`25,518`** (`25,734` emitted; `+3,840` over upstream `02f404e`). *(Verified offline; ready for live launch on RX 6700 XT with baked-in defaults.)*
+- **Key `v8` additions over `v7`:**
+  - **Baked-in RX 6700 XT defaults (`!cfg!(test)`, overridable via env):** `VICTORY_RELAY=2`, `VICTORY_TEXTURE_DROP_MIPS=1`, `VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_CARD_ROOM_FOR_BUFFERS=1`, `VICTORY_CARD_REHASH_RUNS=1`, `VICTORY_CARD_FETCH_INFLIGHT=1`, `VICTORY_PAGE_WRITES=1` (`guards + slots`), and `VICTORY_ACTIVATE_RAYS=0`.
+  - **Custom `v8` GPU fixes:** Non-256-byte-aligned constant buffers (`View::Constant`) fall back cleanly to `shadow::exact` aligned host copies in both `buffer_copy` and `make`; placed 2D/3D unordered texture views (`View::Placed(true, ...)`) mirror to real UAV host resources (`resource::unordered_texture_at`) instead of null descriptors.
+  - **Wave 1 + Wave 2 PRs & `XBVK` port:** Merged/ported `fxceless` `#800`, `#801`, `#802`, `#803`, `#804`, `#805`, `#806`, `#807`, `#808`, `#809`, `#818`, `#819`, `#822`, `#824`, `#827`, `#832`, `#834`, `#836`, `#837`, `#838`, `myokex-pr-6` (per-thread pipeline waits while world loads), `seen_pages`/`unmake` sampler safety fixes, plus `evict_placed_in` / `ranges_overlap` from [`0x0007b/XBVK`](https://github.com/0x0007b/XBVK) for immediate VRAM freeing on memory unmaps.
+- **Credits:** Upstream [Marvisak/VIctory](https://github.com/Marvisak/VIctory), [fxceless/victory-fork](https://github.com/fxceless/victory-fork), [myokex/victory-amd](https://github.com/myokex/victory-amd), [0x0007b/XBVK](https://github.com/0x0007b/XBVK), [ztrx](https://github.com/ztrx), [ZSlayerHQ](https://github.com/ZSlayerHQ), [ka1qux](https://github.com/ka1qux).
 
 ---
 

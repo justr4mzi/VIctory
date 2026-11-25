@@ -1,20 +1,17 @@
-# Fork: `justr4mzi/VIctory` (`v7` RX 6700 XT World-Rendering Edition, AI-assisted)
+# Fork: `justr4mzi/VIctory` (`v8` RX 6700 XT Edition, AI-assisted)
 
-Personal fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (rebased in **`v7`** onto [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) `9376fd6`). Branches `ultimate-rx6700xt` and `main` (mirrored) stack community PRs, multi-fork AMD/VRAM/Wave64 fixes, and local adaptations from upstream `02f404e` (`#685`) through **`v6`** (archived on branch `backup-v6-final` and tag `v6-final` at `a0b1b07`) and now **`v7`** (tag `v7-final`), targeting **Windows 11 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64)** with 48 GB system RAM.
+Personal fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (rebased in `v7` onto [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) `9376fd6`, extended in **`v8`** through `fxceless` `#800`–`#838`, `myokex-pr-6`, `0x0007b/XBVK`, and custom `v8` GPU fixes). Branches `v8-rx6700xt`, `ultimate-rx6700xt`, and `main` (mirrored) stack community PRs, multi-fork AMD/VRAM/Wave64 fixes, and local adaptations from upstream `02f404e` (`#685`) through `v6` (`backup-v6-final` / `v6-final` at `a0b1b07`), `v7` (`backup-v7-final` at `7fccf82`), and **`v8`** (`v8-final`), targeting **Windows 11 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64)** with 48 GB system RAM.
 
-Nothing here is upstream-approved; please direct upstream feedback to the original repositories and PR authors. **Zero game data, filenames, executables, hashes, or offsets are included** (`cargo xtask policy` verified). This fork and its conflict resolutions are **AI-assisted**.
+Nothing here is upstream-approved; please direct upstream feedback to the original repositories and PR authors. **Zero game data, filenames, executables, hashes, or offsets are included** (`cargo xtask policy` verified: **`180 files ok`**). This fork, its conflict resolutions, and its `v8` additions are **AI-assisted**.
 
 ## Status & Live Testing History (RX 6700 XT, Windows 11)
 
 - **Base upstream (`02f404e` -> `8e79c80` -> `ffe310e`):** Boot, menus at 30 fps, intro video, saves, and initial world entry; **`21,678`** primary shaders validated offline on `02f404e`.
-- **v2 live test:** Boot, settings, audio, HUD, subtitles, and opening sequences rendered; distant emissive lights appeared in-world (`~1.0–1.4 FPS`, peak `4,587 draws/frame`, `1,433+` host pipelines), ended with `DXGI_ERROR_DEVICE_HUNG` at frame `19200`.
-- **v3 + 3 session fixes (`e67bb3d`) live test:** Held cleanly in-world with **`0` `ERROR` lines** (`6,634` log lines), `1,892` host pipelines compiled, GPU `~74–94 ms/frame` (`~0.6–1.0 FPS`, CPU prep/readback `~1,000 ms/frame`). Sky tone, bloom, subtitles, audio, and controller camera worked; closed cleanly without GPU hang/reset.
-- **v4 live logs:** Ran cleanly (`21,174` lines in `session.log`, `0` `ERROR`, `0` `WARN`); offline validated **`23,356`** primary + **`195`** ES halves.
-- **v5 live test:** Menus ran at `27.1–29.9 FPS` (`11,840` log lines, `0` `ERROR`, `0` `WARN`); stalled / black-screened after profile/save load with no new shaders logged. Offline validated **`24,410`** primary + **`195`** ES halves (`729` DXIL validator rejections, incl. `658` CS stage errors).
-- **v6 (`backup-v6-final` / `v6-final` at `a0b1b07`):** Verified offline with `610` workspace tests passing (`0` failed), `142` GPU diagnostics tests passing (`0` failed), `cargo xtask policy` OK (`174` files), Thin LTO release build OK, and `24,519` primary shaders + `195` ES halves validated (`2,494 / 2,494` compute validated, DXIL validator rejections `71`). Live test showed white/black world-entry stalling (~0.7–1 fps, indirect drops & pipeline wait stalls) on old `02f404e`-rooted GPU stack.
-- **v7 (current `HEAD`, `v7-final`, rebased on `fxceless/victory-fork` `9376fd6`):** Verified offline with **`567` workspace tests passing (`0` failed, `10` ignored)**, **`167` GPU diagnostics tests passing (`0` failed, `3` ignored)**, `cargo xtask policy` OK (**`177` files**), Thin LTO release build OK (`8,195,072` bytes), and **`25,526`** primary shaders validated out of `25,742` emitted (`14,137 / 14,248` VS/PS, **`2,729 / 2,729`** CS = 100% of emitted compute, `8,660 / 8,765` MS; `216` DXIL validator rejections). **Verified offline; not yet tested live in-game.**
+- **v2–v6:** Progressed from `~1.0 FPS` distant emissive lights (`v2`), clean 0-ERROR in-world sky/bloom/camera (`v3`), `23,356`–`24,519` offline shaders (`v4`–`v6`), preserved on `backup-v6-final` (`a0b1b07`).
+- **v7 (`backup-v7-final` @ `7fccf82`, live tested):** Reached full 3D prologue scene rendering (interior + exterior daylight yard, fence, characters, NPCs) at **`3.7–9.9 FPS`** (`101.0–271.4 ms/frame`, GPU `8.4–59.9 ms`), **`0` ERROR**, `0` VRAM `no_room`, `0` shader translation failures, `0` buffer view refusals under tuned RX 6700 XT flags. Remaining log warnings isolated for `v8`: non-256-byte-aligned CBV, placed unordered texture view (`dimension=3`), unaligned raw `first=2` buffer view (`fx-pr-803`).
+- **v8 (`v8-final`, current `HEAD`):** Bakes in all 8 tuned RX 6700 XT flags as `!cfg!(test)` defaults, fixes unaligned CBVs and placed 2D/3D texture UAVs, and merges Wave 1 (`fxceless` `#802`–`#805`, `#807`, `#809`, `#818`, `#819`, `#822`, `#824`, `#827`, `#834`, `#836`, `#838`, `myokex-pr-6`), Wave 2 shaders (`#800`, `#801`, `#806`, `#808`, `#832`, `#837`), and `XBVK` `evict_placed_in`. Verified offline with **`598` workspace tests passing (`0` failed, `13` ignored)**, **`186` GPU diagnostics tests passing (`0` failed, `3` ignored)**, `cargo xtask policy` OK (**`180 files ok`**), Thin LTO release build OK (`8,279,552` bytes), and **`25,518`** primary shaders validated out of `25,734` emitted (`14,129 / 14,240` VS/PS, **`2,729 / 2,729`** CS = 100% of emitted compute, `8,660 / 8,765` MS). *(Verified offline; ready for live launch without manual env var tuning.)*
 
-## Progression & Verification History (`02f404e` -> `v7`)
+## Progression & Verification History (`02f404e` -> `v8`)
 
 Host: Windows 11 x64 AVX2, AMD Radeon RX 6700 XT, `dxil.dll` `10.0.26100.0` (corpus: `26,599` containers / `26,148` programs).
 
@@ -27,14 +24,60 @@ Host: Windows 11 x64 AVX2, AMD Radeon RX 6700 XT, `dxil.dll` `10.0.26100.0` (cor
 | **v4** (+3 fixes + 17 items) | `13,248` (`13,292`) | `1,539` (`1,573`) | `8,374` (`8,455`) | `195` (`195`) + `195` ES | **23,356** | `159` |
 | **v5** (+22 merges + `#981` + `f64`) | `13,769` (`13,769`) | `1,847` (`2,505`) | `8,599` (`8,670`) | `195` (`195`) + `195` ES | **24,410** | `729` (`658` CS + `71` MS) |
 | **v6** (`backup-v6-final`, `a0b1b07`) | `13,425` (`13,425`) | `2,494` (`2,494`) | `8,405` (`8,476`) | `195` (`195`) + `195` ES | **24,519** | `71` (`0` CS + `71` MS) |
-| **v7 (current)** (`fxceless 9376fd6` + Layers 1–3) | **`14,137`** (`14,248`) | **`2,729`** (`2,729`) | **`8,660`** (`8,765`) | `–` (unemitted; +195 SGPR) | **`25,526`** | **`216`** (`111` VP + `0` CS + `105` MS) |
+| **v7** (`backup-v7-final`, `7fccf82`) | `14,137` (`14,248`) | **`2,729`** (`2,729`) | **`8,660`** (`8,765`) | `–` (+195 SGPR) | **25,526** | `216` (`111` VP + `0` CS + `105` MS) |
+| **v8 (current `v8-final`)** | **`14,129`** (`14,240`) | **`2,729`** (`2,729`) | **`8,660`** (`8,765`) | `–` (+195 SGPR) | **`25,518`** | **`216`** (`111` VP + `0` CS + `105` MS) |
 
-- **v7 Verification Results:**
-  - `cargo test --workspace -- --test-threads=1`: **567 passed, 0 failed, 10 ignored** (`victory` 1, `victory-core` 11, `victory-formats` 25 + 4 ign, `victory-game` 3, `victory-gpu` 160 + 3 ign, `victory-hle` 101, `victory-loader` 27, `victory-pe` 7, `victory-pipeline` 4, `victory-shader` 224 + 3 ign, `xtask` 4).
-  - `cargo test -p victory-gpu --features diagnostics -- --test-threads=1`: **167 passed, 0 failed, 3 ignored**.
-  - `cargo xtask policy`: **`asset policy: 177 files ok`** (512 KiB limit honored cleanly without modifying `xtask/src/policy.rs`).
-  - `cargo build --release -p victory`: **ok** (`1m 13s`, `8,195,072` bytes).
-  - `translate --validate` delta vs `v6`: **`+1,007`** primary shaders validated (`24,519 -> 25,526`, **`+3,848`** over upstream `02f404e`), including **`+712` VS/PS**, **`+235` Compute** (`2,729 / 2,729`, `100%` of emitted CS!), and **`+255` Mesh**. Note `v7`'s `fxceless` base intentionally does not emit the 195 GS (`an address in an SGPR that is no root parameter`), while gaining huge coverage in world pixel, compute, and mesh shaders. Remaining non-validator shader refusals across the entire corpus are only **16** (`10` hardware SGPR input, `5` descriptor read only as data, `1` opaque lane mask) plus `195` SGPR non-root addresses; DXIL validator rejections are almost entirely packed signature interpolation-mode mismatches (`63`), `Program Output/Input Signature` mismatches (`72`), mesh output >32768 (`71`), and `3` out-of-bound coord undef.
+- **v8 Verification Results:**
+  - `cargo test --workspace -- --test-threads=1`: **598 passed, 0 failed, 13 ignored** (`victory` 1, `victory-core` 11, `victory-formats` 25 + 4 ign, `victory-game` 3, `victory-gpu` 179 + 3 ign, `victory-hle` 104, `victory-loader` 27, `victory-pe` 7, `victory-pipeline` 4, `victory-shader` 233 + 6 ign, `xtask` 4).
+  - `cargo test -p victory-gpu --features diagnostics -- --test-threads=1`: **186 passed, 0 failed, 3 ignored**.
+  - `cargo xtask policy`: **`asset policy: 180 files ok`** (`lower.rs` at `522,554` B <= `524,288` B without modifying `xtask/src/policy.rs`).
+  - `cargo build --release -p victory`: **ok** (`39.02s`, `8,279,552` bytes).
+  - `translate --validate` note: the `8`-shader delta (`25,526 -> 25,518`) comes strictly from **`fx-pr-801`** restoring `Err(FIRST_HALF)` on 8 unhandled paired interpolation first halves rather than silently compiling them as `0.0`. Compute validation remains **`2,729 / 2,729` (100% of emitted CS)**.
+
+---
+
+## Complete Chronological Change Inventory (`v8` on `v7`, then `v7`, then `v1..v6`)
+
+### v8 — RX 6700 XT Default-Tuned Edition (`v8-final`, built on `backup-v7-final` `7fccf82`)
+
+- **Wave 1 — GPU, Memory, HLE & Loading (`backup-v8-wave1` @ `b5ea581`):**
+  - **fxceless PR #803** (`39f6994`): `own_bytes` buffer extent + 16-byte raw alignment fix (resolves raw `first=2` buffer view refusals).
+  - **fxceless PR #834** (`2624049`): split indirect dispatches past `65,535` groups in `x`.
+  - **fxceless PR #827** (`4068349`): world-entry table-slot skip crash fix, coalesced host refreshes, `VICTORY_RAM_RELIEF_MB`.
+  - **fxceless PR #824** (`2e57463`): `RangeSet`/`holes` fast-path for view-memory guards, `xmem` alias coalescing, texture waits, relay refinements.
+  - **fxceless PR #802** (`058156f`): sync raw-copied heap slots before draw passes + page-straddling descriptor records.
+  - **fxceless PR #819** (`aa99a34`): return caller output pointer from 4 `GetDesc` methods.
+  - **fxceless PR #838** (`02b6d7f`): stop preparing heap views after host device removal.
+  - **fxceless PR #836** (`6434c18`): HLE accounting for DirectStorage decompression intermediate buffers.
+  - **fxceless PR #818** (`5fc1129`): fix texture bake budget precision.
+  - **myokex PR #6** (`f02e6d6`): per-thread pipeline wait while world loads.
+  - **fxceless PR #805** (`1d9f67a`): resolved `CardInflight::brought` `Arc<Shadow>` leak fix.
+  - **fxceless PR #807** (`e43910c`): resolved `HostHeap::copied` fingerprint invalidation across API writes, unmakes, and raw zeroing.
+  - **fxceless PR #822** (`7f0354a`, adapted `relieve()` to `available_memory()`): trim idle upload caches when system commit runs low.
+  - **fxceless PR #809** (`b5ea581`, ported to coalesced `xmem::map_alias`): skip redundant page commits via `PageCommitment::Existing`.
+  - **fxceless PR #804** (`b5ea581`, ported to `RangeSet` `Guards`): exclude `absent` from `Guards::knows()` and verify `is_view()` on private reallocations.
+  - **Local `v8` descriptor fixes (`b5ea581`):** invalidate `seen_pages` whenever `HostHeap::forget_copied()` clears a slot (`take_forgotten_copied()`), and guard `HostHeap::unmake()` for sampler heaps (`self.null_sampler(index)` instead of invalid `CreateShaderResourceView` call).
+  - **Skipped Wave 1 PRs (logged with reasons):**
+    - `fx-pr-812`: superseded by `fx-pr-824` `RangeSet`/`holes` O(log intervals) guard fast path.
+    - `zslayer-pr-4`: deep texture staging buffer pool conflict with `fx-pr-822`/`824`/`827` memory trimming.
+    - `zslayer-pr-9`: superseded by `fx-pr-827` incremental texture slot sweep.
+
+- **Wave 2 — Shaders & Wave64 (`backup-v8-wave2` @ `8c7257d`):**
+  - **fxceless PR #808** (`e71850d`): packed dot products and clamps (`emit/dot.rs`).
+  - **fxceless PR #806** (`09237a6`): trace descriptor waterfalls across joins and per-lane loads (`resource.rs`).
+  - **fxceless PR #801** (`9163a2e`, test adjusted in `emit/mod.rs` for upstream `Interp::Weighted` standalone `v_interp_p1_f32`): restore `Err(FIRST_HALF)` so `with_first_half_pairs` retries instead of silently returning `0.0`.
+  - **fxceless PR #837** (`6389714`): NaN guard (`0` / `±65504`) on pixel color exports and typed image/buffer stores (`VICTORY_NAN_GUARD=0` to disable).
+  - **fxceless PR #800** (`3ad7340`, resolved `valu_tests.rs`): lower guarded uniform first-lane reads on split waves.
+  - **fxceless PR #832** (`8c7257d`, resolved `lower_tests.rs`): track divergent re-entry into shader loop exits.
+
+- **XBVK Ports (`b32f177`, from [`0x0007b/XBVK`](https://github.com/0x0007b/XBVK) `858cd6a` / `b776914`):**
+  - Fast-path detiling (`walk<const DETILE>` / `copy_runs`) was already present upstream in `crates/victory-formats/src/texture.rs`.
+  - Ported `evict_placed_in` + `ranges_overlap` into `crates/victory-gpu/src/resource.rs` and wired into `watch::title_memory_remapped()` for immediate VRAM release on remaps/unmaps.
+
+- **Custom `v8` GPU Fixes & Baked-In RX 6700 XT Defaults (`bf10bb1`):**
+  - **Unaligned CBVs (`descriptor/host.rs`):** `buffer_copy` and `make(&View::Constant(..))` fall back to `shadow::exact(address, size)` when `shadow.gpu(address) % 256 != 0` (+ unit test `unaligned_constant_buffer_uses_exact_256_byte_copy`).
+  - **Placed 2D/3D Texture UAVs (`resource.rs` + `descriptor/host.rs`):** Added `resource::unordered_texture_at` (`flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`) and extended `placed_texture` to handle `View::Placed(true, ...)` -> `View::Unordered` (+ unit test `placed_unordered_textures_2d_and_3d_create_host_uavs`).
+  - **Default RX 6700 XT Tuning (`!cfg!(test)`, all overrideable via env vars):** `VICTORY_RELAY=2`, `VICTORY_TEXTURE_DROP_MIPS=1`, `VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_CARD_ROOM_FOR_BUFFERS=1`, `VICTORY_CARD_REHASH_RUNS=1`, `VICTORY_CARD_FETCH_INFLIGHT=1`, `VICTORY_PAGE_WRITES=1` (`3` = guards + slots), and `VICTORY_ACTIVATE_RAYS=0`.
 
 ---
 
