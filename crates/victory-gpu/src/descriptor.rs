@@ -262,44 +262,63 @@ pub(crate) fn sync_heaps() {
                     }
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     let step_len = step as usize;
-                    // The page's records in one go, under one lock
-                    // (`HostHeap::mirror_copied_page`); one by one below
-                    // with `VICTORY_HEAP_SYNC_PAGE=0`.
-                    let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
+                    if page_at_once() {
+                        let (seen, made) = host.mirror_copied_page(slots.clone(), (start, step), from, &page_bytes);
                         looked += seen;
                         mirrored += made;
-                        0..0
-                    } else {
-                        slots
-                    };
-                    for index in slots {
-                        let handle = start + index * step;
-                        let record = match (handle as usize)
-                            .checked_sub(from)
-                            .and_then(|at| page_bytes.get(at..at + step_len))
-                        {
-                            Some(record) => record,
-                            None => {
-                                // A record straddling a 64 KiB page boundary (either
-                                // at `from` or `to`) is read whole through the kernel.
-                                if handle + step > end || step_len > straddle.len() {
-                                    continue;
-                                }
-                                if !crate::host::read_into(
-                                    handle as *const u8,
-                                    &mut straddle[..step_len],
-                                ) {
-                                    continue;
-                                }
-                                &straddle[..step_len]
-                            }
+                        // Handle at most the first/last slot when a record straddles `from` or `to`.
+                        let edges = if slots.is_empty() {
+                            [None, None]
+                        } else if slots.end - slots.start == 1 {
+                            [Some(slots.start), None]
+                        } else {
+                            [Some(slots.start), Some(slots.end - 1)]
                         };
-                        looked += 1;
-                        // Only a record that is not the one last seen there
-                        // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
-                            mirrored += 1;
+                        for index in edges.into_iter().flatten() {
+                            let handle = start + index * step;
+                            let in_page = (handle as usize)
+                                .checked_sub(from)
+                                .is_some_and(|at| at + step_len <= page_bytes.len());
+                            if in_page || handle + step > end || step_len > straddle.len() {
+                                continue;
+                            }
+                            if !crate::host::read_into(handle as *const u8, &mut straddle[..step_len]) {
+                                continue;
+                            }
+                            looked += 1;
+                            if host.mirror_copied(index as u32, handle, &straddle[..step_len]) {
+                                mirrored += 1;
+                            }
+                        }
+                    } else {
+                        for index in slots {
+                            let handle = start + index * step;
+                            let record = match (handle as usize)
+                                .checked_sub(from)
+                                .and_then(|at| page_bytes.get(at..at + step_len))
+                            {
+                                Some(record) => record,
+                                None => {
+                                    // A record straddling a 64 KiB page boundary (either
+                                    // at `from` or `to`) is read whole through the kernel.
+                                    if handle + step > end || step_len > straddle.len() {
+                                        continue;
+                                    }
+                                    if !crate::host::read_into(
+                                        handle as *const u8,
+                                        &mut straddle[..step_len],
+                                    ) {
+                                        continue;
+                                    }
+                                    &straddle[..step_len]
+                                }
+                            };
+                            looked += 1;
+                            // Only a record that is not the one last seen there
+                            // (`HostHeap::mirror_copied`).
+                            if host.mirror_copied(index as u32, handle, record) {
+                                mirrored += 1;
+                            }
                         }
                     }
                 }
@@ -963,6 +982,21 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
         CONSTANT => Some(constant_of(i, generation)),
         PLACED => views_read().placed_of(i, generation),
         _ => None,
+    }
+}
+
+/// Whether the record words `i` and `generation` still name a live view,
+/// matching [`view_at`] returning `Some` without cloning the [`View`].
+#[cfg(windows)]
+pub(crate) fn view_alive(i: u32, generation: u32) -> bool {
+    match generation >> KIND_SHIFT {
+        0 => views_read()
+            .list
+            .get(i as usize)
+            .is_some_and(|(_, current)| *current == generation),
+        CONSTANT => true,
+        PLACED => ((payload(i, generation) >> PLACED_ADDRESS_BITS) as usize) < views_read().shapes.len(),
+        _ => false,
     }
 }
 
@@ -1761,5 +1795,72 @@ mod tests {
         );
         assert!(get_desc(h, std::ptr::null_mut()).is_null());
         assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+    }
+
+    #[test]
+    fn view_alive_and_mirror_for_pass_avoid_requeueing_changed_slots() {
+        let null = std::ptr::null();
+        let mut slots = [0u64; 3 * 4];
+        let a = slots.as_mut_ptr() as u64;
+        // Inline CBV record: view_alive matches view_at.
+        create_cbv(null, &[0x40, 6, 512, 0], a);
+        // SAFETY: slot `a` was written above.
+        let [tag, i, gen_word] = unsafe { *(a as *const [u32; 3]) };
+        assert_eq!(tag, VIEW_TAG);
+        assert!(view_alive(i, gen_word));
+        assert!(view_at(i, gen_word).is_some());
+
+        // Table resource view: goes stale after `forget`.
+        let b = a + 32;
+        let resource_obj = 0x7778_0000usize as This;
+        create_srv(null, resource_obj, std::ptr::null(), b);
+        // SAFETY: slot `b` was written above.
+        let [tag_b, ib, gb] = unsafe { *(b as *const [u32; 3]) };
+        assert_eq!(tag_b, VIEW_TAG);
+        assert!(view_alive(ib, gb));
+        forget(0x7778_0000);
+        assert!(!view_alive(ib, gb));
+
+        // Placed raw buffer SRV (has a stride -> tracked in buffers/changed).
+        let mut buf_data = vec![0u8; 256];
+        let buf_addr = buf_data.as_mut_ptr() as u64;
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // BUFFER
+        resource[4] = 256;
+        resource[8] = 1;
+        let mut srv_desc = [0u32; 16];
+        srv_desc[0] = 39; // DXGI_FORMAT_R32_TYPELESS
+        srv_desc[1] = 1; // D3D12_SRV_DIMENSION_BUFFER
+        srv_desc[2] = 5768; // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+        srv_desc[6] = 64;
+        srv_desc[8] = 1; // D3D12_BUFFER_SRV_FLAG_RAW
+        srv_desc[10] = buf_addr as u32;
+        srv_desc[11] = (buf_addr >> 32) as u32;
+        let c = a + 64;
+        create_placed_srv(null, &resource, &srv_desc, c);
+        // SAFETY: slot `c` was written above.
+        let [tag_c, ic, gc] = unsafe { *(c as *const [u32; 3]) };
+        assert_eq!(tag_c, VIEW_TAG);
+        assert!(view_alive(ic, gc));
+
+        let Some(host) = host::HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        assert!(host.mirror(0, c, false).is_some());
+        assert_eq!(host.buffer_changes(), vec![0]);
+        assert!(host.mirror_for_pass(0, c).is_some());
+        assert!(
+            host.buffer_changes().is_empty(),
+            "pass mirror must not re-add the same slot to changed"
+        );
+        let (key, ki, kg) = host.record_key(0, c).expect("valid buffer SRV record");
+        assert_eq!((ki, kg), (ic, gc));
+        assert!(host.is_made(0, key));
+        assert!(host.mirror(1, c, true).is_some());
+        assert_eq!(
+            host.buffer_changes(),
+            vec![1],
+            "draw-side mirror must still notify changed"
+        );
     }
 }

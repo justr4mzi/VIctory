@@ -875,7 +875,6 @@ impl Guards {
     fn knows(&self, block: usize) -> bool {
         self.protected.contains(block)
             || self.holes.contains(block)
-            || self.absent.contains(block)
             || (view_known() && self.viewed.contains(block))
     }
 

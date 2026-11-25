@@ -1430,13 +1430,12 @@ impl State {
         // draining `buffer_changes()` and `heap_textures()`, so they are
         // materialized for this frame rather than nulled out at `Host::submit`.
         crate::descriptor::sync_heaps();
-        // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        // Per host heap: `(key, shadow, from, to)` each slot's buffer view
+        // reads, kept from pass to pass. Instead of wiping `ranges` every 16
+        // passes, each pass processes `buffer_changes()` plus an amortized 1/32
+        // sweep of active buffer slots, skipping slots whose descriptor key,
+        // made bit, and view liveness are unchanged.
+        type Ranges = std::collections::HashMap<u32, (u64, std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1444,13 +1443,10 @@ impl State {
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
-        let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
+        let mut slots = host.buffer_changes();
+        host.append_buffer_sweep(&mut slots, *passes as u32, 32);
+        slots.sort_unstable();
+        slots.dedup();
         *passes += 1;
         if let Some(why) = crate::descriptor::host::device_removed() {
             drop(kept);
@@ -1458,18 +1454,28 @@ impl State {
         }
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
+                ranges.remove(&index);
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let record_key = host.record_key(index, handle);
+            if let Some((key, i, gen_word)) = record_key
+                && ranges.get(&index).is_some_and(|&(cached_key, ..)| cached_key == key)
+                && host.is_made(index, key)
+                && crate::descriptor::view_alive(i, gen_word)
+            {
+                continue;
+            }
+            ranges.remove(&index);
+            let Some(view) = host.mirror_for_pass(index, handle) else {
                 continue;
             };
-            // Every 64 views while the device lives (a cheap query).
-            if n % 64 == 63
+            // Periodic device-lost check without spamming COM on every 64 views.
+            if n % 4096 == 4095
                 && let Some(why) = crate::descriptor::host::device_removed()
             {
-                let last: Vec<String> = slots[n - 63..=n]
+                let start_i = n.saturating_sub(63);
+                let last: Vec<String> = slots[start_i..=n]
                     .iter()
                     .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
                     .map(|s| s.chars().take(200).collect())
@@ -1488,13 +1494,24 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            if let Some((key, _, _)) = record_key {
+                ranges.insert(index, (key, shadow, address, address + len));
+            }
+        }
+        if !slots.is_empty()
+            && !slots.len().is_multiple_of(4096)
+            && let Some(why) = crate::descriptor::host::device_removed()
+        {
+            drop(kept);
+            crate::host::fail(format_args!(
+                "host device lost after preparing buffer views: {why}"
+            ));
         }
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
+        for (_, shadow, from, to) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
             span.1 = span.1.min(*from);
