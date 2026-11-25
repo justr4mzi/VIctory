@@ -91,6 +91,7 @@ fn build_with(words: &[u32], buffers: bool, nonuniform: u32, wave_ops: bool) -> 
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -314,6 +315,46 @@ fn a_sampler_chosen_by_a_branch_between_immediate_ones_samples_as_the_one_taken(
             let red: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
             // Clamped, 1.25 reads the last texel; wrapped, 0.25 the first.
             assert_eq!(red, vec![want; 32], "{label}, eq {eq}");
+        }
+    }
+}
+
+#[test]
+fn image_resinfo_returns_zero_depth_for_a_2d_view() {
+    let shader = build_with(
+        &[
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0602,
+            0xFA00_0000, // s_load_dwordx8 s[24:31], s[4:5], 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x7E04_0280, // v_mov_b32 v2, 0 (mip)
+            0x3420_0084, // v_lshlrev_b32 v16, 4, v0 (16 bytes per lane)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF038_0F08,
+            0x0006_0C02, // image_get_resinfo v[12:15], v2, s[24:31], dmask:0xf, dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE078_1000,
+            0x800A_0C10, // buffer_store_dwordx4 v[12:15], v16, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
+        ],
+        false,
+        0,
+        false,
+    );
+    let pixels = [[0.0; 4]; 6];
+    let views = [
+        View::Texture(3, 2, &pixels),
+        View::Texture(3, 2, &pixels),
+        View::RawUav(128),
+    ];
+    let results = run(&shader, &views);
+    assert!(!results.is_empty());
+    for (label, words) in results {
+        assert_eq!(words.len(), 128);
+        for (lane, dimensions) in words.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(*dimensions, [3, 2, 0, 1], "{label}, lane {lane}");
         }
     }
 }

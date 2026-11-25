@@ -155,18 +155,28 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 firsts.extend(mask);
                 Wave::Plain
             }
-            ("v_add_nc_u32" | "s_add_i32", [a, b]) => match (*a, *b) {
-                (Wave::Prefix, Wave::Base) | (Wave::Base, Wave::Prefix) => Wave::Base,
-                (Wave::Prefix, Wave::Plain | Wave::Prefix) | (Wave::Plain, Wave::Prefix) => Wave::Prefix,
-                (x, y) if sum(x) && sum(y) => x,
-                _ => return Err(why(w)),
-            },
-            ("v_sub_nc_u32" | "s_sub_i32", [a, b]) => match (*a, *b) {
-                (Wave::Base, Wave::Prefix) => Wave::Base,
-                (Wave::Prefix, Wave::Plain) => Wave::Prefix,
-                (Wave::Plain, y) if sum(y) && matches!(ops[0], Operand::Const(128)) => y,
-                _ => return Err(why(w)),
-            },
+            ("v_add_nc_u32" | "s_add_i32", [a, b])
+                if !matches!(&inst.fields, Fields::Valu(v) if v.clamp) =>
+            {
+                match (*a, *b) {
+                    (Wave::Prefix, Wave::Base) | (Wave::Base, Wave::Prefix) => Wave::Base,
+                    (Wave::Prefix, Wave::Plain | Wave::Prefix) | (Wave::Plain, Wave::Prefix) => {
+                        Wave::Prefix
+                    }
+                    (x, y) if sum(x) && sum(y) => x,
+                    _ => return Err(why(w)),
+                }
+            }
+            ("v_sub_nc_u32" | "s_sub_i32", [a, b])
+                if !matches!(&inst.fields, Fields::Valu(v) if v.clamp) =>
+            {
+                match (*a, *b) {
+                    (Wave::Base, Wave::Prefix) => Wave::Base,
+                    (Wave::Prefix, Wave::Plain) => Wave::Prefix,
+                    (Wave::Plain, y) if sum(y) && matches!(ops[0], Operand::Const(128)) => y,
+                    _ => return Err(why(w)),
+                }
+            }
             ("s_mul_i32" | "v_mul_lo_u32" | "v_mul_u32_u24", [a, b]) => match (*a, *b) {
                 (x, Wave::Plain) | (Wave::Plain, x) if sum(x) || x == Wave::Prefix => x,
                 _ => return Err(why(w)),

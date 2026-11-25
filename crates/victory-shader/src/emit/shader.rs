@@ -84,6 +84,8 @@ pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// UAVs in a vertex, geometry or mesh program.
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
@@ -489,6 +491,14 @@ impl Shader {
                 }
             }
         }
+        // UAVs outside pixel and compute programs (in vertex, geometry and
+        // mesh programs), as DXC counts them: declared UAV ranges, not
+        // UAVs indexed from the heap.
+        let compute = self.threads.is_some() && self.mesh.is_none() && self.geometry.is_none();
+        let declared_uavs = !self.root_uavs.is_empty();
+        if declared_uavs && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -800,6 +810,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
         }
@@ -911,5 +924,51 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::super::bitcode::Term;
+    use super::*;
+
+    /// A program that declares a root UAV or (`heap`) indexes a UAV from
+    /// the heap: vertex (`pixel` false, no threads), pixel or compute.
+    fn with_uav(pixel: bool, threads: Option<[u32; 3]>, heap: bool) -> Vec<u8> {
+        let mut s = Shader::new(pixel);
+        s.threads = threads;
+        let b = s.entry;
+        let h = if heap {
+            let index = s.m.i32(0);
+            s.heap_handle(b, index, false, false, (11 | 0x1000, 0))
+        } else {
+            s.root_uav_handle(0)
+        };
+        let (or, zero, one) = (s.m.i32(2), s.m.i32(0), s.m.i32(1));
+        let iu = s.m.undef(s.t.i32);
+        let i32t = s.t.i32;
+        s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, or, zero, iu, iu, one]);
+        s.m.terminate(b, Term::Ret);
+        s.finish()
+    }
+
+    #[test]
+    fn uavs_outside_pixel_and_compute_programs_are_declared() {
+        let mut validator = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        for (name, pixel, threads, heap) in [
+            ("vertex", false, None, false),
+            ("pixel", true, None, false),
+            ("compute", false, Some([1, 1, 1]), false),
+            ("vertex, heap", false, None, true),
+        ] {
+            let mut dxil = with_uav(pixel, threads, heap);
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut dxil)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
     }
 }

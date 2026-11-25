@@ -223,7 +223,11 @@ pub fn track(
     // and loads that entry: accesses, offset reads and loads by block.
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
-    for (b, block) in p.blocks.iter().enumerate() {
+    // Visit producers before consumers. Index order misses loads that land in
+    // higher-indexed blocks (for example after `split_irreducible` appends a
+    // copy) when a lower-indexed consumer runs first (VIC-BT-024 / #1249).
+    for b in crate::ir::reverse_postorder(&p.blocks) {
+        let block = &p.blocks[b];
         t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -847,6 +851,7 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1044,6 +1049,7 @@ impl<'a> Tracer<'a> {
                     return false;
                 };
                 inst.name() == "v_add_co_ci_u32"
+                    && !f.clamp
                     && f.src[..2.min(f.src.len())]
                         .iter()
                         .any(|o| self.vterm(inst, o).is_some_and(high_of))
@@ -1062,6 +1068,7 @@ impl<'a> Tracer<'a> {
             return false;
         };
         inst.name() == "v_add_co_ci_u32"
+            && !f.clamp
             && f.src[..2.min(f.src.len())]
                 .iter()
                 .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
@@ -3908,5 +3915,45 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    /// Block 0 jumps to a higher-indexed producer (block 2) that loads the
+    /// buffer descriptor, then back to a lower-indexed consumer (block 1).
+    /// Index order would visit the consumer first and miss the load in
+    /// `out.scalar`; RPO is `[0, 2, 1]` so the descriptor traces to block 2.
+    #[test]
+    fn track_visits_blocks_in_reverse_postorder() {
+        let r = track_words(
+            &[
+                0xBE84_0300, // 0x00: s_mov_b32 s4, s0
+                0xBE85_0380, // 0x04: s_mov_b32 s5, 0
+                0xBF82_0005, // 0x08: s_branch -> 0x20 (block 2)
+                0xF400_0302,
+                0xFA00_0000, // 0x0c (block 1): s_load_dword s12, s[4:5], null
+                0xE030_1000,
+                0x8002_0200, // 0x14: buffer_load_dword v2, v0, s[8:11], 0 offen
+                0xBF81_0000, // 0x1c: s_endpgm
+                0xF408_0202,
+                0xFA00_0000, // 0x20 (block 2): s_load_dwordx4 s[8:11], s[4:5], null
+                0xBF8C_C07F, // 0x28: s_waitcnt lgkmcnt(0)
+                0xBF82_FFF7, // 0x2c: s_branch -> 0x0c (block 1)
+            ],
+            &[param(Table, 0, 1)],
+            HwStage::Cs,
+        );
+        let prod = r.scalar.iter().position(|s| s.0 == (2, 0)).unwrap();
+        let cons = r.scalar.iter().position(|s| s.0 == (1, 0)).unwrap();
+        assert!(
+            prod < cons,
+            "expected block 2 before block 1 in RPO: {:?}",
+            r.scalar
+        );
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Loaded {
+                load: (2, 0),
+                first: 0,
+            }
+        );
     }
 }

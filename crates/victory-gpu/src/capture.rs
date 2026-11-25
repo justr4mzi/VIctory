@@ -8,12 +8,30 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+static DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// Called only after capture is enabled. Bound each allocation to 512 MiB.
+fn within_limit(width: u64, height: u64, estimated_bytes: Option<u64>, valid: bool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if DISABLED.load(Relaxed) { return false; }
+    if valid && estimated_bytes.is_some_and(|n| n > 0 && n <= 536_870_912) {
+        return true;
+    }
+    if !DISABLED.swap(true, Relaxed) {
+        tracing::warn!(width, height, ?estimated_bytes, "capture disabled: invalid layout, overflow or size limit");
+    }
+    false
+}
+
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    FOLDER
+    let folder = FOLDER
         .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
-        .as_ref()
+        .as_ref()?;
+    // The unset path returns above, without even loading the new state.
+    if DISABLED.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+    Some(folder)
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
@@ -180,6 +198,15 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
+    let (width64, height64) = (u64::from(width), u64::from(height));
+    let input = height64.checked_sub(1).and_then(|h| h.checked_mul(pitch as u64))
+        .and_then(|n| width64.checked_mul(4).and_then(|row| n.checked_add(row)));
+    if !within_limit(width64, height64, input,
+        width > 0 && u64::from(width) * 4 <= pitch as u64
+            && input.is_some_and(|n| n <= rows.len() as u64)) { return; }
+    let raw_bytes = u64::from(w).checked_mul(3).and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_mul(u64::from(h)));
+    if !within_limit(width64, height64, raw_bytes, true) { return; }
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
     for y in 0..h as usize {
@@ -200,9 +227,11 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     header.extend(h.to_be_bytes());
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
-    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let bound = zlib_rs::compress_bound(raw.len());
+    if !within_limit(width64, height64, (bound as u64).checked_add(57), true) { return; }
+    let mut compressed = vec![0u8; bound];
     let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
-    debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+    if !within_limit(width64, height64, raw_bytes, rc == zlib_rs::ReturnCode::Ok) { return; }
     chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
@@ -250,6 +279,7 @@ fn read_back_of(
     texture: &ID3D12Resource,
     sub: u32,
 ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+    folder()?;
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
     // SAFETY: a live texture; outputs for one subresource.
@@ -266,6 +296,18 @@ fn read_back_of(
             Some(&mut total),
         );
     }
+    let f = footprint.Footprint;
+    let (width, height) = (u64::from(f.Width), u64::from(f.Height));
+    let padded = u64::from(f.RowPitch).checked_mul(height).map(|n| n.max(total));
+    if !within_limit(width, height, padded,
+        width > 0 && height > 0 && f.RowPitch > 0 && total > 0
+            && f.Depth == 1 && footprint.Offset == 0) { return None; }
+    // Target conversion may keep three f32 channels per pixel.
+    if !within_limit(width, height, width.checked_mul(height).and_then(|n| n.checked_mul(12)), true) {
+        return None;
+    }
+    // The mapping below spans full padded rows, including the final row.
+    total = padded?;
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_READBACK,
         ..Default::default()
@@ -362,7 +404,9 @@ fn dump_on() -> bool {
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() || !dump_on()
+        || DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+        || !listed(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());

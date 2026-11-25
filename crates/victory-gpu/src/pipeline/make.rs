@@ -618,6 +618,12 @@ fn start(p: &Arc<Pending>, priority: u8) {
         }
         return;
     }
+    let lost = super::library::LOST.swap(0, Ordering::Relaxed);
+    for _ in 0..lost {
+        if let Err(e) = spawn_worker("victory-pipelines-repl".to_owned()) {
+            tracing::warn!(error = %e, "no replacement pipeline worker");
+        }
+    }
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
@@ -637,6 +643,28 @@ fn next() -> Arc<Pending> {
     }
 }
 
+fn spawn_worker(name: String) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name(name)
+        .spawn(|| {
+            // Below the title's own threads (loading, recording).
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+            loop {
+                next().make();
+                if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    drained();
+                } else {
+                    super::library::save(false);
+                }
+            }
+        })
+        .map(|_| ())
+}
+
 /// Starts the workers (half the logical processors, 2 to 8) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -644,24 +672,7 @@ fn workers() -> bool {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
-                    loop {
-                        next().make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
+            let spawned = spawn_worker(format!("victory-pipelines-{i}"));
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
             } else {
