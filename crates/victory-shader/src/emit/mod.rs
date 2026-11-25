@@ -2011,34 +2011,23 @@ mod barycentric_tests {
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
 
-    /// Reading the first half of an interpolation as data must refuse plain
-    /// lowering with `FIRST_HALF` so `translate` can retry with
-    /// `with_first_half_pairs`, and an orphan first half with no second half
-    /// must remain refused instead of silently compiling to 0.
+    /// Reading the first half of a paired interpolation as data must refuse
+    /// plain lowering with `FIRST_HALF` so `translate` can retry with
+    /// `with_first_half_pairs`, while a standalone `v_interp_p1_f32`
+    /// evaluates cleanly as `Interp::Weighted`.
     #[test]
     fn first_half_read_as_data_triggers_retry_and_orphan_is_refused() {
-        // 1. Orphan v_interp_p1_f32 (no matching p2) must fail with FIRST_HALF.
+        // 1. Standalone v_interp_p1_f32 (no matching p2) evaluates via Interp::Weighted.
         let [e0, e1] = exp_mrt0(2);
-        let orphan = [
+        let standalone = [
             0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
             e0,
             e1,
             S_ENDPGM,
         ];
-        assert!(
-            matches!(
-                pixel(&orphan, PERSP_CENTER),
-                Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF
-            ),
-            "orphan v_interp_p1_f32 must be refused with FIRST_HALF"
-        );
-        assert!(
-            matches!(
-                lower::with_first_half_pairs(|| pixel(&orphan, PERSP_CENTER)),
-                Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF
-            ),
-            "orphan v_interp_p1_f32 has no pair and must remain refused on retry"
-        );
+        let weighted = pixel(&standalone, PERSP_CENTER)
+            .expect("standalone v_interp_p1_f32 lowers as Interp::Weighted");
+        validate(&weighted);
 
         // 2. Paired v_interp_p1_f32 whose dst is read as data before p2 overwrites it:
         // plain lowering refuses with FIRST_HALF; retry with `with_first_half_pairs`

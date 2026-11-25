@@ -417,7 +417,8 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
+            // A backedge can revisit the split before its lanes reconverge.
+            if seen[b] || (b != d && pdom[d][b / 64] >> (b % 64) & 1 == 1) {
                 continue;
             }
             seen[b] = true;
