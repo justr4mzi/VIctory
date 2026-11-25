@@ -1341,7 +1341,7 @@ pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
         std::env::var("VICTORY_TEXTURE_DROP_MIPS")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(if cfg!(test) { 0 } else { 1 })
+            .unwrap_or(0)
             .min(4)
     });
     if n == 0 || !fills(desc) || desc.dimension != TEXTURE_2D || desc.sample_count > 1 {
