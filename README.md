@@ -1,9 +1,22 @@
-# `justr4mzi/VIctory` — `v12-ready` RX 6700 XT Edition (`AI-assisted`)
+# `justr4mzi/VIctory` — `v13-ready` RX 6700 XT Edition (`AI-assisted`)
 
-> **Personal fork (`AI-assisted`)** built on `v11-ready` / [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork), adding curated community PRs (`#798`, `#1069`, `#1078`, `#1080`, `#1081`, `#1082`, `#1086`, `#1093`, `#1094`, `#1096`, `#1097`, `#1102`, `#1104`, upstream `mv#2723`), RDNA2 memory/descriptor tuning, and validated `!cfg!(test)` defaults for **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64) + 48 GB RAM**.
-> Previous milestones are preserved on `backup-v6-final`, `backup-v7-final`, `backup-v8-final`, `backup-v9-base2`, `v10-final`, and `v11-ready`.
+> **Personal fork (`AI-assisted`)** built on `v12-ready` / [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork), adding Wave A–C2 upstream, community, and RDNA2 optimizations (**Native FP16 SM 6.2 arithmetic**, **Wave32 LDS range/slot disambiguation**, **DXIL IR optimizations**, **page-granular texture detiling**, **single-call upload feeds**, **`BufferMap`**, **fast MD5**, **DPP8 quad ops**, **queued presents**), targeting **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64) + 48 GB RAM**.
+> Previous milestones are preserved on `backup-v6-final`, `backup-v7-final`, `backup-v8-final`, `backup-v9-base2`, `v10-final`, `v11-ready`, and `v12-ready`.
 > Full changelog and PR comparison ledger: see **[FORK.md](FORK.md)**.
-> Zero game files, assets, filenames, hashes, or offsets are included (`cargo xtask policy`: **205 files ok**).
+> Zero game files, assets, filenames, hashes, or offsets are included (`cargo xtask policy`: **211 files ok**).
+
+## `v13` Highlights & Verified Checks (`v13-ready`, `v13-rx6700xt`)
+
+- **Workspace & GPU tests:**
+  - `cargo test --workspace -- --test-threads=1`: **834 passed, 0 failed, 23 ignored**.
+  - `cargo test -p victory-gpu --features diagnostics -- --test-threads=1`: **299 passed, 0 failed, 11 ignored**.
+  - `cargo xtask policy`: **211 files ok** (`lower.rs` = `501,859` B <= `524,288` B without modifying `xtask/src/policy.rs`).
+- **Release build (Thin LTO + `codegen-units = 1`):** `9,345,536` B (`SHA-256: 038660A9E033D354F2947ED3B233F1EF7F5B3460AA3ED506F3D36B42599100E5`).
+- **Key improvements over `v12-ready`:**
+  - **Wave A (`72ffa502`..`3adfb785`):** `mv#114` unlocked XAsync cleanup, `mv#139` SSA sums memoization, `mv#244` serialized WARP host ops.
+  - **Wave B1/B2a/B2b/B2c (`677969b6`..`a6a98e10`):** `fx#1101` display-source driver watch filter, `fx#1108` `bcpack` scratch buffer reuse, `fx#1135` parallel texture refresh timing, `fx#1117`/`#1120`/`#1128`/`#1146` cached `gpu_handle`, stack `user_data`, inplace `VIEWS` `RwLock`/sections, `land_aside`, `mv#2828` concurrent cache pub, `triippy` present barrier skip, `mv#2727` rect range clamp, `Belobug` skip ray activation, `mv#2788` non-blocking XMA mixer & ended-voice resume, `fx#1142` `BufferMap`, `fx#1130` `VICTORY_TEXTURE_PAGES=1` page-granular detile, `fx#1137` `VICTORY_FEED_ONE_CALL=1` single-call upload batches, `fx#1136` `VICTORY_PRESENT_QUEUED` queued presents (opt-in with `VICTORY_LATE_WAIT=3`), `mv#2824` 32-bit `release_title_allocation`.
+  - **Wave C1 (`b1049466`):** `mv#2808` fast MD5, `fx#1126` DXIL bitcode opt passes (preserving AMD `0x1002` `REUSE` workaround), `fx#1140` `emit/lds.rs` Wave32 disjoint/lane-private LDS lowering, `fx#1124` `emit/group_wide.rs` + `ends_trivially`, `fx#1132` env-switch fingerprinting, `fx#1123` `filter_for_host`, `fx#1112` `image_with_sampler` + `mv#2816` split scalar mask recovery.
+  - **Wave C2 (`81470672`):** `mv#2825` **Native FP16 (`half`, SM 6.2 `NATIVE_LOW_PRECISION`)** via `set_host_native16` (override `VICTORY_F16_IN_F32=1`), `mv#2817` DPP8 quad ops (`emit/quad_tests.rs`), `ka1qux 033da400` `Atom::Opaque(Value, Value)`, `mv#2812` `StaticSampler::make_comparison`, `mv#2823` bit-31 `Lower::fneg`, `flamingo #751` dead-phi empty latch folding, `flamingo #747` `v_mul_hi_u32_u24`/`i24`.
 
 ## `v12` Highlights & Verified Checks (`v12-ready`, `v12-rx6700xt`)
 
