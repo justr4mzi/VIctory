@@ -1537,7 +1537,7 @@ mod remap_tests {
         let description = [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 1, 0, 0];
         let staged = crate::resource::texture_at(texture_start as u64, &description).and_then(|resource| {
             let host_texture = crate::resource::host_resource(resource)?;
-            super::staging(resource, host_texture, 0)
+            super::staging(resource, host_texture)
         });
         // `None` means there is no GPU to make the host texture on: nothing
         // to check then.
