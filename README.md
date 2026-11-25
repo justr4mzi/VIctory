@@ -148,7 +148,8 @@ What did it, on top of the list below:
     made of (the render thread's time in the present call, the submit
     thread's work, copies, copy-back, recording, texture work, faults,
     disk). A card meter (`VICTORY_CARD_METER`) adds the card's time by
-    kind of list from a timestamp at each list's start and end.
+    kind of list from a timestamp at each list's start and end. The meter
+    runs only while the frame log is enabled.
   - What they showed, windows off: a usual frame of 136 ms; the title's
     render thread waits 77 ms of it in the present call for the submit
     thread, which works 118 ms (copies of title memory 41, copy-back 40);
