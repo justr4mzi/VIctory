@@ -82,6 +82,8 @@
 
 mod bitcode;
 mod container;
+#[cfg(test)]
+mod descriptor_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
