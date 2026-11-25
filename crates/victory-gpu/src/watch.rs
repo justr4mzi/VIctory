@@ -920,6 +920,9 @@ fn guard_locked(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
                 }
                 // Written through the runtime or aliased, still read-only.
                 g.clean.insert(block);
+                if view_guard() {
+                    protect_aliases_in(g, block, block + 1);
+                }
             } else {
                 run.get_or_insert(block);
             }
@@ -987,6 +990,12 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
+    protect_aliases_in(g, from, to);
+}
+
+/// Makes the other views of `[from, to)`'s aliased pages read-only and notes
+/// them all guarded together (see [`protect`]).
+fn protect_aliases_in(g: &mut Guards, from: usize, to: usize) {
     for (block, shown) in
         crate::inplace::aliased_pages_in(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK), MANY_VIEWS)
     {
@@ -1134,11 +1143,11 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         for block in a..b {
             for alias in crate::inplace::pages_of(block * BLOCK) {
                 let ab = alias / BLOCK;
-                if ab != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
+                if ab != block && g.protected.contains(ab) && g.clean.contains(ab) {
+                    g.clean.remove_range(ab, ab + 1);
                     #[cfg(feature = "diagnostics")]
                     ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                g.aliased.remove_range(ab, ab.saturating_add(1));
             }
         }
     }
@@ -1926,6 +1935,31 @@ mod tests {
         assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
         assert_eq!(guard(two, two + SIZE), Some(Vec::new()));
         drop_views(section, &[one, two], SIZE);
+    }
+
+    /// A write through a view that no copy checks: the checked view is
+    /// noted written and left read-only, its check reports the pages and
+    /// guards the written view again, so a second write through it is seen
+    /// as well.
+    #[test]
+    fn a_view_no_copy_checks_is_guarded_again_by_the_checked_one() {
+        let (section, checked, other) = two_views(BLOCK);
+        assert_eq!(guard(checked, checked + BLOCK), Some(vec![checked / PAGE]));
+        assert!(!writable(other), "guarded with the checked view");
+        // SAFETY: the other view, read-write once the handler has opened it.
+        unsafe { (other as *mut u8).write(1) };
+        assert!(writable(other), "opened by the handler");
+        assert!(!writable(checked), "noted written, left read-only");
+        assert_eq!(guard(checked, checked + BLOCK), Some(vec![checked / PAGE]));
+        assert!(!writable(other), "guarded again by the check");
+        // SAFETY: as above.
+        unsafe { (other as *mut u8).write(2) };
+        assert_eq!(guard(checked, checked + BLOCK), Some(vec![checked / PAGE]));
+        assert_eq!(guard(checked, checked + BLOCK), Some(Vec::new()));
+        // SAFETY: the checked view, opened by the handler.
+        unsafe { (checked as *mut u8).write(3) };
+        assert_eq!(guard(checked, checked + BLOCK), Some(vec![checked / PAGE]));
+        drop_views(section, &[checked, other], BLOCK);
     }
 
     /// A page shown in more than `MANY_VIEWS` views is guarded at each by

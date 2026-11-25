@@ -6878,7 +6878,7 @@ impl<'a> Lower<'a> {
         self.heap_index_at(load, 4 * u32::from(first), sampler)
     }
 
-    fn heap_index_at(&mut self, load: Site, adjust: u32, sampler: bool) -> Result<V, Why> {
+    pub(super) fn heap_index_at(&mut self, load: Site, adjust: u32, sampler: bool) -> Result<V, Why> {
         let a = *self
             .scalar
             .get(&load)

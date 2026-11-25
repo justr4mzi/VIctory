@@ -744,13 +744,36 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let len = now.len().min(held.len()).min(title.len());
     let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    let mut i = 0;
+    while i + 8 <= len {
+        let nw = u64::from_ne_bytes(now[i..i + 8].try_into().unwrap());
+        let hw = u64::from_ne_bytes(held[i..i + 8].try_into().unwrap());
+        if nw != hw {
+            for k in i..i + 8 {
+                let n = now[k];
+                let h = &mut held[k];
+                let t = &mut title[k];
+                if n != *h {
+                    differs |= n ^ *t;
+                    *t = n;
+                    *h = n;
+                }
+            }
+        }
+        i += 8;
+    }
+    while i < len {
+        let n = now[i];
+        let h = &mut held[i];
+        let t = &mut title[i];
+        if n != *h {
+            differs |= n ^ *t;
+            *t = n;
+            *h = n;
+        }
+        i += 1;
     }
     differs != 0
 }

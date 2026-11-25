@@ -37,6 +37,11 @@ pub(crate) struct Pending {
     left_out: Option<&'static str>,
     /// When a worker began it ([`slow`]).
     begun: OnceLock<Instant>,
+    /// First title frame in which a recording thread waited on this pipeline
+    /// (`u64::MAX`: never waited yet). Caps waiting to one frame per pipeline
+    /// so a slow or hung shader compiles asynchronously without stalling every
+    /// subsequent frame for the full wait budget.
+    waited_frame: AtomicU64,
 }
 
 /// Why a pipeline with these shaders is not made, if it is not.
@@ -167,6 +172,7 @@ impl Pending {
             used: AtomicBool::new(false),
             left_out,
             begun: OnceLock::new(),
+            waited_frame: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -275,7 +281,19 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        let frame = crate::frame::current();
+        let first = match p.waited_frame.compare_exchange(
+            u64::MAX,
+            frame,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => frame,
+            Err(f) => f,
+        };
+        if first == frame {
+            wait(p, frame);
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -786,5 +804,24 @@ mod tests {
             wait(&second, frame);
             assert!(second.made.get().is_some());
         });
+    }
+
+    #[test]
+    fn slow_pipeline_waits_at_most_one_frame() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.key = "slow-pipeline-one-frame-test".to_owned();
+        // Simulate a pipeline already claimed by a worker that has not finished.
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let first_frame = crate::frame::current();
+        // Pretend it already exhausted its wait on another frame (avoid u64::MAX sentinel).
+        let earlier_frame = if first_frame == 0 { 1 } else { first_frame - 1 };
+        p.waited_frame.store(earlier_frame, Ordering::Relaxed);
+        let p = Arc::new(p);
+        let started = Instant::now();
+        assert!(ready(&p).is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "subsequent frames must not block for the pipeline wait budget"
+        );
     }
 }

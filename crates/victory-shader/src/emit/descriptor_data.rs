@@ -106,12 +106,13 @@ impl<'a> Lower<'a> {
         };
         let use_at = use_of(site)
             .or_else(twin)
-            .map(|(at, first)| (at, site, first))
-            .or_else(image_size_word);
+            .map(|(at, first)| (false, at, site, first))
+            .or_else(|| image_size_word().map(|(at, load, first)| (true, at, load, first)));
         // `sized`: no instruction uses the descriptor, the code reads a size from it
         // ([`Self::unused_descriptor_kind`]).
-        let (load, first, used, uav, props, image, sized) = if let Some((at, load, first)) = use_at {
-            let src = Source::Loaded { load, first };
+        let (size_word, load, first, used, uav, props, image, sized) =
+            if let Some((size_word, at, load, first)) = use_at {
+                let src = Source::Loaded { load, first };
             let used = self.used_kind(&src);
             let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
             let un = ui.name();
@@ -162,7 +163,7 @@ impl<'a> Lower<'a> {
                 }
                 _ => return Err("a scalar memory read as data"),
             };
-            (load, first, used, uav, props, image, false)
+            (size_word, load, first, used, uav, props, image, false)
         } else {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
@@ -193,7 +194,7 @@ impl<'a> Lower<'a> {
             if let Some((used, uav, props, image)) =
                 self.unused_descriptor_kind(inst, site, code, count)
             {
-                (site, 0, used, uav, props, image, true)
+                (false, site, 0, used, uav, props, image, true)
             } else if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
@@ -228,8 +229,15 @@ impl<'a> Lower<'a> {
             }
         };
         let src = Source::Loaded { load, first };
-        let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
+        let h = if size_word {
+            // Recover the entry from the current load's operands, which
+            // are available here even if the full load is in a later block.
+            let index = self.heap_index_at(site, 0u32.wrapping_sub(4 * IMAGE_SIZE_DWORD), false)?;
+            self.s.heap_handle(c, index, false, false, props)
+        } else {
+            self.handle(site, &src, false, props)?
+        };
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
         let mip = if image.is_some() && !uav {
@@ -307,7 +315,11 @@ impl<'a> Lower<'a> {
             }
         };
         for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
+            let rel = if size_word {
+                IMAGE_SIZE_DWORD
+            } else {
+                k.wrapping_sub(u32::from(first))
+            };
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
