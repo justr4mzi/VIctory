@@ -1183,10 +1183,8 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(p);
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -1605,6 +1603,9 @@ impl State {
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
+        // Evict slots that left `buffers` or became tabled so `ranges` stops
+        // pinning dead `shadow::exact` copies for 32+ frames.
+        ranges.retain(|&index, _| host.is_active_buffer_slot(index, frame));
         let mut slots = host.buffer_changes();
         host.append_buffer_sweep(&mut slots, *passes as u32, 32);
         slots.sort_unstable();
@@ -1629,9 +1630,11 @@ impl State {
                 continue;
             }
             ranges.remove(&index);
-            let Some(view) = host.mirror_for_pass(index, handle) else {
+            let Some((view, resolved)) = host.mirror_for_pass(index, handle) else {
                 continue;
             };
+            #[cfg(feature = "diagnostics")]
+            let made = resolved.is_some();
             // Periodic device-lost check without spamming COM on every 64 views.
             if n % 4096 == 4095
                 && let Some(why) = crate::descriptor::host::device_removed()
@@ -1647,13 +1650,16 @@ impl State {
                     "host device lost while preparing buffer views at slot {index}: {why}; recent views: {last:#?}"
                 ));
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-                continue;
+            // The copy the slot shows (`buffer_copy`), or the one just resolved when made.
+            let (shadow, address, len) = match resolved {
+                Some(copy) => copy,
+                None => match crate::descriptor::host::buffer_copy(&view) {
+                    Some(copy) => copy,
+                    None => continue,
+                },
             };
             #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
+            if !made && host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
             if let Some((key, _, _)) = record_key {
@@ -1672,7 +1678,7 @@ impl State {
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::with_capacity(ranges.len().min(8192));
         for (_, shadow, from, to) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
@@ -1681,22 +1687,14 @@ impl State {
         }
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
-        // Memory that is not write-watched is copied whole by every refresh.
-        // It was once refreshed only every 120 frames (unmapped pages read
-        // one by one cost 14 GB a frame in run 11, before they were
-        // remembered): streamed geometry then drew from stale buffers, and
-        // the garbage ended runs (the card stopped answering 14-90 frames
-        // into the opening cutscene; with every frame it ran on). The pass
-        // costs some 30 ms a frame this way.
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
+        let mut eligible: Vec<(&std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+            Vec::with_capacity(spans.len());
         for (shadow, from, to) in spans.values() {
             if shadow.unwatched() {
-                // By the copy's number: a copy made where one let go was
-                // (`shadow::let_go_idle`) has never been refreshed.
                 let key = shadow.id() as usize;
-                // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
                 static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
                 let every = *EVERY.get_or_init(|| {
                     std::env::var("VICTORY_UNWATCHED_FRAMES")
@@ -1711,8 +1709,9 @@ impl State {
                     }
                 }
             }
-            shadow.refresh(list, *from, to - from);
+            eligible.push((shadow, *from, to - from));
         }
+        crate::shadow::Shadow::refresh_many(list, eligible);
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);

@@ -74,6 +74,10 @@ pub(crate) struct Shadow {
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
     card: Option<Card>,
+    /// Serializes `merge_under_writes` (write lock) against concurrent
+    /// `card_merge_relay` workers merging disjoint 64 KiB pieces (read lock)
+    /// on a carded copy.
+    card_merge_lock: std::sync::RwLock<()>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -2434,6 +2438,17 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
+    /// Brings several `(copy, address, len)` spans up to date under one lock of `list`.
+    pub(crate) fn refresh_many<'a>(
+        list: &HostList,
+        spans: impl IntoIterator<Item = (&'a Arc<Shadow>, u64, u64)>,
+    ) {
+        list.defer_refreshes(spans.into_iter().map(|(shadow, address, len)| {
+            let len = len.min(shadow.start + shadow.len - address);
+            (shadow, address as usize, len as usize)
+        }));
+    }
+
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
@@ -2459,6 +2474,7 @@ impl Shadow {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             },
             card: None,
+            card_merge_lock: std::sync::RwLock::new(()),
             window: false,
             place: None,
         }
@@ -2669,7 +2685,7 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
+                let read = |first: usize, title: &mut [u8]| crate::host::read_buffer_into((start + at + first) as *const u8, title);
                 let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
                     continue;
                 };
@@ -2809,7 +2825,7 @@ impl Shadow {
         title.resize(n, 0);
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
-        if !crate::host::read_into((start + at) as *const u8, title) {
+        if !crate::host::read_buffer_into((start + at) as *const u8, title) {
             return 0;
         }
         // The stretch as read: what the card did not change is the
@@ -3144,23 +3160,13 @@ impl Shadow {
                 }
                 let n = hi - lo;
                 let title = &mut title[..n];
-                // The lock of the copy's reference (the snapshot, or the
-                // CPU's side of a copy in the card's memory), from before
-                // title memory is read until the title's bytes are in: with
-                // the copy-back on its own thread ([`relay`]) that thread
-                // puts what the card wrote into title memory and into the
-                // reference under the same lock, and a page read before
-                // such a merge and compared after it would take the card's
-                // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-                // A page that is not there is left as it is, and looked at
-                // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
-                    continue;
-                }
-                MERGED[0].fetch_add(1, Ordering::Relaxed);
-                let at = lo - start;
                 if self.card.is_some() {
+                    let _side = self.card_merge_lock.write().unwrap_or_else(|e| e.into_inner());
+                    if !crate::host::read_into(lo as *const u8, title) {
+                        continue;
+                    }
+                    MERGED[0].fetch_add(1, Ordering::Relaxed);
+                    let at = lo - start;
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
@@ -3176,6 +3182,14 @@ impl Shadow {
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
                 } else {
+                    // The lock of the copy's reference (the snapshot), from
+                    // before title memory is read until the title's bytes are in.
+                    let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                    if !crate::host::read_into(lo as *const u8, title) {
+                        continue;
+                    }
+                    MERGED[0].fetch_add(1, Ordering::Relaxed);
+                    let at = lo - start;
                     let Some(snapshot) = before.as_mut() else {
                         return true;
                     };
@@ -3184,16 +3198,14 @@ impl Shadow {
                     // are in a declared range.
                     let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
                     for (r, m) in changed_runs(title, held) {
-                        // SAFETY: inside the copy's mapping. The card may be
-                        // writing the copy beside these bytes; they are
-                        // written here and nothing around them.
+                        // SAFETY: inside the copy's mapping.
                         unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
+                    drop(before);
                 }
-                drop(before);
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
                 // only whole pages, and the page is looked at again.
@@ -3643,7 +3655,7 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
-        if crate::host::read_into((start + at) as *const u8, title) {
+        if crate::host::read_buffer_into((start + at) as *const u8, title) {
             // The stretch as read: what the card did not change is the
             // title's, and may have been written again since.
             let as_read = merge_race_on().then(|| title.clone());
@@ -3700,7 +3712,7 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let _side = self.card_merge_lock.read().unwrap_or_else(|e| e.into_inner());
         self.card_merge_relay_locked(card, start, at, gpu, fetched_after, title)
     }
 
@@ -3726,7 +3738,7 @@ impl Shadow {
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         title.clear();
         title.resize(n, 0);
-        let mapped = crate::host::read_into((start + at) as *const u8, title);
+        let mapped = crate::host::read_buffer_into((start + at) as *const u8, title);
         // If a coalesced multi-piece run spans a partly unmapped region, split
         // it into 64 KiB chunks so mapped pieces still write back cleanly.
         if !mapped && n > crate::watch::PAGE {
@@ -3786,15 +3798,23 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+///
+/// Read most of the time; written only when a buffer is registered or
+/// released, or when a copy is made on first use.
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> =
+    std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    buffers_write().insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -3805,14 +3825,14 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    buffers_write().remove(&(start, resource));
 }
 
 /// The title buffer holding `address`, as (start, length), without making
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -3838,7 +3858,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
-        let mut map = buffers();
+        let mut map = buffers_write();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
@@ -3856,7 +3876,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
-    let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
+    let mut spans: Vec<(u64, u64, bool)> = buffers_read().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
@@ -3896,7 +3916,25 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
+    let needs_copy = {
+        let map = buffers_read();
+        match map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+        {
+            Some((_, entry)) => match &entry.shadow {
+                Some(shadow) => return Some(shadow.clone()),
+                None => true,
+            },
+            None => false,
+        }
+    };
+    if !needs_copy {
+        return loose(address, end, len <= 1, any);
+    }
+    let mut map = buffers_write();
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
@@ -4540,7 +4578,7 @@ mod card_merge_tests {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();

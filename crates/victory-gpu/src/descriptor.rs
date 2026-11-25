@@ -206,7 +206,8 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
-    let mut page_bytes: Vec<u8> = Vec::new();
+    let mut page_bytes = vec![0u8; crate::watch::PAGE];
+    let mut due: Vec<(u32, u64, [u32; 3])> = Vec::new();
     let mut straddle = [0u8; 32];
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -247,8 +248,8 @@ pub(crate) fn sync_heaps() {
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
-                page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
+                let slice = &mut page_bytes[..to - from];
+                if crate::host::read_into(from as *const u8, slice) {
                     pages += 1;
                     // The kernel says the page was written; writing back the
                     // bytes it already held is not a change. Compare the
@@ -257,19 +258,19 @@ pub(crate) fn sync_heaps() {
                     // hundreds.
                     {
                         let mut seen = seen_pages().lock().unwrap_or_else(|e| e.into_inner());
-                        if seen.get(&from).is_some_and(|old| old.as_slice() == page_bytes.as_slice()) {
+                        if seen.get(&from).is_some_and(|old| old.as_slice() == slice) {
                             page += crate::watch::PAGE;
                             continue;
                         }
                         if seen.len() >= 4096 {
                             seen.clear();
                         }
-                        seen.insert(from, page_bytes.clone());
+                        seen.insert(from, slice.to_vec());
                     }
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     let step_len = step as usize;
                     if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots.clone(), (start, step), from, &page_bytes);
+                        let (seen, made) = host.mirror_copied_page(slots.clone(), (start, step), from, slice, &mut due);
                         looked += seen;
                         mirrored += made;
                         // Handle at most the first/last slot when a record straddles `from` or `to`.
@@ -284,7 +285,7 @@ pub(crate) fn sync_heaps() {
                             let handle = start + index * step;
                             let in_page = (handle as usize)
                                 .checked_sub(from)
-                                .is_some_and(|at| at + step_len <= page_bytes.len());
+                                .is_some_and(|at| at + step_len <= slice.len());
                             if in_page || handle + step > end || step_len > straddle.len() {
                                 continue;
                             }
@@ -301,7 +302,7 @@ pub(crate) fn sync_heaps() {
                             let handle = start + index * step;
                             let record = match (handle as usize)
                                 .checked_sub(from)
-                                .and_then(|at| page_bytes.get(at..at + step_len))
+                                .and_then(|at| slice.get(at..at + step_len))
                             {
                                 Some(record) => record,
                                 None => {

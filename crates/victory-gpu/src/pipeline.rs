@@ -60,6 +60,8 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    full_hash: [u8; 32],
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
@@ -114,6 +116,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                full_hash: *full.as_bytes(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
@@ -141,7 +144,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = translate(&self.full_hash, &self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -179,28 +182,35 @@ impl Shader {
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate(full_hash: &[u8; 32], container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
-    let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
-        None => Vec::new(),
-    };
     let host = crate::shader_cache::host_shader(container)?;
-    let stores = programs.is_empty() || programs.iter().any(stores);
-    let used = programs
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-            )
-        })
-        .map(|p| p.used)
-        .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    let meta = crate::shader_meta::get_or_compute(full_hash, || {
+        let c = Container::parse(container).map_err(|e| e.to_string())?;
+        let programs = match c.part(FourCC::DXIL) {
+            Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
+            None => Vec::new(),
+        };
+        let stores = programs.is_empty() || programs.iter().any(stores);
+        let used = programs
+            .into_iter()
+            .find(|p| {
+                matches!(
+                    p.stage,
+                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+                )
+            })
+            .map(|p| p.used)
+            .unwrap_or_default();
+        Ok(crate::shader_meta::CachedMeta { stores, used })
+    })?;
+    Ok(Translated {
+        host,
+        used: meta.used,
+        stores: meta.stores,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder

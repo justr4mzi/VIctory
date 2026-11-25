@@ -1154,6 +1154,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 /// Makes the other views of `[from, to)`'s aliased pages read-only and notes
 /// them all guarded together (see [`protect`]).
 fn protect_aliases_in(g: &mut Guards, from: usize, to: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    let mut alias_blocks: Vec<usize> = Vec::new();
     for (block, shown) in
         crate::inplace::aliased_pages_in(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK), MANY_VIEWS)
     {
@@ -1163,8 +1165,44 @@ fn protect_aliases_in(g: &mut Guards, from: usize, to: usize) {
         for alias in shown {
             let alias = alias / BLOCK;
             g.aliased.insert(alias);
-            if alias != block {
-                protect_alias(g, alias);
+            if alias != block && !g.protected.contains(alias) {
+                alias_blocks.push(alias);
+            }
+        }
+    }
+    if alias_blocks.len() > 1 {
+        alias_blocks.sort_unstable();
+        alias_blocks.dedup();
+    }
+    let mut at = 0;
+    while at < alias_blocks.len() {
+        let run_start = alias_blocks[at];
+        let mut run_end = run_start + 1;
+        at += 1;
+        while at < alias_blocks.len() && alias_blocks[at] == run_end {
+            run_end += 1;
+            at += 1;
+        }
+        let n = run_end - run_start;
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes.
+        let set = unsafe {
+            VirtualProtect(
+                (run_start * BLOCK) as *const _,
+                n * BLOCK,
+                PAGE_READONLY,
+                &mut old,
+            )
+        };
+        if set != 0 {
+            g.protected.insert_range(run_start, run_end);
+            GUARD_GEN.fetch_add(1, Ordering::Release);
+            if view_known() {
+                g.viewed.insert_range(run_start, run_end);
+            }
+        } else {
+            for block in run_start..run_end {
+                protect_alias(g, block);
             }
         }
     }
