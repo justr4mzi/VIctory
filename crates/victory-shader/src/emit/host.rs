@@ -2,6 +2,7 @@
 //! tests, drawing a full-screen triangle and reading the target back.
 
 use std::ffi::CString;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -15,6 +16,7 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    warp: bool,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -62,67 +64,139 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// A D3D12 device kept alive for the process so concurrent callers do not
+/// race creating and tearing down the same singleton adapter device.
+struct SharedDevice(ID3D12Device);
+
+// SAFETY: `ID3D12Device` is free-threaded; cloning increments its COM
+// reference count.
+unsafe impl Send for SharedDevice {}
+// SAFETY: as above.
+unsafe impl Sync for SharedDevice {}
+
+fn create_device(warp: bool) -> Result<ID3D12Device, String> {
+    // SAFETY: plain D3D12/DXGI calls with valid out pointers.
+    unsafe {
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+            let mut debug: Option<ID3D12Debug> = None;
+            if D3D12GetDebugInterface(&mut debug).is_ok()
+                && let Some(debug) = debug
+            {
+                debug.EnableDebugLayer();
+            }
+        }
+        let mut device: Option<ID3D12Device> = None;
+        let factory: IDXGIFactory4 =
+            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+        let adapter: IDXGIAdapter1 = if warp {
+            factory.EnumWarpAdapter().map_err(err)?
+        } else {
+            let hw = hardware_adapter(&factory).map_err(err)?;
+            if let Ok(desc) = hw.GetDesc1() {
+                super::set_host_vendor(desc.VendorId);
+            }
+            hw
+        };
+        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+        let device = device.ok_or("no device")?;
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .map_err(err)?;
+        if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+            return Err(format!(
+                "the device supports SM {:#x} only",
+                sm.HighestShaderModel.0
+            ));
+        }
+        Ok(device)
+    }
+}
+
+/// Whether `device` runs on a software adapter (WARP); `true` when that
+/// cannot be told, so its work is serialised rather than raced.
+fn on_software_adapter(device: &ID3D12Device) -> bool {
+    // SAFETY: plain D3D12/DXGI queries with valid pointers.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return true;
+        };
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) else {
+            return true;
+        };
+        adapter
+            .GetDesc1()
+            .map_or(true, |d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+    }
+}
+
+/// The first adapter that is a GPU: not flagged software, and with video
+/// memory of its own.
+fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter enumeration.
+    unsafe {
+        for index in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(index) else {
+                break;
+            };
+            let desc = adapter.GetDesc1()?;
+            let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            if !software && desc.DedicatedVideoMemory > 0 {
+                return Ok(adapter);
+            }
+        }
+    }
+    Err(windows::core::Error::new(
+        windows::Win32::Foundation::E_FAIL,
+        "no hardware adapter",
+    ))
+}
+
+/// Serializes WARP (`d3d10warp.dll`) operations across threads: concurrent
+/// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
+static WARP_LOCK: Mutex<()> = Mutex::new(());
+
 impl Host {
+    fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
+        self.warp
+            .then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-        // SAFETY: plain D3D12/DXGI calls with valid out pointers.
-        unsafe {
-            // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
-            // refused pipeline's error then carries.
-            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
-                let mut debug: Option<ID3D12Debug> = None;
-                if D3D12GetDebugInterface(&mut debug).is_ok()
-                    && let Some(debug) = debug
-                {
-                    debug.EnableDebugLayer();
-                }
-            }
-            let mut device: Option<ID3D12Device> = None;
-            if warp {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-                // A machine without a graphics card gives the software
-                // adapter as its default device (a hosted test runner,
-                // whose first adapter is a display stub that cannot make a
-                // device): that is no hardware device, and the tests that
-                // ask for one skip it, as they do where there is none.
-                if let Some(made) = &device {
-                    let factory: IDXGIFactory4 =
-                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
-                        && let Ok(desc) = adapter.GetDesc1()
-                    {
-                        if desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c) {
-                            return Err("the default device is the software adapter".to_owned());
-                        }
-                        super::set_host_vendor(desc.VendorId);
-                    }
-                }
-            }
-            let device = device.ok_or("no device")?;
-            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            device
-                .CheckFeatureSupport(
-                    D3D12_FEATURE_SHADER_MODEL,
-                    (&raw mut sm).cast(),
-                    size_of_val(&sm) as u32,
-                )
-                .map_err(err)?;
-            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-                return Err(format!(
-                    "the device supports SM {:#x} only",
-                    sm.HighestShaderModel.0
-                ));
-            }
-            Ok(Host { device })
+        if warp {
+            static WARP: OnceLock<Result<SharedDevice, String>> = OnceLock::new();
+            let shared = WARP.get_or_init(|| {
+                let _guard = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                create_device(true).map(SharedDevice)
+            });
+            return shared
+                .as_ref()
+                .map(|d| Host {
+                    device: d.0.clone(),
+                    warp: true,
+                })
+                .map_err(Clone::clone);
         }
+        Ok(Host {
+            device: create_device(false)?,
+            warp: false,
+        })
+    }
+
+    /// A host on a device made elsewhere (the GPU crate's). Its work is
+    /// serialised as WARP's is when the device runs on a software adapter.
+    pub fn from_device(device: ID3D12Device) -> Self {
+        let warp = on_software_adapter(&device);
+        Host { device, warp }
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -223,18 +297,26 @@ impl Host {
             },
         };
         // SAFETY: the description points at live arrays.
-        unsafe {
+        let blob: ID3DBlob = unsafe {
             let mut blob = None;
             let mut error = None;
             D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
                 .map_err(err)?;
-            let blob: ID3DBlob = blob.ok_or("no root signature blob")?;
-            let bytes = std::slice::from_raw_parts(
-                blob.GetBufferPointer().cast::<u8>(),
-                blob.GetBufferSize(),
-            );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
-        }
+            blob.ok_or("no root signature blob")?
+        };
+        // SAFETY: `blob` stays alive for the lifetime of `bytes`.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        };
+        self.root_signature_bytes(bytes)
+    }
+
+    /// Creates a root signature from serialized root signature bytes (or a
+    /// DXIL container carrying one).
+    pub fn root_signature_bytes(&self, bytes: &[u8]) -> Result<ID3D12RootSignature, String> {
+        let _guard = self.lock_warp();
+        // SAFETY: `bytes` is a live slice of root-signature or container bytes.
+        unsafe { self.device.CreateRootSignature(0, bytes) }.map_err(err)
     }
 
     /// A compute pipeline; user data is root parameter 0.
@@ -261,6 +343,7 @@ impl Host {
             },
             ..Default::default()
         };
+        let _guard = self.lock_warp();
         // SAFETY: the description points at live data.
         unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| self.explained(e))
     }
@@ -395,6 +478,7 @@ impl Host {
             desc.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
             desc.DepthStencilState.StencilEnable = true.into();
         }
+        let _guard = self.lock_warp();
         // SAFETY: the description points at live data.
         let pso = unsafe { self.device.CreateGraphicsPipelineState(&desc) };
         pso.map_err(err)
@@ -505,10 +589,225 @@ impl Host {
             SizeInBytes: size_of::<Stream>(),
             pPipelineStateSubobjectStream: (&raw mut stream).cast(),
         };
+        let _guard = self.lock_warp();
         let device: ID3D12Device2 = self.device.cast().map_err(err)?;
         // SAFETY: the stream points at live data and outlives the call.
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
+
+    /// Whether this device fuses DXIL `FMad`, which the lowering emits for
+    /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
+    /// does not, their results can differ in kind. Runs the lowered `v_fma_f32`
+    /// of (1 - 2^-24, 1 + 2^-23, -1) once: 2^-24 - 2^-47 fused, 0 not.
+    pub fn fuses_fmad(&self) -> Result<bool, String> {
+        let shader = fmad_probe().map_err(|e| e.to_string())?;
+        let (root, pso) = self.compute_pipeline(&shader)?;
+        // Taken after the pipeline, which takes it itself.
+        let _guard = self.lock_warp();
+        let operands = [0x3F7F_FFFF, 0x3F80_0001, 0xBF80_0000];
+        let mut user_data = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if u.root == crate::native::RootType::Constants {
+                user_data[u.index as usize] = operands[u.dword as usize % 3];
+            }
+        }
+        let dev = &self.device;
+        // SAFETY: D3D12 calls with descriptions that outlive them; the
+        // resources stay alive until the fence says the GPU is done.
+        unsafe {
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .map_err(err)?;
+            let alloc: ID3D12CommandAllocator = dev
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .map_err(err)?;
+            let list: ID3D12GraphicsCommandList = dev
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso)
+                .map_err(err)?;
+            let buffer = |heap, flags| -> Result<ID3D12Resource, String> {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: heap,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 256,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        Flags: flags,
+                        ..Default::default()
+                    },
+                    if heap == D3D12_HEAP_TYPE_READBACK {
+                        D3D12_RESOURCE_STATE_COPY_DEST
+                    } else {
+                        D3D12_RESOURCE_STATE_COMMON
+                    },
+                    None,
+                    &mut r,
+                )
+                .map_err(err)?;
+                r.ok_or_else(|| "no buffer".to_string())
+            };
+            let out = buffer(
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            )?;
+            let readback = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE)?;
+            let views: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+                .map_err(err)?;
+            dev.CreateUnorderedAccessView(
+                &out,
+                None,
+                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            NumElements: 64,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                }),
+                views.GetCPUDescriptorHandleForHeapStart(),
+            );
+            list.SetDescriptorHeaps(&[Some(views.clone())]);
+            list.SetComputeRootSignature(&root);
+            list.SetComputeRoot32BitConstants(
+                0,
+                user_data.len() as u32,
+                user_data.as_ptr().cast(),
+                0,
+            );
+            list.Dispatch(1, 1, 1);
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::transmute_copy(&out),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    }),
+                },
+            }]);
+            list.CopyBufferRegion(&readback, 0, &out, 0, 4);
+            list.Close().map_err(err)?;
+            queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+            queue.Signal(&fence, 1).map_err(err)?;
+            while fence.GetCompletedValue() < 1 {
+                if let Err(e) = dev.GetDeviceRemovedReason() {
+                    return Err(format!("device removed: {}", err(e)));
+                }
+                std::thread::yield_now();
+            }
+            let mut p = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut p)).map_err(err)?;
+            let bits = p.cast::<u32>().read();
+            readback.Unmap(0, None);
+            Ok(bits != 0)
+        }
+    }
+}
+
+/// `v_fma_f32 v0, s0, s1, s2` (through VGPRs) stored to dword 0 of the raw
+/// UAV a table at s4 names, lowered as a title's program is.
+fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
+    use crate::native::{
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
+    let words: [u32; 11] = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xFA00_0000,
+        0x7E02_0200, // v_mov_b32 v1, s0
+        0x7E04_0201, // v_mov_b32 v2, s1
+        0x7E06_0202, // v_mov_b32 v3, s2
+        0xD54B_0000, // v_fma_f32 v0, v1, v2, v3
+        0x040E_0501,
+        0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
+        0x8002_0000,
+        0xBF81_0000, // s_endpgm
+    ];
+    let param = |root, user_data, sgprs, slot| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            param(RootType::Constants, 0, 4, 0),
+            param(RootType::Table, 4, 1, 1),
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = crate::ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = crate::structure::structure(&p)?;
+    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = crate::io::raise(&p, &native)?;
+    let lowered = super::lower::lower(&super::lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })?;
+    Ok(HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: Vec::new(),
+        half_views: lowered.half_views,
+    })
 }
 
 /// A vertex shader that feeds `ps`'s inputs (zeros) and a position.
@@ -648,6 +947,7 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        let _guard = self.lock_warp();
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -1038,6 +1338,7 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        let _guard = self.lock_warp();
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -1462,5 +1763,56 @@ impl Host {
             drop(keep);
             Ok(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+
+    use super::*;
+
+    /// Regression test for concurrent WARP device creation, pipeline
+    /// compilation, and draws across threads (issue #181).
+    #[test]
+    fn parallel_warp_pipelines_and_draws() {
+        let Ok(first) = Host::new(true) else {
+            eprintln!("no SM 6.6 warp device; skipped");
+            return;
+        };
+        let second = Host::new(true).expect("second WARP Host::new");
+        assert_eq!(first.device, second.device, "WARP device should be shared");
+
+        let ps = stub_ps();
+        let vs = stub_vs(&ps).expect("stub_vs");
+        let threads = 8;
+        let barrier = Barrier::new(threads);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..4 {
+                        let host = Host::new(true).expect("WARP Host::new");
+                        let (root, pso) = host.pipeline(&vs, &ps).expect("WARP pipeline");
+                        let out = host
+                            .draw(
+                                &root,
+                                &pso,
+                                &Draw {
+                                    roots: Vec::new(),
+                                    textures: &[],
+                                    samplers: &[],
+                                    vertices: &[],
+                                    stride: 0,
+                                    size: (4, 4),
+                                    mesh_groups: 0,
+                                },
+                            )
+                            .expect("WARP draw");
+                        assert_eq!(out.len(), 16);
+                    }
+                });
+            }
+        });
     }
 }
