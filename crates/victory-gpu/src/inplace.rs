@@ -369,6 +369,11 @@ pub fn title_memory_placeholder(at: usize, len: usize) {
     map.insert(at, len);
 }
 
+#[cfg(test)]
+pub(crate) fn placeholder_gone(at: usize) {
+    PLACEHOLDERS.write().unwrap_or_else(|e| e.into_inner()).remove(&at);
+}
+
 /// Whether `at` lies inside a runtime physical-page placeholder reservation.
 pub(crate) fn is_placeholder(at: usize) -> bool {
     if !placeholder_fast() {

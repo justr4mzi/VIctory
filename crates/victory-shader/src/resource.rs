@@ -387,6 +387,7 @@ enum Term {
 
 /// A 32-bit sum: optional root parameter (as its first dword), constant,
 /// optional computed term.
+#[derive(Clone, Copy)]
 struct Sum {
     base: Option<Value>,
     offset: u32,

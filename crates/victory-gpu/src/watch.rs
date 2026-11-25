@@ -2865,6 +2865,8 @@ mod mapping_tests {
         }
         title_memory_remapped(p, BLOCK);
         crate::inplace::views_gone(p, BLOCK);
+        crate::inplace::placeholder_gone(p);
+        crate::watch::journal().written.remove(&(p / BLOCK));
     }
 }
 
