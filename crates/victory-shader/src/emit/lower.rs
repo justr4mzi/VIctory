@@ -9399,25 +9399,6 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            // The first half of a pair: its second half interpolates the
-            // attribute itself, so nothing needs this half's partial sum.
-            // But an f16 second half that writes the high half of the
-            // register this one wrote keeps the low half as it was (the
-            // console compiler reuses the register; the low half is not
-            // read), so the register needs a value: 0.
-            let name = inst.name();
-            if name == "v_interp_p1_f32" || name == "v_interp_p1ll_f16" {
-                let dst = match &inst.fields {
-                    Fields::Vintrp { dst, .. } => Some(*dst),
-                    Fields::Valu(v) => v.dst,
-                    _ => None,
-                };
-                if let Some(Operand::Vector { reg, .. }) = dst {
-                    let zero = self.s.m.i32(0);
-                    self.write(inst, Reg::V(reg), zero, None);
-                    return Ok(());
-                }
-            }
             return Err(FIRST_HALF);
         };
         let name = inst.name();

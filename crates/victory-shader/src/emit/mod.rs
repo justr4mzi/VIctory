@@ -2010,4 +2010,62 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+
+    /// Reading the first half of an interpolation as data must refuse plain
+    /// lowering with `FIRST_HALF` so `translate` can retry with
+    /// `with_first_half_pairs`, and an orphan first half with no second half
+    /// must remain refused instead of silently compiling to 0.
+    #[test]
+    fn first_half_read_as_data_triggers_retry_and_orphan_is_refused() {
+        // 1. Orphan v_interp_p1_f32 (no matching p2) must fail with FIRST_HALF.
+        let [e0, e1] = exp_mrt0(2);
+        let orphan = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        assert!(
+            matches!(
+                pixel(&orphan, PERSP_CENTER),
+                Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF
+            ),
+            "orphan v_interp_p1_f32 must be refused with FIRST_HALF"
+        );
+        assert!(
+            matches!(
+                lower::with_first_half_pairs(|| pixel(&orphan, PERSP_CENTER)),
+                Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF
+            ),
+            "orphan v_interp_p1_f32 has no pair and must remain refused on retry"
+        );
+
+        // 2. Paired v_interp_p1_f32 whose dst is read as data before p2 overwrites it:
+        // plain lowering refuses with FIRST_HALF; retry with `with_first_half_pairs`
+        // succeeds and validates cleanly (loading the input instead of zeroing it).
+        let [e0, e1] = exp_mrt0(3);
+        let paired_read = [
+            0xC808_0000,        // v_interp_p1_f32 v2, v0, attr0.x
+            v_add_f32(3, 2, 2), // v3 = v2 + v2 (reads first half as data)
+            0xC809_0001,        // v_interp_p2_f32 v2, v1, attr0.x
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        assert!(
+            matches!(
+                pixel(&paired_read, PERSP_CENTER),
+                Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF
+            ),
+            "reading paired first half as data must fail plain lowering with FIRST_HALF"
+        );
+        let shader = lower::with_first_half_pairs(|| pixel(&paired_read, PERSP_CENTER))
+            .expect("retry with first-half pairs should succeed");
+        let (_, inputs) = parts(&shader);
+        assert!(
+            inputs.iter().any(|e| e.name == "TEXCOORD"),
+            "retried shader must load the interpolated input, not constant 0: {inputs:?}"
+        );
+        validate(&shader);
+    }
 }
