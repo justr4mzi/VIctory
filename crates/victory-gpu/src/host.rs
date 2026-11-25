@@ -254,6 +254,7 @@ fn sweep() {
     crate::texture::let_go_idle(idle_ms);
     crate::resource::let_go_idle();
     crate::tiles::give_back_let_go();
+    crate::placed::let_go_idle();
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -8063,6 +8064,13 @@ impl Meter {
                         if tc > 0.0 { tb / tc / 1e3 } else { 0.0 }
                     );
                 }
+                let [ns, made] = [0, 1].map(|i| crate::resource::MAKING[i].swap(0, Ordering::Relaxed) as f64);
+                let [heaps, placed, committed] = crate::placed::stats();
+                tracing::info!(
+                    "host textures of the title's placed textures since the last such line: {made:.0} made, {:.1} us each; with VICTORY_PLACED_TEX=1, since the start: {placed} placed in {heaps} heaps ({} MB free in them), {committed} committed instead",
+                    ns / 1e3 / made.max(1.0),
+                    crate::placed::free_bytes() >> 20
+                );
             }
             {
                 let [queued, due, away, partly, oldest] =

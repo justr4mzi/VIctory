@@ -1217,6 +1217,11 @@ struct Hosted {
 pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+/// Nanoseconds spent making host textures of the title's placed textures,
+/// and how many, since the line that says so.
+#[cfg(windows)]
+pub(crate) static MAKING: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Every title texture alive (not buffers), by address: for the sweep and
 /// the memory line. A texture leaves the table before it is freed.
 #[cfg(windows)]
@@ -1453,7 +1458,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
+            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true, false) } else { None };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1465,10 +1470,22 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 texture = reserved;
             }
         }
+        // A texture the title views in its own memory, whose contents are
+        // uploaded whole, may be placed in memory another had. (One that is
+        // not uploaded must read zeros.)
+        let placed = r.host.placed.load(Relaxed)
+            && crate::placed::on()
+            && fills(&r.desc)
+            && texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+        let began = std::time::Instant::now();
         let texture = match texture {
             Some(texture) => Some(texture),
-            None => host_texture(&r.desc, r.host.state, clear),
+            None => host_texture(&r.desc, r.host.state, clear, placed),
         };
+        if r.host.placed.load(Relaxed) {
+            MAKING[0].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+            MAKING[1].fetch_add(1, Relaxed);
+        }
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
             return None;
@@ -1554,8 +1571,9 @@ pub(crate) fn room() -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
+        // What the heaps of placed textures have free is room.
         Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+            used.saturating_sub(crate::placed::free_bytes()) + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -2246,8 +2264,9 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    placed: bool,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    host_texture_as(desc, state, clear, false)
+    host_texture_as(desc, state, clear, false, placed)
 }
 
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
@@ -2258,6 +2277,7 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
+    placed: bool,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -2314,6 +2334,16 @@ fn host_texture_as(
         }
         value
     });
+    if placed && !reserved {
+        let state = D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
+        // SAFETY: the description has the host layout (checked size, same
+        // fields).
+        let of = unsafe { &*(&raw const d).cast::<D3D12_RESOURCE_DESC>() };
+        if let Some(t) = crate::placed::make(&host.device, of, state) {
+            crate::host::name(&t, || format!("placed texture {}x{} f{}", d.width, d.height, d.format));
+            return Some(t);
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
