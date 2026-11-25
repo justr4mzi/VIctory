@@ -72,6 +72,49 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 
 ### Newest (2026-11-25, later the same day)
 
+**Update, 2026-11-25 afternoon: what a frame is made of, measured, and two
+changes that hold.** First rooms, about 3,850 draws a frame: 104 ms a frame
+(9.6 frames a second) with the set below, from about 120 ms in the
+morning. Still far from the console's 33 ms.
+- How the title paces itself (new meters in `fence.rs` and
+  `console_insn.rs`): it never asks for an event. Each frame begins with
+  one small submission and a signal, and a title thread then waits for
+  that fence value by reading it in memory with `monitorx` / `mwaitx`
+  (AMD-only: about 280,000 emulated exceptions a second on an Intel
+  processor, all from this wait). The value is set when the layer has
+  finished the whole frame before. So a frame is the time the layer needs
+  for one frame's burst of submissions plus about 20 ms of the title's
+  own; putting presents behind the line, or giving the title's threads
+  more processors, changes nothing (both measured).
+- Two walls stand side by side and both are full: the layer's submit
+  thread (about 95 ms of a 120 ms frame in the morning) and the card
+  (about 102 ms busy, by a timestamp pair around every host list:
+  `cardmeter.rs`). Taking time off one alone moved the frame by 0 to 7 %.
+- `VICTORY_JOIN_PARTS=1` (off by default): the title's lists wait for
+  memory values, which cut its ~15 submissions a frame into ~29 parts;
+  parts that follow one another now go to the host as one submission
+  (9 a frame), the same lists in the same order. About 6 %.
+- `VICTORY_BACK_OWN_VIEW=1` (off by default): what shaders wrote goes
+  back into title view memory through a view of the layer's own, so the
+  copy that wrote it is not read in again. About 9 % (submit thread 93 ->
+  81 ms a frame, 104 -> 80 MB a frame checked). A CORRECTION: an earlier
+  run seemed to show washed-out frames with this switch; the same frames
+  turn up in about 6 of 21 runs with no switch at all (cause not known),
+  and `VICTORY_BACK_OWN_CHECK=1` counted 0 stores gone astray in 1.36
+  million.
+- Where the card's time goes now (`VICTORY_CARD_METER_PIPELINES=1`, a
+  table by pipeline): no pass is large. About 82 ms of the title's lists
+  are spread over ~3,400 pipeline bindings a frame; ~2,400 of the
+  indirect commands still get a clamp pass of the layer's with draw
+  windows on (960 are compute dispatches; about 1,000 are mesh records
+  the title keeps scattered through a 100 MB argument buffer, which a
+  window of records at one step cannot serve).
+- Measured and found to give nothing (switches left in, off):
+  `VICTORY_REFRESH_ONCE`, `VICTORY_ASYNC_PRESENT`, `VICTORY_VIEW_KNOWN`,
+  `VICTORY_SPREAD`, `VICTORY_QUEUE2=3`, `VICTORY_WINDOW_JUMP`. Each has an
+  `=alt` form (twenty seconds on, twenty off, each change said in the
+  log) so that one run measures both in the same scene.
+
 **Update, the same night: the first room now renders right on the test
 machine** (walls, textures, people, lamps), at 190 to 450 ms a frame (2 to 5
 frames a second): the picture work has caught up, the frame rate has not.
@@ -162,9 +205,15 @@ What did it, on top of the list below:
     frame (`VICTORY_CAPTURE_WORLD`, every 8th world frame) is read back
     and written as a PNG inside the present, 235 ms each.
     `VICTORY_CAPTURE_WORLD_EVERY=64` for runs that measure speed.
-  - `VICTORY_INDIRECT_WINDOW=1` measured again with those instruments:
-    6.0 -> 8.9 frames a second on average in the first room, 3.1 -> 4.2
-    in the opening cutscene.
+  - `VICTORY_INDIRECT_WINDOW=1` measured again with those instruments. A
+    CORRECTION: the first figures given here (6.0 against 8.9 frames a
+    second) compared two runs that stood in different scenes during the
+    measured window (about 4,300 against 1,550 draws a frame) and are
+    withdrawn. Compared at equal draws, by a line fitted to each run's
+    frame times against its draws per frame: windows off 145 ms at 4,500
+    draws and 271 ms at 10,000; windows on with `VICTORY_COPY_PLAIN=1`
+    124 ms and 211 ms. On screen: 7-8 frames a second in the first rooms,
+    10-12 in their lighter views.
   - A driver watch (on by default; `VICTORY_DRIVER_WATCH=0` off): the
     layer subscribes to the system's event log and logs every entry of a
     display driver as it is recorded; the first one turns draw windows
@@ -179,10 +228,22 @@ What did it, on top of the list below:
     sync looks at a changed page's records under one lock, fingerprint
     first; guarded view memory is left out of a submission's write-watch
     askings ahead (after triippywhale).
-  - Behind switches, built and unit-tested, not yet shown to pay:
-    `VICTORY_COPY_PLAIN=1` (copies of title memory made in place by this
+  - `VICTORY_COPY_PLAIN=1`: copies of title memory made in place by this
     process, with a handler that falls back to the kernel's copy on a
-    missing page), `VICTORY_REFRESH_ONCE=1`, `VICTORY_VIEW_KNOWN=1`,
+    missing page. Its first form also took the layer's one-byte "is this
+    page there" reads, 1,000 to 1,300 faults a frame, and won nothing;
+    reads under 256 bytes now stay with the kernel and a source that
+    faulted is left alone for two seconds (4 to 9 faults a frame). The
+    submit thread's kernel time fell from 44 to 20 ms a frame; the
+    picture is the same.
+  - The layer's submit and copy-back threads ask for the fast cores of a
+    hybrid processor (`VICTORY_FAST_CORES=0`: not): the submit thread was
+    found on a slow core in 6 % of its looks, now in none of 21,059.
+    `VICTORY_DISK_CORES=slow` (off, not measured) asks the slow cores for
+    the DirectStorage workers, which are as many as the logical
+    processors and free to run anywhere.
+  - Behind switches, built and unit-tested, not yet shown to pay:
+    `VICTORY_REFRESH_ONCE=1`, `VICTORY_VIEW_KNOWN=1`,
     `VICTORY_BACK_OWN_VIEW=1` (picture to be checked),
     `VICTORY_ASYNC_PRESENT=1` (the present goes behind the queue's line;
     no gain while the card is the limit).
@@ -197,6 +258,12 @@ What did it, on top of the list below:
   Still open: the per-record clamp is most of the card's time, and the
   copies between the PC's memory and the card's are most of the submit
   thread's; the cause of the one device loss with windows is not known.
+  A first play session past the first rooms reached the open world and
+  lost the device there with no driver entry (reason "device removed"):
+  the card had no room for new textures from the opening cutscene on
+  (9.2 of a 10.3 GB budget on a 12 GB card; 2,073 passes made no texture
+  for lack of room; 44,613 textures let go and made again in 13 minutes).
+  Cause of that removal not known either.
 - Known and counted, not fixed yet: an indirect compute pass asks for
   about 77,500 thread groups in x where one dispatch runs 65,535 (the
   rest is cut off).
