@@ -1200,30 +1200,88 @@ mod host {
         }
     }
 
+    /// Parses a virtual-key name for `VICTORY_KEYS` and `VICTORY_KEYS_FILE`.
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(super) fn parse_key_name(key: &str) -> Option<u8> {
+        match key.trim() {
+            "Enter" => Some(0x0D),
+            "Esc" => Some(0x1B),
+            "Tab" => Some(0x09),
+            "Back" => Some(0x08),
+            "Space" => Some(0x20),
+            "Up" => Some(0x26),
+            "Down" => Some(0x28),
+            "Left" => Some(0x25),
+            "Right" => Some(0x27),
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                Some(k.as_bytes()[0].to_ascii_uppercase())
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(super) struct FileKeys {
+        last_poll: Instant,
+        active: Vec<(Instant, u8)>,
+    }
+
+    #[cfg(any(test, feature = "diagnostics"))]
+    impl FileKeys {
+        pub(super) fn new(now: Instant) -> Self {
+            Self {
+                last_poll: now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
+                active: Vec::new(),
+            }
+        }
+
+        pub(super) fn poll(&mut self, path: &std::path::Path, now: Instant) -> Vec<u8> {
+            self.active.retain(|&(until, _)| until > now);
+            if now.duration_since(self.last_poll) >= Duration::from_millis(200) {
+                self.last_poll = now;
+                if let Ok(text) = std::fs::read_to_string(path)
+                    && !text.trim().is_empty()
+                {
+                    let _ = std::fs::write(path, b"");
+                    for token in text.split([',', '\n', '\r', ' ', '\t']) {
+                        let token = token.trim();
+                        if token.is_empty() {
+                            continue;
+                        }
+                        let (name, hold_ms) = match token.split_once(':') {
+                            Some((k, ms)) => {
+                                let ms = ms.trim().parse::<u64>().unwrap_or(250).clamp(50, 5000);
+                                (k, ms)
+                            }
+                            None => (token, 250),
+                        };
+                        if let Some(vk) = parse_key_name(name) {
+                            self.active.push((now + Duration::from_millis(hold_ms), vk));
+                        }
+                    }
+                }
+            }
+            let mut keys = Vec::new();
+            for &(_, vk) in &self.active {
+                if !keys.contains(&vk) {
+                    keys.push(vk);
+                }
+            }
+            keys
+        }
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// 0.2 s that long after input starts, with or without focus, and
+    /// `VICTORY_KEYS_FILE=<path>` polls a command file every 200 ms for
+    /// `<key>` (250 ms hold) or `<key>:<ms>` tokens and clears it after reading.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = parse_key_name(key)?;
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                     vk,
@@ -1231,12 +1289,30 @@ mod host {
             });
             (Instant::now(), keys.collect())
         });
+        static FILE: LazyLock<Option<(std::path::PathBuf, std::sync::Mutex<FileKeys>)>> =
+            LazyLock::new(|| {
+                let path = std::env::var_os("VICTORY_KEYS_FILE")?;
+                if path.is_empty() {
+                    return None;
+                }
+                Some((path.into(), std::sync::Mutex::new(FileKeys::new(Instant::now()))))
+            });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut out: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        if let Some((path, state)) = &*FILE {
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            for vk in guard.poll(path, Instant::now()) {
+                if !out.contains(&vk) {
+                    out.push(vk);
+                }
+            }
+        }
+        out
     }
 
     /// `VICTORY_KEYS_ANYWHERE=1`: the keyboard is read whichever window has
@@ -1672,5 +1748,28 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn keys_file_parses_consumes_holds_and_expires() {
+        use super::host::{FileKeys, parse_key_name};
+
+        assert_eq!(parse_key_name("Enter"), Some(0x0D));
+        assert_eq!(parse_key_name("Space"), Some(0x20));
+        assert_eq!(parse_key_name("x"), Some(b'X'));
+        assert_eq!(parse_key_name("unknown"), None);
+
+        let path = std::env::temp_dir().join(format!("victory_keys_test_{}.txt", std::process::id()));
+        std::fs::write(&path, "Enter, W:800").unwrap();
+        let t0 = Instant::now();
+        let mut keys = FileKeys::new(t0);
+        assert_eq!(keys.poll(&path, t0), vec![0x0D, b'W']);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        // Both held at +150ms; only W held at +300ms; neither held at +900ms.
+        assert_eq!(keys.poll(&path, t0 + Duration::from_millis(150)), vec![0x0D, b'W']);
+        assert_eq!(keys.poll(&path, t0 + Duration::from_millis(300)), vec![b'W']);
+        assert!(keys.poll(&path, t0 + Duration::from_millis(900)).is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 }

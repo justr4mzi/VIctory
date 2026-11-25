@@ -350,7 +350,9 @@ pub(crate) fn release_held(all: bool) {
 pub(crate) fn behind() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1") && crate::host::late() && cuts();
+        let on = std::env::var_os("VICTORY_ASYNC_SUBMIT").map_or(!cfg!(test), |v| v != "0")
+            && crate::host::late()
+            && cuts();
         if on {
             tracing::info!("submissions are prepared and sent by a thread of ours, not by the thread that submits (VICTORY_ASYNC_SUBMIT=1)");
             let _ = std::thread::Builder::new().name("victory-submit".into()).spawn(worker);

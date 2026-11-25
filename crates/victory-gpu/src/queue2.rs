@@ -75,7 +75,13 @@ use windows::core::Interface;
 /// Read once, when the first submission asks.
 pub(crate) fn bits() -> u32 {
     static BITS: OnceLock<u32> = OnceLock::new();
-    *BITS.get_or_init(|| std::env::var("VICTORY_QUEUE2").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0) & 3)
+    *BITS.get_or_init(|| {
+        std::env::var("VICTORY_QUEUE2")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(if cfg!(test) { 0 } else { 1 })
+            & 3
+    })
 }
 
 /// The most bytes of landing buffers in the card's memory, for title
