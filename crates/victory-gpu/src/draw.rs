@@ -662,6 +662,16 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
+/// Per host heap, for [`State::heap_buffers`]: `(evict_gen, passes, ranges)`
+/// kept from pass to pass. (At module level so [`State::heap_buffers_marked`]
+/// can reset it on mode changes.)
+type Ranges = std::collections::HashMap<u32, (u64, std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, u64, Ranges)>>> =
+    std::sync::Mutex::new(None);
+/// Per host heap, for [`State::heap_buffers_marked`]: what the marked pass
+/// keeps (`VICTORY_HEAP_PASS_MARKED`).
+type Marked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
+static MARKED: std::sync::Mutex<Option<std::collections::HashMap<usize, Marked>>> = std::sync::Mutex::new(None);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
 /// picked by index that runs inside it (`heap_textures`), and the buffer
@@ -782,6 +792,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         }
         shadow.refresh(list, address, len);
         return Some(gpu);
+    }
+    if crate::host::list_reuse() {
+        return list.fill_scratch(address as *const u8, len);
     }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
@@ -1721,6 +1734,13 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
+        if crate::heap_pass::marked() {
+            self.heap_buffers_marked(list, heap, host, frame);
+            return Some(gpu);
+        }
+        if crate::heap_pass::marked_paused() {
+            *MARKED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         let started = std::time::Instant::now();
         // Discover raw-byte-copied buffer and placed-texture views before
         // draining `buffer_changes()` and `heap_textures()`, so they are
@@ -1732,9 +1752,6 @@ impl State {
         // reads, kept from pass to pass. `evict_gen` lets steady frames skip
         // scanning all 30k+ `ranges` entries when no slot left `buffers` or
         // became newly tabled.
-        type Ranges = std::collections::HashMap<u32, (u64, std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let (evict_gen, passes, ranges) = kept
             .get_or_insert_with(Default::default)
@@ -1886,6 +1903,175 @@ impl State {
             );
         }
         Some(gpu)
+    }
+
+    /// Marked buffer-view heap pass (`VICTORY_HEAP_PASS_MARKED`): scans only
+    /// slots written, forgotten, orphaned, or periodically re-swept, then
+    /// refreshes coalesced buffer spans via `Shadow::refresh_many`.
+    fn heap_buffers_marked(
+        &self,
+        list: &HostList,
+        heap: &crate::descriptor::Heap,
+        host: &crate::descriptor::host::HostHeap,
+        frame: u64,
+    ) {
+        let started = std::time::Instant::now();
+        let t_sync = std::time::Instant::now();
+        crate::descriptor::sync_heaps();
+        HEAP_PASS_BREAKDOWN[0].fetch_add(t_sync.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t_retain = std::time::Instant::now();
+        let mut kept = MARKED.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = kept.get_or_insert_with(Default::default);
+        if crate::heap_pass::RESUMED.swap(false, Ordering::Relaxed) {
+            heaps.clear();
+            *RANGES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        let forgotten = crate::descriptor::take_forgotten();
+        for picked in heaps.values_mut() {
+            picked.note_forgotten(forgotten.as_deref());
+        }
+        let ranges = heaps
+            .entry(std::ptr::from_ref(host) as usize)
+            .or_insert_with(|| Marked::new(false));
+        let changed = host.buffer_changes();
+        let record = |index: u32| heap.handle(index).map(crate::descriptor::record_at);
+        let slots = ranges.plan(changed, || host.buffer_slots(), record, crate::descriptor::record_entry);
+        HEAP_PASS_BREAKDOWN[1].fetch_add(t_retain.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        if let Some(why) = crate::descriptor::host::device_removed() {
+            drop(kept);
+            crate::host::fail(format_args!("host device lost before preparing buffer views: {why}"));
+        }
+        HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+
+        let t_mirror = std::time::Instant::now();
+        let mut same = 0u64;
+        for (n, &index) in slots.iter().enumerate() {
+            let Some(handle) = heap.handle(index) else {
+                ranges.forget(index);
+                continue;
+            };
+            let record = crate::descriptor::record_at(handle);
+            let entry = crate::descriptor::record_entry(record);
+            same += u64::from(ranges.record_of(index) == Some(record));
+            ranges.forget(index);
+            let Some((view, resolved)) = host.mirror_for_pass(index, handle) else {
+                continue;
+            };
+            #[cfg(feature = "diagnostics")]
+            let made = resolved.is_some();
+            if n % 4096 == 4095
+                && let Some(why) = crate::descriptor::host::device_removed()
+            {
+                let start_i = n.saturating_sub(63);
+                let last: Vec<String> = slots[start_i..=n]
+                    .iter()
+                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                    .map(|s| s.chars().take(200).collect())
+                    .collect();
+                drop(kept);
+                crate::host::fail(format_args!(
+                    "host device lost while preparing buffer views at slot {index}: {why}; recent views: {last:#?}"
+                ));
+            }
+            let copy = match resolved {
+                Some(copy) => Some(copy),
+                None => crate::descriptor::host::buffer_copy(&view),
+            };
+            let Some((shadow, address, len)) = copy else {
+                if crate::descriptor::host::buffer_range(&view).is_some_and(|(_, len)| len > 0) {
+                    ranges.orphan(index, record, entry);
+                }
+                continue;
+            };
+            #[cfg(feature = "diagnostics")]
+            if !made && host.shows(index, &shadow.buffer) == Some(false) {
+                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+            }
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            ranges.keep(index, key, &shadow, address, address + len, record, entry);
+        }
+        if !slots.is_empty()
+            && !slots.len().is_multiple_of(4096)
+            && let Some(why) = crate::descriptor::host::device_removed()
+        {
+            drop(kept);
+            crate::host::fail(format_args!(
+                "host device lost after preparing buffer views: {why}"
+            ));
+        }
+        HEAP_PASS_BREAKDOWN[2].fetch_add(t_mirror.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t_spans = std::time::Instant::now();
+        let views = ranges.views() as u32;
+        let spans = ranges.spans();
+        drop(kept);
+        let copies_count = spans.len();
+        let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
+        static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
+            std::sync::Mutex::new(None);
+        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+        let whole = whole.get_or_insert_with(Default::default);
+        let mut eligible: Vec<(&std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+            Vec::with_capacity(copies_count);
+        for (shadow, from, to) in &spans {
+            if shadow.unwatched() {
+                let key = shadow.id() as usize;
+                static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let every = *EVERY.get_or_init(|| {
+                    std::env::var("VICTORY_UNWATCHED_FRAMES")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1)
+                });
+                match whole.get(&key) {
+                    Some(&last) if frame < last + every => continue,
+                    _ => {
+                        whole.insert(key, frame);
+                    }
+                }
+            }
+            eligible.push((shadow, *from, *to - *from));
+        }
+        HEAP_PASS_BREAKDOWN[3].fetch_add(t_spans.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t_refresh = std::time::Instant::now();
+        crate::shadow::Shadow::refresh_many(list, eligible);
+        HEAP_PASS_BREAKDOWN[4].fetch_add(t_refresh.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let textures_began = std::time::Instant::now();
+        self.heap_textures(list, heap, host);
+        let tex_us = textures_began.elapsed().as_micros() as u64;
+        HEAP_PASS_PARTS[0].fetch_add(tex_us, Ordering::Relaxed);
+        HEAP_PASS_BREAKDOWN[5].fetch_add(tex_us, Ordering::Relaxed);
+
+        HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
+        HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        static SEEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+        SEEN[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        SEEN[2].fetch_add(same, Ordering::Relaxed);
+        if SEEN[0].fetch_add(1, Ordering::Relaxed) % 256 == 255 {
+            tracing::info!(
+                "the marked pass over the heap's buffer views (VICTORY_HEAP_PASS_MARKED), its last 256 passes: {} slots looked at, {} of them held the record seen at their last look; {} views kept now",
+                SEEN[1].swap(0, Ordering::Relaxed),
+                SEEN[2].swap(0, Ordering::Relaxed),
+                views,
+            );
+        }
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        let seen = LOGGED.load(Ordering::Relaxed);
+        if u64::from(views) > seen + seen / 2 {
+            LOGGED.store(u64::from(views), Ordering::Relaxed);
+            tracing::info!(
+                slots = slots.len(),
+                views,
+                copies = copies_count,
+                mb = bytes >> 20,
+                ms = started.elapsed().as_millis(),
+                "buffer views of the heap made ready for shaders that pick them by index (the marked pass)"
+            );
+        }
     }
 
     /// Runs the pass that uploads textures picked by index

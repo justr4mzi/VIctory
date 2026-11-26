@@ -1788,6 +1788,11 @@ impl HostHeap {
         out.extend(buffers.iter().copied().filter(|&i| i % stride == target));
     }
 
+    /// All title slots of this heap that currently hold a buffer view.
+    pub(crate) fn buffer_slots(&self) -> Vec<u32> {
+        self.buffers.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect()
+    }
+
     /// Whether buffer slots read through descriptor tables should be skipped
     /// from the global heap buffer tracking (`VICTORY_HEAP_BUF_SKIP_TABLED=1`).
     fn skip_tabled_buffers() -> bool {

@@ -183,6 +183,10 @@ fn card_limits() -> (u64, u64) {
         // each submission to go through. Not tried in a game yet.
         let least = match std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
             Some(kib) if kib > 0 => kib << 10,
+            _ if std::env::var_os("VICTORY_CARD_BUFFERS_MIN_MB").is_some() => {
+                mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20)
+            }
+            _ if !cfg!(test) => 64 << 10,
             _ => mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20),
         };
         (least, mb("VICTORY_CARD_BUFFERS_MB", 2048))
@@ -2735,16 +2739,26 @@ pub(crate) fn let_go_idle(idle_ms: u64) {
         if map.is_empty() {
             return;
         }
-        let idle: Vec<(u64, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(key, _)| *key)
-            .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let idle = |s: &Arc<Shadow>| {
+            Arc::strong_count(s) == 1
+                && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                && crate::host::references(&s.buffer) == 1
+        };
+        let keys: Vec<(u64, u64)> = map.iter().filter(|(_, s)| idle(s)).map(|(key, _)| *key).collect();
+        // Counted before they leave the table, with its lock held, and
+        // each looked at AGAIN after the count ([`TABLES_CHANGED`]): a
+        // thread that took one from its own memory of asks before the
+        // count moved holds it by now, and it stays.
+        if !keys.is_empty() {
+            tables_changed();
+        }
+        let mut gone = Vec::new();
+        for key in keys {
+            if map.get(&key).is_some_and(&idle) {
+                gone.extend(map.remove(&key));
+            }
+        }
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -4026,7 +4040,11 @@ impl Shadow {
     pub(crate) fn card_hashed(&self) -> Option<u64> {
         static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let size = self.card.as_ref()?.size;
-        if *WHOLE.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_LEN").is_none_or(|v| v != "1")) {
+        if *WHOLE.get_or_init(|| match std::env::var("VICTORY_CARD_HASH_LEN").as_deref() {
+            Ok("0") => true,
+            Ok("1") => false,
+            _ => cfg!(test),
+        }) {
             return Some(size);
         }
         Some(self.len.next_multiple_of(16).min(size))
@@ -4430,12 +4448,18 @@ fn buffers_write() -> std::sync::RwLockWriteGuard<'static, BufferMap> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers_write().register(resource, start, len);
+    let mut map = buffers_write();
+    map.register(resource, start, len);
+    // Counted after insert with the table's lock held so readers of the old
+    // table still observe the old count.
+    tables_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers_write().unregister(resource, start);
+    let mut map = buffers_write();
+    tables_changed();
+    map.unregister(resource, start);
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -4472,12 +4496,20 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(_, shadow)| shadow.place.is_some())
             .map(|(key, _)| *key)
             .collect();
+        if !keys.is_empty() {
+            tables_changed();
+        }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
         let mut map = buffers_write();
+        let mut bumped = false;
         for entry in map.overlapping(at, end) {
             if entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
+                if !bumped {
+                    tables_changed();
+                    bumped = true;
+                }
                 gone.extend(entry.shadow.take());
             }
         }
@@ -4535,7 +4567,127 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true)
 }
 
+/// Counts table changes that can change what [`lookup`] finds.
+static TABLES_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+fn tables_changed() {
+    TABLES_CHANGED.fetch_add(1, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::{TABLES_CHANGED, buffers_write, register, unregister};
+    use std::sync::{Barrier, atomic::Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_pending_registration_invalidates_readers_of_the_old_table() {
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        let table = buffers_write();
+        let initial = TABLES_CHANGED.load(Ordering::Acquire);
+        let ready = Barrier::new(2);
+        let observed = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                ready.wait();
+                register(resource, start, 8);
+            });
+            ready.wait();
+            let deadline = Instant::now() + Duration::from_millis(50);
+            while TABLES_CHANGED.load(Ordering::Acquire) == initial && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let count = TABLES_CHANGED.load(Ordering::Acquire);
+            assert!(!table.entries.contains_key(&(start, resource)));
+            drop(table);
+            count
+        });
+        let committed = TABLES_CHANGED.load(Ordering::Acquire);
+        unregister(resource, start);
+        assert_ne!(committed, observed, "the old table still has the current count");
+    }
+}
+
+/// Since the last frame line: asks answered from a thread's own memory of
+/// them, and asks that went to the tables.
+pub(crate) static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether a thread caches buffer lookups (`VICTORY_LOOKUP_CACHE=0` disables;
+/// default ON outside tests; `alt` alternates every 20s).
+fn lookup_cache() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_LOOKUP_CACHE").as_deref() {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => u8::from(!cfg!(test)),
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a thread remembers what its asks for a buffer's host copy found from now (VICTORY_LOOKUP_CACHE=alt): {}",
+                    if on { "ON" } else { "off, every ask goes to the tables as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+const FOUND_MOST: usize = 8192;
+
+type Found = std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
+
+thread_local! {
+    static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::new()));
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    if !lookup_cache() {
+        return lookup_tables(address, len, any);
+    }
+    let changes = TABLES_CHANGED.load(Ordering::Acquire);
+    let found = FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        if f.0 != changes {
+            f.1.clear();
+            f.0 = changes;
+        }
+        f.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)
+    });
+    if let Some(shadow) = found.filter(|_| TABLES_CHANGED.load(Ordering::SeqCst) == changes) {
+        LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
+        if shadow.window {
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+            shadow.asked[1].fetch_max(address.saturating_add(len.max(1)), Ordering::Relaxed);
+            if len <= 1 {
+                shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        return Some(shadow);
+    }
+    LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
+    let shadow = lookup_tables(address, len, any)?;
+    FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        if f.0 == changes {
+            if f.1.len() >= FOUND_MOST {
+                f.1.clear();
+            }
+            f.1.insert((address, len, any), Arc::downgrade(&shadow));
+        }
+    });
+    Some(shadow)
+}
+
+fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let needs_copy = {
         let map = buffers_read();
@@ -4807,6 +4959,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, rs, rl, true, true));
         note(&shadow);
         map.insert((rs, rl), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     // In place, if asked for and the window's memory can be opened: the
@@ -4815,6 +4968,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true, false));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     // In a GPU upload heap, if asked for and there is room: one buffer in
@@ -4829,6 +4983,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -4867,6 +5022,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    tables_changed();
     Some(shadow)
 }
 

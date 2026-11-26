@@ -2159,6 +2159,11 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// With [`list_reuse`]: upload memory filled from title memory since
+    /// the last title copy (source, bytes): its host GPU address, which a
+    /// second fill would find holding the same bytes
+    /// ([`HostList::fill_scratch`]).
+    filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2204,6 +2209,7 @@ impl Deferred {
         self.kept.clear();
         self.bound_pipelines.clear();
         self.refreshed.clear();
+        self.filled.clear();
         self.textures.clear();
         self.writes.clear();
         self.backs.clear();
@@ -3373,19 +3379,282 @@ mod fill_check {
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
+/// What `VICTORY_LIST_REUSE` says: 0 off, 1 on, 2 in turn.
+fn list_reuse_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_LIST_REUSE").as_deref() {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => u8::from(!cfg!(test)),
+    })
+}
+
+fn list_reuse_set() -> bool {
+    list_reuse_mode() != 0
+}
+
+/// Whether a list reuses repeated root view scratch copies within the same
+/// recording (`VICTORY_LIST_REUSE=0` disables; default ON outside tests; `alt`
+/// alternates every 20s).
+pub(crate) fn list_reuse() -> bool {
+    match list_reuse_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a list copies a repeated root view once from now (VICTORY_LIST_REUSE=alt): {}",
+                    if on { "ON" } else { "off, at every bind as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Whether a list's fills of under 256 bytes are copied in place
+/// (`VICTORY_FILLS_PLAIN=0` disables; default ON outside tests; `alt`
+/// alternates every 20s).
+fn fills_plain() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_FILLS_PLAIN").as_deref() {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => u8::from(!cfg!(test)),
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a list's fills of under 256 bytes are copied in place from now (VICTORY_FILLS_PLAIN=alt): {}",
+                    if on { "ON" } else { "off, through the kernel's copy as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// A fill's copy ([`Step::Fill`]): title memory at `src` into upload memory
+/// at `dst`. In place if short and [`fills_plain`] says so, else [`copy_mapped`].
+fn copy_fill(dst: *mut u8, src: *const u8, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    let timing_only = crate::copystat::mode() != 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let timing_only = false;
+    if len > 0
+        && len < crate::plaincopy::least()
+        && !timing_only
+        && fills_plain()
+        && crate::plaincopy::copy_short(dst, src, len)
+    {
+        #[cfg(feature = "diagnostics")]
+        crate::backreads::touched(src as usize, len, false);
+        return;
+    }
+    copy_mapped(dst, src, len, false);
+}
+
+/// Whether a submission's passes over its lists' steps find a step's copy
+/// by an index instead of a search (`VICTORY_STEP_INDEX=0` disables;
+/// default ON outside tests; `alt`: twenty seconds with, twenty without).
+fn step_index() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_STEP_INDEX").as_deref() {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => u8::from(!cfg!(test)),
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a submission's steps find their copy by an index from now (VICTORY_STEP_INDEX=alt): {}",
+                    if on { "ON" } else { "off, by a search as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The ranges (from, to) given to shaders, as `given` names them in order,
+/// per copy: the copies in the order they first come, each range once, in
+/// the order it first comes. What the search per step gives
+/// ([`declared_writes`], `Host::card_before`), found by an index.
+fn declared_by_index<'a>(
+    given: impl Iterator<Item = (&'a std::sync::Arc<crate::shadow::Shadow>, (usize, usize))>,
+) -> Vec<Declared> {
+    grouped(given.map(|(shadow, range)| (std::sync::Arc::as_ptr(shadow) as usize, shadow, range)))
+        .into_iter()
+        .map(|(shadow, ranges)| (shadow.clone(), ranges))
+        .collect()
+}
+
+/// `given` (a key, what the key stands for, a range) as one entry per key,
+/// in the order the keys first come, each with its ranges, every range
+/// once, in the order it first comes ([`declared_by_index`]).
+fn grouped<T>(given: impl Iterator<Item = (usize, T, (usize, usize))>) -> Vec<(T, Vec<(usize, usize)>)> {
+    let mut out: Vec<(T, Vec<(usize, usize)>)> = Vec::new();
+    let mut place: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashSet<(usize, usize, usize)> = std::collections::HashSet::new();
+    for (key, of, range) in given {
+        if !seen.insert((key, range.0, range.1)) {
+            continue;
+        }
+        let at = *place.entry(key).or_insert_with(|| {
+            out.push((of, Vec::new()));
+            out.len() - 1
+        });
+        out[at].1.push(range);
+    }
+    out
+}
+
+#[cfg(test)]
+mod grouped_tests {
+    fn searched(given: &[(usize, (usize, usize))]) -> Vec<(usize, Vec<(usize, usize)>)> {
+        let mut back: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+        for &(key, range) in given {
+            match back.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, ranges)) => {
+                    if !ranges.contains(&range) {
+                        ranges.push(range);
+                    }
+                }
+                None => back.push((key, vec![range])),
+            }
+        }
+        back
+    }
+
+    #[test]
+    fn the_index_gives_what_the_search_gives() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |below: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % below
+        };
+        assert!(super::grouped(std::iter::empty::<(usize, usize, (usize, usize))>()).is_empty());
+        for (keys, ranges, steps) in [(1, 1, 5), (3, 4, 200), (40, 6, 3000), (500, 50, 3000)] {
+            for _ in 0..20 {
+                let given: Vec<(usize, (usize, usize))> = (0..steps)
+                    .map(|_| {
+                        let from = next(ranges) * 64;
+                        (0x1000 + next(keys) * 8, (from, from + 16 + next(2) * 16))
+                    })
+                    .collect();
+                let by_index = super::grouped(given.iter().map(|&(key, range)| (key, key, range)));
+                assert_eq!(by_index, searched(&given), "{keys} keys, {ranges} ranges, {steps} steps");
+            }
+        }
+    }
+}
+
+/// The ranges of `runs`' steps that give memory to shaders, with the copy
+/// each is of; `carded`: only those of copies in the card's memory.
+fn given_to_shaders<'a>(
+    runs: &'a [&'a HostList],
+    carded: bool,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, (usize, usize))> {
+    let mut given = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::GpuWrite(shadow, address, len) = step
+                && (!carded || shadow.carded())
+            {
+                given.push((shadow.clone(), (*address, *address + *len)));
+            }
+        }
+    }
+    given
+}
+
+/// Whether the send-and-hash list records copies, one state barrier, and
+/// hashes in three batched steps (`VICTORY_CARD_SYNC_BATCH=0` disables;
+/// default ON outside tests; `alt` alternates every 20s).
+fn sync_batched() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_SYNC_BATCH").as_deref() {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => u8::from(!cfg!(test)),
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the send-and-hash list records its copies, one state change and its hash passes in three steps from now (VICTORY_CARD_SYNC_BATCH=alt): {}",
+                    if on { "ON" } else { "off, copy by copy as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
 fn stale_under_flights(runs: &[&HostList]) -> bool {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && shadow.writes_pending()
-            {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+    if step_index() {
+        let mut known: std::collections::HashMap<usize, Option<usize>> = std::collections::HashMap::new();
+        let mut last: (usize, Option<usize>) = (0, None);
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step {
+                    let key = Arc::as_ptr(shadow) as usize;
+                    let at = if last.0 == key {
+                        last.1
+                    } else {
+                        let at = *known.entry(key).or_insert_with(|| {
+                            shadow.writes_pending().then(|| {
+                                spans.push((shadow.clone(), usize::MAX, 0));
+                                spans.len() - 1
+                            })
+                        });
+                        last = (key, at);
+                        at
+                    };
+                    if let Some(at) = at {
+                        let s = &mut spans[at];
+                        (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                    }
+                }
+            }
+        }
+    } else {
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Refresh(shadow, address, len) = step
+                    && shadow.writes_pending()
+                {
+                    match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
+                        Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
+                        None => spans.push((shadow.clone(), *address, *address + *len)),
+                    }
                 }
             }
         }
@@ -3857,6 +4126,14 @@ fn late_line(frames: f64) {
         s[14],
     );
     {
+        let found = [0, 1].map(|i| crate::shadow::LOOKUPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "asks for a buffer's host copy per frame: {:.0} answered from the asking thread's memory of them, {:.0} from the tables (VICTORY_LOOKUP_CACHE)",
+            found[0],
+            found[1]
+        );
+    }
+    {
         let w: Vec<f64> = LATE_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames).collect();
         tracing::info!(
             "of the waiting for the card in settles, per frame, by what settled: a synchronous submission or present {:.1} ms, \
@@ -4048,7 +4325,12 @@ fn coalesce(refreshes: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, u
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
-    for list in runs {
+    let indexed = step_index();
+    if indexed {
+        let given = given_to_shaders(runs, false);
+        back = declared_by_index(given.iter().map(|(shadow, range)| (shadow, *range)));
+    }
+    for list in if indexed { &[][..] } else { runs } {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
                 let range = (*address, *address + *len);
@@ -4571,7 +4853,12 @@ impl Host {
         }
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
-        for list in runs {
+        let indexed = step_index();
+        if indexed {
+            let given = given_to_shaders(runs, true);
+            declared = declared_by_index(given.iter().map(|(shadow, range)| (shadow, *range)));
+        }
+        for list in if indexed { &[][..] } else { runs } {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
                     && shadow.carded()
@@ -4698,6 +4985,73 @@ impl Host {
                     let shot_span = crate::shot::span_begin(list);
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
+                    struct Synced<'a> {
+                        shadow: &'a Arc<crate::shadow::Shadow>,
+                        ranges: &'a [(usize, usize)],
+                        before: Option<ID3D12Resource>,
+                        size: u64,
+                    }
+                    let batched = sync_batched();
+                    let mut synced: Vec<Synced> = Vec::with_capacity(dirty.len());
+                    let hashes = |list: &ID3D12GraphicsCommandList, group: &[Synced]| {
+                        let moves: Vec<_> = group
+                            .iter()
+                            .filter(|w| w.before.is_some() && !w.ranges.is_empty())
+                            .map(|w| {
+                                transition(
+                                    &w.shadow.buffer,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                )
+                            })
+                            .collect();
+                        if !moves.is_empty() {
+                            list.ResourceBarrier(&moves);
+                        }
+                        let mut bound = false;
+                        for w in group {
+                            let Some(before) = &w.before else {
+                                continue;
+                            };
+                            if !bound {
+                                bound = true;
+                                list.SetComputeRootSignature(&work.root);
+                                list.SetPipelineState(&work.pso);
+                                list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                            }
+                            list.SetComputeRootShaderResourceView(1, w.shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            let runs: Vec<crate::shadow::CardSpan> =
+                                if whole.iter().any(|s| Arc::ptr_eq(s, w.shadow)) {
+                                    vec![w.shadow.card_run(0, usize::MAX)]
+                                } else {
+                                    w.ranges.iter().map(|&(a, b)| w.shadow.card_run(a, b)).collect()
+                                };
+                            let runs = if rehash_runs() {
+                                crate::shadow::joined_piece_runs(runs)
+                            } else {
+                                runs
+                            };
+                            CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            CARD_PASSES[1].fetch_add(
+                                runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(),
+                                Ordering::Relaxed,
+                            );
+                            for run in runs {
+                                card_compare_dispatch(
+                                    list,
+                                    [
+                                        run.first,
+                                        run.skew,
+                                        w.shadow.card_hashed().unwrap_or(w.size) as u32,
+                                        run.pieces,
+                                        0,
+                                        0,
+                                    ],
+                                );
+                            }
+                        }
+                    };
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -4716,49 +5070,13 @@ impl Host {
                             ranges.iter().map(|&(a, b)| (b - a) as u64).sum(),
                             ranges.len() as u64,
                         );
-                        let Some(before) = before else {
-                            continue;
-                        };
-                        // No twin (it cost the card the copy's size again,
-                        // 399 MB in run 75): `before` holds a 128-bit hash
-                        // of each 64 KiB piece. The pieces just sent up are
-                        // hashed again, all of them the first time; the
-                        // compare after the lists hashes the declared
-                        // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
-                            list.ResourceBarrier(&[transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
+                        synced.push(Synced { shadow, ranges, before, size });
+                        if !batched {
+                            hashes(list, &synced[synced.len() - 1..]);
                         }
-                        list.SetComputeRootSignature(&work.root);
-                        list.SetPipelineState(&work.pso);
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
-                        } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
-                        };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
-                        for run in runs {
-                            card_compare_dispatch(
-                                list,
-                                [
-                                    run.first,
-                                    run.skew,
-                                    shadow.card_hashed().unwrap_or(size) as u32,
-                                    run.pieces,
-                                    0,
-                                    0,
-                                ],
-                            );
-                        }
+                    }
+                    if batched {
+                        hashes(list, &synced);
                     }
                     crate::cardmeter::end(list, timed);
                     #[cfg(feature = "diagnostics")]
@@ -7454,6 +7772,20 @@ impl HostList {
         }
     }
 
+    /// With [`list_reuse`]: the host GPU address of `len` bytes of upload
+    /// memory holding the title memory at `src` as of the list's submission.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        let found = self.deferred().filled.get(&key).copied();
+        if let Some(gpu) = found {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
+    }
+
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -7478,6 +7810,9 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        if list_reuse_set() {
+            deferred.filled.clear();
+        }
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7843,8 +8178,12 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        if list_reuse_set() {
+            deferred.filled.clear();
+        }
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -7914,7 +8253,7 @@ impl HostList {
                     }
                     #[cfg(feature = "diagnostics")]
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    copy_fill(dst as *mut u8, src as *const u8, len);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
