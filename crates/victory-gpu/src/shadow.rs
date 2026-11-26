@@ -5999,7 +5999,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let mut big = cards() && (size >= card_limits().0 || card_all());
     // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
     // title's 32-bit graphics heap in place, big or not.
-    if let Some(placed) = crate::port::place_for(key.0, buf_len, false) {
+    // Keep >4 GiB big buffers in local GDDR6 VRAM so GPU-heavy buffers do not stall over PCIe.
+    if (!big || key.0 + buf_len <= (1u64 << 32)) && let Some(placed) = crate::port::place_for(key.0, buf_len, false) {
         let shadow = Arc::new(Shadow::placed(placed, key.0, buf_len, false));
         map.get_mut(&key)?.shadow = Some(shadow.clone());
         return Some(shadow);
