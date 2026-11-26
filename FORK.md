@@ -27,7 +27,7 @@
 - **`PR #314` (`VICTORY_AMBIENT_REFLECT=1`):** Clamps traced reflections indoors to surrounding ambient light so eyes, glasses, and indoor glass panes no longer reflect the open sky when ray tracing is off.
 - **`PR #311` (`VICTORY_BORDERLESS=1`):** Opt-in borderless fullscreen covering the primary display.
 - **`PR #303`:** Per-pipeline wait budget across frames and panic-safe refusal.
-- **`PastiiJay/klbf-lab` (`60eca6bb`, `VICTORY_SKIP_MOVIES=open`):** Opt-in Bink intro movie skip for faster boot into gameplay (`3/3` unit tests passing).
+- **`PastiiJay/klbf-lab` (`60eca6bb`, `VICTORY_SKIP_MOVIES=open`):** Opt-in Bink movie skip (`open`/`end`/`fast`). Only the `3/3` unit tests pass; it was **not** validated in game on this fork. **Known regression on the first `v20` run:** with `open`, every `BinkOpenWithOptions` returns a null handle (all movies, not only the intros). The boot stopped on a black screen at `60 FPS` / `3 draws/frame` right after `movie skipped again (strategy=open, skips=2)`, which means the title waits on a movie it needs. Leave it **unset** by default; `end` (movies open normally, then jump to their last frame) is the only variant to try after that.
 - **Policy Compliance (`913e1f3c`):** Extracted `host::refresh_tests` into `crates/victory-gpu/src/host/refresh_tests.rs` so `host.rs` stays under the 512 KiB `xtask policy` limit (`516,326 B < 524,288 B`).
 
 ### 3. Live A/B Tuning Validated on Ryzen 5 5600 (6C/12T) + RX 6700 XT
@@ -38,7 +38,7 @@
 
 ## Recommended RX 6700 XT `1920x1080` Settings (`v20-ready`)
 
-- **Output & Boot:** `VICTORY_OUTPUT=1920x1080`, `VICTORY_FRAME_INTERVAL_MS=16.667`, `VICTORY_SKIP_MOVIES=open`, `VICTORY_AMBIENT_REFLECT=1`, `VICTORY_PLANES=0` (`1` for `--console series-s`).
+- **Output & Boot:** `VICTORY_OUTPUT=1920x1080`, `VICTORY_FRAME_INTERVAL_MS=16.667`, `VICTORY_SKIP_MOVIES` **unset** (`open` blocks the boot on a black screen; test `end` on its own), `VICTORY_AMBIENT_REFLECT=1`, `VICTORY_PLANES=0` (`1` for `--console series-s`).
 - **v20 CPU & Ports #1–#8:** `VICTORY_PORT_BUFFERS=1` (`0` in Safe/LightVRAM profile), `VICTORY_PORT_JOURNAL=1`, `VICTORY_PORT_GUARD=1`, `VICTORY_PORT_CONSTANTS=1`, `VICTORY_PORT_DESCRIPTORS=1`, `VICTORY_PORT_CBV=1`, `VICTORY_PORTABLE_FLOAT_FAST=1`, `VICTORY_MAP_LOCK_FINE=1`, `VICTORY_PARTIAL_DELTA=1`, `VICTORY_REFRESH_ONCE=1`.
 - **Threading & Async:** `VICTORY_WIDE_MERGE=1`, `VICTORY_WIDE_THREADS=8`, `VICTORY_UNDER_THREADS=6`, `VICTORY_VIEW_THREADS=6`, `VICTORY_ASYNC_LAND=1`, `VICTORY_WIDE_BACK=1`, `VICTORY_JOIN_COPIES=1`, `VICTORY_COPY_BESIDE=1`, `VICTORY_STORE_BESIDE=1`.
 - **RDNA2 Send-Ahead & 12 GB VRAM:** `VICTORY_LATE_WAIT=3`, `VICTORY_LATE_WAIT_LISTS=512`, `VICTORY_LATE_FLUSH_TABLES=1`, `VICTORY_CARD_BUFFERS_MIN_KB=64`, `VICTORY_CARD_BUFFERS_MB=2048`, `VICTORY_CARD_WINDOWS_MB=1024`, `VICTORY_KEEP_FREED=1`, `VICTORY_BURY_LAG=16`, `VICTORY_TEXTURE_AUTO_MIP_CLAMP=1`, `VICTORY_TEXTURE_LRU_EVICT=1`, `VICTORY_SPARES_BY_HEADROOM=1`, `VICTORY_COPIES_IN_PLACE=0`, `VICTORY_RELAY=0`, `VICTORY_THIN=0`, `VICTORY_ASYNC_SUBMIT=0`.
