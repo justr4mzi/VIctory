@@ -1613,7 +1613,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         return None;
     }
     let is_alias = fills(&r.desc) && alias_of(this).is_some();
-    let want_fill_room = fills(&r.desc) && make && !r.host.refused.load(Relaxed);
+    let want_fill_room = fills(&r.desc) && make && !refused(r);
     if want_fill_room
         && lru_evict_enabled()
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
