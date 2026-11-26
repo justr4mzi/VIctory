@@ -183,8 +183,13 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
     let began = std::time::Instant::now();
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
-    for root in &paths {
+    let expired = || limit.is_some_and(|n| began.elapsed().as_secs() >= n);
+    'scan: for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if expired() {
+                counts[3].fetch_add(1, Ordering::Relaxed);
+                break 'scan;
+            }
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -197,11 +202,15 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
                 for _ in 0..threads.min(jobs.len()) {
                     host_wave::spawn(s, wave, || {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            if expired() {
+                                counts[3].fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
                             let Some(bytes) = job.bytes() else {
                                 continue;
                             };
                             let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
-                            if limit.is_some_and(|n| began.elapsed().as_secs() >= n) {
+                            if expired() {
                                 counts[3].fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
@@ -222,6 +231,9 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<
                     });
                 }
             });
+            if counts[3].load(Ordering::Relaxed) > 0 {
+                break 'scan;
+            }
         }
     }
     let [translated, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
