@@ -1264,29 +1264,42 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     // per region: LDS reads, LDS writes
     let mut reads = vec![false; n];
     let mut writes = vec![false; n];
+    let lds_op = |i: &Inst| {
+        let name = i.name();
+        (matches!(i.fields, Fields::Ds { .. }) && !name.starts_with("ds_swizzle") && !name.contains("permute"))
+            .then_some(name)
+    };
     for (b, block) in p.blocks.iter().enumerate().take(n) {
         if all[b] {
             continue;
         }
         let r = find(&mut region, b);
-        for i in &block.insts {
-            let name = i.name();
-            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
-                continue;
-            }
+        for name in block.insts.iter().filter_map(lds_op) {
             if name.starts_with("ds_read") {
                 reads[r] = true;
             } else {
                 writes[r] = true;
+                // Only ordinary stores are write-only. An atomic depends on the
+                // previous LDS value even when it has no return register.
+                reads[r] |= !(name.starts_with("ds_write_b") || name.starts_with("ds_write2"));
             }
         }
     }
-    // A region that reads and writes LDS is still taken when it only raises flags
-    // (`lds_flag_region`): a read that misses the other host wave's write changes nothing
-    // the region leaves behind.
     let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
     for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
         let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
+        let mut ops = blocks.iter().flat_map(|&b| p.blocks[b].insts.iter().filter_map(lds_op));
+        // One kind of integer reduction, with no value returned to any lane:
+        // its final value at each address is independent of the order of the halves.
+        if let Some(op) = ops.next()
+            && matches!(op, "ds_add_u32" | "ds_sub_u32" | "ds_and_b32" | "ds_or_b32"
+                | "ds_xor_b32" | "ds_min_i32" | "ds_max_i32" | "ds_min_u32" | "ds_max_u32")
+            && ops.all(|next| next == op)
+        {
+            continue;
+        }
+        // In a flag region a read that misses the other half's write changes
+        // nothing the region leaves behind.
         if !(flags_on && lds_flag_region(p, st, &blocks)) {
             return None;
         }
@@ -13778,6 +13791,100 @@ mod tests {
             assert!(!excludes_zero(Some(value)));
         }
         assert!(!excludes_zero(None));
+    }
+
+    #[test]
+    fn divergent_lds_atomics_need_instruction_order_between_halves() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+        // s0 = 33 and s1 = 0: the active lanes first take the unsigned minimum
+        // with zero and then each add one to the same word, both atomically.
+        let run_in_batches = |batches: &[u32]| {
+            let word = AtomicU32::new(7);
+            for &lanes in batches {
+                for _ in 0..lanes {
+                    word.fetch_min(0, Relaxed);
+                }
+                for _ in 0..lanes {
+                    word.fetch_add(1, Relaxed);
+                }
+            }
+            word.load(Relaxed)
+        };
+        assert_eq!(run_in_batches(&[33]), 33);
+        assert_eq!(run_in_batches(&[32, 1]), 1);
+        assert_eq!(run_in_batches(&[1, 32]), 32);
+        let mut words: [u32; 15] = [
+            0x7E12_0280, // v_mov_b32 v9, 0 (address and minimum)
+            0x7E04_0281, // v_mov_b32 v2, 1 (increment)
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0006, // s_cbranch_execz past both atomics
+            0x36 << 26 | 0x07 << 18, 9 << 8 | 9, // ds_min_u32 v9, v9
+            0xBF07_8001, // s_cmp_lg_u32 s1, 0
+            0xBF85_0002, // s_cbranch_scc1 past the increment
+            0x36 << 26, 2 << 8 | 9, // ds_add_u32 v9, v2
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0x36 << 26 | 0x36 << 18, 5 << 24 | 9, // ds_read_b32 v5, v9
+            S_ENDPGM,
+        ];
+        for (first, second, names, ordered) in [
+            (0x07, 0, ["ds_min_u32", "ds_add_u32"], true),
+            (0x07, 0x20, ["ds_min_u32", "ds_add_rtn_u32"], true),
+            (0, 0, ["ds_add_u32", "ds_add_u32"], false),
+        ] {
+            words[5] = 0x36 << 26 | first << 18;
+            words[9] = 0x36 << 26 | second << 18;
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 16,
+                layout: vec![RootParam { sgprs: 2, ..root(RootType::Constants, 0, 0) }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo { rsrc2: 1 << 15 | 2 << 1, threads: [64, 1, 1] }),
+                code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+            };
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let all = super::all_lane_blocks(&st).unwrap();
+            let divergent_ds: Vec<_> = p.blocks.iter().zip(&all)
+                .filter(|(_, full)| !**full)
+                .flat_map(|(block, _)| &block.insts)
+                .map(|i| i.name())
+                .filter(|name| name.starts_with("ds_"))
+                .collect();
+            assert_eq!(divergent_ds, names);
+            let io = io::raise(&p, &native).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let c = crate::dxbc::Container { digest: [0; 16], version: (1, 0), parts: vec![] };
+            let was = super::TEST_HOST_WAVE.replace(Some(32));
+            let original = super::super::emit_program(&c, &native, &p, &st, &io, &res);
+            let translated = super::super::emit(&c, &native, &p, &st, &io, &res);
+            super::TEST_HOST_WAVE.set(was);
+            assert_eq!(super::lds_meetings(&p, &st, &all).is_none(), ordered);
+            assert_eq!(original.unwrap().1, Some(if ordered { 64 } else { 32 }));
+            let shader = translated.unwrap();
+            if ordered {
+                // Removing the EXEC skip puts both atomics in all-lane blocks:
+                // the emitter places an LDS meeting before each guarded operation.
+                let flat = ir::without_skips(&p, false).unwrap();
+                let fst = structure::structure(&flat).unwrap();
+                let full = super::all_lane_blocks(&fst).unwrap();
+                for (b, block) in flat.blocks.iter().enumerate() {
+                    if block.insts.iter().any(|i| names.contains(&i.name())) {
+                        assert!(full[b], "a reordered atomic remained divergent");
+                    }
+                }
+                let fio = io::raise(&flat, &native).unwrap();
+                let fres = resource::track(&flat, &native.layout, native.stage, Some(&fst)).unwrap();
+                let was = super::TEST_HOST_WAVE.replace(Some(32));
+                let alternative = super::super::emit_program(&c, &native, &flat, &fst, &fio, &fres);
+                super::TEST_HOST_WAVE.set(was);
+                let (alternative, wave) = alternative.unwrap();
+                assert_eq!(wave, Some(32));
+                assert_eq!(shader.dxil, alternative.dxil);
+            }
+        }
     }
 
     #[test]
