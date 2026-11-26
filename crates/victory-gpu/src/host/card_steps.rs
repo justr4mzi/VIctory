@@ -404,7 +404,7 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
         None => crate::shadow::find(from as u64, (to - from) as u64).ok_or("no host copy of it")?,
     };
     let (start, len) = shadow.span();
-    if shadow.in_place() || (from as u64) < start || to as u64 > start + len {
+    if (from as u64) < start || to as u64 > start + len {
         return Err("no host copy holds all of it");
     }
     Ok(shadow)
