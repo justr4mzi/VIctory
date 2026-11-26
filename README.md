@@ -1,9 +1,22 @@
-# `justr4mzi/VIctory` — `v13-ready` RX 6700 XT Edition (`AI-assisted`)
+# `justr4mzi/VIctory` — `v14-ready` RX 6700 XT Edition (`AI-assisted`)
 
-> **Personal fork (`AI-assisted`)** built on `v12-ready` / [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork), adding Wave A–C2 upstream, community, and RDNA2 optimizations (**Native FP16 SM 6.2 arithmetic**, **Wave32 LDS range/slot disambiguation**, **DXIL IR optimizations**, **page-granular texture detiling**, **single-call upload feeds**, **`BufferMap`**, **fast MD5**, **DPP8 quad ops**, **queued presents**), targeting **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64) + 48 GB RAM**.
-> Previous milestones are preserved on `backup-v6-final`, `backup-v7-final`, `backup-v8-final`, `backup-v9-base2`, `v10-final`, `v11-ready`, and `v12-ready`.
+> **Personal fork (`AI-assisted`)** built on `v13-ready` / [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork), adding Wave 1 + Wave 2 optimizations and visual fixes (**sky-following ambient light**, **held reflection glaze fix**, **`2048 MB` card buffer cap**, **changed-list tracking**, **absent-once guard cache**, **XMA 10-bit VLC & quant LUTs**, **`v_dot8_i32_i4` shader lowering**, **save version cleanup**), targeting **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64) + 48 GB RAM**.
+> Previous milestones are preserved on `backup-v6-final`, `backup-v7-final`, `backup-v8-final`, `backup-v9-base2`, `v10-final`, `v11-ready`, `v12-ready`, and `v13-ready`.
 > Full changelog and PR comparison ledger: see **[FORK.md](FORK.md)**.
 > Zero game files, assets, filenames, hashes, or offsets are included (`cargo xtask policy`: **211 files ok**).
+
+## `v14` Highlights & Verified Checks (`v14-ready`, `v14-rx6700xt`)
+
+- **Workspace & GPU tests:**
+  - `cargo test --workspace -- --test-threads=1`: **839 passed, 0 failed, 23 ignored**.
+  - `cargo test -p victory-gpu --features diagnostics -- --test-threads=1`: **300 passed, 0 failed, 12 ignored**.
+  - `cargo xtask policy`: **211 files ok** (`lower.rs` = `501,859` B, `host.rs` = `495,085` B, all `<= 524,288` B without modifying `xtask/src/policy.rs`).
+- **Release build (Thin LTO + `codegen-units = 1`):** `9,407,488` B (`SHA-256: B01727D6CFACD7450BC531FE55D1E6837F60759A7E0419F472713AE2BA3FEDE2`).
+- **Wave 1 (`cb645b22`):**
+  - Default `VICTORY_CARD_BUFFERS_MB=2048`, `VICTORY_CARD_CHANGED_LIST=1`, `VICTORY_LAND_ASIDE=1` & `VICTORY_WIDE_REFRESH=1` (when logical CPUs >= 4), `VICTORY_ABSENT_ONCE=1` + `VICTORY_ABSENT_MS=u64::MAX` (`XMemVirtualAlloc` commit invalidation), `buffers_evict_gen` gating `ranges.retain`, pooled `SPANS` HashMap, and `HEAP_PASS_BREAKDOWN[6]` instrumentation.
+- **Wave 2 (`97f1b391` + `5e2e05de`, `f3578e38`):**
+  - `Belobug`: sky-following `ambient.rs` (`VICTORY_AMBIENT=0.6`, `VICTORY_AMBIENT_REFLECT=0.5`, `VICTORY_AMBIENT_SKY=0.36,0.05,0.4` defaults), `CS_UpdateHistory` reflection clamp, `list.keep(&shadow.buffer)` in `root_view`, `transition_copy`, `KEEP_TIME=8s` on retired host objects (`!cfg!(test)`), and non-fatal warning on locked legacy save folders (`xgamesave.rs`).
+  - Audio & Shaders: `BCPack` 32-index first BC7 dictionary entry, `#2493` `v_add_f16` inline float constants in whole-wave sim, `#2663` XMA 10-bit VLC table + `u64` `peek32` + `quant_factor` LUT, `v_dot8_i32_i4` (`0x018`) decoding/lowering/clamp, and `VICTORY_SHADER_OPT_TRACE=1`.
 
 ## `v13` Highlights & Verified Checks (`v13-ready`, `v13-rx6700xt`)
 

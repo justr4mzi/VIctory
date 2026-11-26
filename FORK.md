@@ -1,8 +1,23 @@
-# Fork: `justr4mzi/VIctory` (`v13-ready` RX 6700 XT Edition, AI-assisted)
+# Fork: `justr4mzi/VIctory` (`v14-ready` RX 6700 XT Edition, AI-assisted)
 
-Personal fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (built atop `v12-ready` / [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) and curated PRs across Waves A–C2 for Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT RDNA2 + 48 GB RAM). Branches `v13-rx6700xt`, `v12-rx6700xt`, `v11-rx6700xt`, `v9-rx6700xt`, `ultimate-rx6700xt`, and `main` target this hardware profile.
+Personal fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (built atop `v13-ready` / [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) and curated PRs across Waves 1–2 for Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT RDNA2 + 48 GB RAM). Branches `v14-rx6700xt`, `v13-rx6700xt`, `v12-rx6700xt`, `v11-rx6700xt`, `v9-rx6700xt`, `ultimate-rx6700xt`, and `main` target this hardware profile.
 
 Nothing here is upstream-approved; please direct upstream feedback to the original repositories and PR authors. **Zero game data, filenames, executables, hashes, or offsets are included** (`cargo xtask policy` verified: **`211 files ok`**). This fork, its conflict resolutions, and its local fixes/defaults are **AI-assisted**.
+
+## `v14` (`v14-ready`, `v14-rx6700xt`) Changelog & Verification
+
+- **Verified offline tests (`cargo test --workspace -- --test-threads=1`):** **839 passed, 0 failed, 23 ignored** (`victory-gpu --features diagnostics`: **300 passed, 0 failed, 12 ignored**; `cargo xtask policy`: **211 files ok**; max `.rs` size: `lower.rs` `501,859` B, `host.rs` `495,085` B <= `524,288` B).
+- **Release build (Thin LTO, `codegen-units = 1`):** `9,407,488` B (`SHA-256: B01727D6CFACD7450BC531FE55D1E6837F60759A7E0419F472713AE2BA3FEDE2`).
+- **Wave 1 (`cb645b22`):**
+  - `shadow.rs`: default `VICTORY_CARD_BUFFERS_MB=2048` + `VICTORY_CARD_CHANGED_LIST=1` dirty card range list.
+  - `host.rs`: `!cfg!(test)` defaults for `VICTORY_LAND_ASIDE=1` & `VICTORY_WIDE_REFRESH=1` (when logical CPUs >= 4).
+  - `descriptor/host.rs` + `draw.rs`: `buffers_evict_gen` gating `ranges.retain`, pooled `SPANS` map, and `HEAP_PASS_BREAKDOWN[6]` instrumentation (`sync_heaps`, `retain`, `mirror_loop`, `spans`, `refresh_many`, `tex`).
+  - `watch.rs` + `xmem.rs`: `!cfg!(test)` defaults for `VICTORY_ABSENT_ONCE=1` + `VICTORY_ABSENT_MS=u64::MAX` with `XMemVirtualAlloc` commit invalidation.
+- **Wave 2 (`5e2e05de`, `f3578e38`, `97f1b391`):**
+  - `Belobug` reflection + sky-dome ambient chain (`ambient.rs`, `pipeline.rs`, `draw.rs`, `host.rs`): default `VICTORY_AMBIENT=0.6`, `VICTORY_AMBIENT_REFLECT=0.5` clamping `CS_UpdateHistory`, `VICTORY_AMBIENT_SKY=0.36,0.05,0.4` following `ps_sky_paraboloid_reflection`, `list.keep(&shadow.buffer)` in `root_view`, `HostList::transition_copy`, `KEEP_TIME=8s` on retired host objects (`!cfg!(test)`), and non-fatal warning on undeletable old save directories (`xgamesave.rs`).
+  - `BCPack`: keep all 32 indices in first BC7 dictionary entry (`5e2e05de`).
+  - `Shaders`: `#2493` `v_add_f16` inline float constants in whole-wave sim (`f3578e38`), `v_dot8_i32_i4` (`0x018`) opcode/lowering/clamped tests, and `VICTORY_SHADER_OPT_TRACE=1`.
+  - `Formats/XMA`: `#2663` 10-bit VLC LUT + `u64` `peek32` + cached `quant_factor` LUT.
 
 ## `v13` (`v13-ready`, `v13-rx6700xt`) Changelog & Verification
 
