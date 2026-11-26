@@ -114,6 +114,7 @@ impl Target {
     pub(crate) fn new(resource: This) -> Option<Self> {
         // Keep the host copy independently of the title's resource lifetime.
         let copy = crate::resource::host_copy(resource)?;
+        // Unranged: the texture's range is only what `title_texture` finds under this read.
         let _mapping = crate::watch::title_memory_reading();
         let (layout, at, size) = crate::resource::title_texture(resource)?;
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
@@ -211,8 +212,8 @@ pub(crate) fn land(back: &Back) {
         }
         return;
     }
-    let _mapping = crate::watch::title_memory_reading();
     let (at, end) = back.range();
+    let _mapping = crate::watch::title_memory_reading_in(at, end - at);
     let size = end - at;
     SCRATCH.with_borrow_mut(|tiled| {
         tiled.resize(size, 0);
