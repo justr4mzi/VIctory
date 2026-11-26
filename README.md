@@ -1,6 +1,6 @@
 # VIctory on an RX 7900 XTX
 
-> **RX 6700 XT (RDNA2, 12 GB) fork (`v19-ready`):** See [FORK.md](FORK.md) for `VICTORY_WIDE_THREADS=8` + `VICTORY_WIDE_MERGE=1`, `VICTORY_ASYNC_LAND=1`, `VICTORY_CARD_WINDOWS_MB=1024`, 11 merged upstream PRs (`#273`, `#279`, `#284`, `#285`, `#286`, `#288`, `#293`, `#295`, `#296`, `#299`, `#300`), Renderer Ports #1–#7, Zen 3 native build notes, and verified `1920x1080` benchmarks.
+> **RX 6700 XT (RDNA2, 12 GB) fork (`v20-ready`):** See [FORK.md](FORK.md) for the 15 `XaviFortes/VIctory-RDNA` CPU/GPU optimizations (`VICTORY_PORT_BUFFERS=1`, AVX2 `word_runs`, `DynamicBits`, `SHARD_SHIFT=6`, single-pass `ask_once`, `AddressHash`), `PR #303`/`#304` (`VICTORY_MAP_LOCK_FINE=1`)/`#306` (`VICTORY_PARTIAL_DELTA=1`, `VICTORY_REFRESH_ONCE=1`)/`#311` (`VICTORY_BORDERLESS=1`)/`#314` (`VICTORY_AMBIENT_REFLECT`), `klbf-lab` `VICTORY_SKIP_MOVIES`, `VICTORY_WIDE_THREADS=8`, `VICTORY_ASYNC_LAND=1`, and Zen 3 native build notes.
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
