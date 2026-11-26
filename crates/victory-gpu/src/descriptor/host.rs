@@ -5647,9 +5647,30 @@ mod tests {
         };
         heap.raw_at(index, &buffer, 64, 1024);
         let (slot, beside) = (bytes(heap.cpu(index)), bytes(staged(false, 0).unwrap()));
-        assert_eq!(slot, beside, "copied as it was made");
-        heap.null_raw_at(index);
-        assert_ne!(bytes(heap.cpu(index)), slot, "another view since");
+        // Copied bytes read as they were made only where the driver copies
+        // descriptors as bytes. AMD's for RDNA 2 (32.0.21045: RX 6700 XT,
+        // Ryzen 7000 graphics) does not: what a handle points at there is
+        // the driver's own, tied to the slot, and a copy into the card's heap
+        // is made anew. One copy by hand tells which it is.
+        let other = heap.dynamic(1).unwrap();
+        // SAFETY: a slot of our heap and this thread's staged slot.
+        unsafe {
+            host.device.CopyDescriptorsSimple(
+                1,
+                heap.cpu(other),
+                staged(false, 0).unwrap(),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            )
+        };
+        if beside.is_some() && bytes(heap.cpu(other)) == beside {
+            assert_eq!(slot, beside, "copied as it was made");
+            heap.null_raw_at(index);
+            assert_ne!(bytes(heap.cpu(index)), slot, "another view since");
+        } else {
+            eprintln!("this card's descriptor copies are not byte copies; bytes not compared");
+            heap.null_raw_at(index);
+        }
+        heap.null_raw_at(other);
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
