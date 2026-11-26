@@ -186,16 +186,21 @@ fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<O
         anyhow::bail!("warm worker stdout unavailable");
     };
     let process = Mutex::new(process);
-    let (heard, over) = (Mutex::new(Instant::now()), AtomicBool::new(false));
+    let heard = Mutex::new(Instant::now());
     let hung = AtomicBool::new(false);
     let mut made = 0;
     std::thread::scope(|s| {
-        s.spawn(|| {
-            while !over.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(500));
-                if lock(&heard).elapsed() > LONGEST {
-                    hung.store(true, Ordering::Relaxed);
-                    let _ = lock(&process).kill();
+        // A completed batch must not wait for the watchdog's next poll.
+        // Dropping the sender also wakes it if the reader unwinds.
+        let (finished, wake) = std::sync::mpsc::channel::<()>();
+        let (watch_heard, watch_hung, watch_process) = (&heard, &hung, &process);
+        s.spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                wake.recv_timeout(Duration::from_millis(500))
+            {
+                if lock(watch_heard).elapsed() > LONGEST {
+                    watch_hung.store(true, Ordering::Relaxed);
+                    let _ = lock(watch_process).kill();
                     return;
                 }
             }
@@ -211,7 +216,7 @@ fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<O
                 each(n, ms, there == "1");
             }
         }
-        over.store(true, Ordering::Relaxed);
+        drop(finished);
     });
     let status = lock(&process).wait();
     let well = status.as_ref().is_ok_and(|s| s.success());
