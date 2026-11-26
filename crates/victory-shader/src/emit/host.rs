@@ -67,12 +67,29 @@ fn software(desc: &DXGI_ADAPTER_DESC1) -> bool {
         || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
 }
 
-fn adapter_matches(requested: &str, index: u32, name: &str) -> bool {
-    if let Ok(wanted) = requested.parse::<u32>() {
-        wanted == index
-    } else {
-        !requested.is_empty() && name.to_lowercase().contains(&requested.to_lowercase())
+/// One adapter DXGI lists, for [`pick_adapter`].
+struct Listed {
+    index: u32,
+    name: String,
+    software: bool,
+}
+
+/// Which of `adapters` `requested` names: a number is a DXGI index where an
+/// adapter has it, else part of a name like any other text, so model numbers
+/// (`4090`, `6700`) find their card. Software adapters are never picked.
+fn pick_adapter(requested: &str, adapters: &[Listed]) -> Option<usize> {
+    if requested.is_empty() {
+        return None;
     }
+    if let Ok(wanted) = requested.parse::<u32>()
+        && let Some(at) = adapters.iter().position(|a| a.index == wanted)
+    {
+        return (!adapters[at].software).then_some(at);
+    }
+    let wanted = requested.to_lowercase();
+    adapters
+        .iter()
+        .position(|a| !a.software && a.name.to_lowercase().contains(&wanted))
 }
 
 fn adapter_desc(device: &ID3D12Device) -> windows::core::Result<DXGI_ADAPTER_DESC1> {
@@ -119,16 +136,22 @@ pub fn create_preferred_device() -> windows::core::Result<ID3D12Device> {
         };
         if !requested.is_empty() {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let (mut adapters, mut listed) = (Vec::new(), Vec::new());
             for index in 0.. {
                 let Ok(adapter) = factory.EnumAdapters1(index) else {
                     break;
                 };
                 let desc = adapter.GetDesc1()?;
                 let name = String::from_utf16_lossy(&desc.Description);
-                if !software(&desc) && adapter_matches(requested, index, name.trim_end_matches('\0'))
-                {
-                    return create(Some(&adapter));
-                }
+                listed.push(Listed {
+                    index,
+                    name: name.trim_end_matches('\0').to_owned(),
+                    software: software(&desc),
+                });
+                adapters.push(adapter);
+            }
+            if let Some(at) = pick_adapter(requested, &listed) {
+                return create(Some(&adapters[at]));
             }
             return Err(windows::core::Error::new(
                 DXGI_ERROR_NOT_FOUND,
@@ -158,13 +181,39 @@ pub fn create_preferred_device() -> windows::core::Result<ID3D12Device> {
 #[cfg(test)]
 #[test]
 fn an_explicit_adapter_matches_an_index_or_name() {
-    let nvidia = "NVIDIA GeForce RTX 3050 Laptop GPU";
-    let integrated = "Intel(R) UHD Graphics";
-    assert!(adapter_matches("1", 1, nvidia));
-    assert!(!adapter_matches("1", 0, integrated));
-    assert!(adapter_matches("geforce rtx 3050", 1, nvidia));
-    assert!(!adapter_matches("nvidia", 0, integrated));
-    assert!(!adapter_matches("", 0, integrated));
+    let listed = |names: &[(&str, bool)]| -> Vec<Listed> {
+        (0..)
+            .zip(names)
+            .map(|(index, &(name, software))| Listed {
+                index,
+                name: name.into(),
+                software,
+            })
+            .collect()
+    };
+    let laptop = listed(&[
+        ("Intel(R) UHD Graphics", false),
+        ("NVIDIA GeForce RTX 3050 Laptop GPU", false),
+        ("Microsoft Basic Render Driver", true),
+    ]);
+    assert_eq!(pick_adapter("1", &laptop), Some(1));
+    assert_eq!(pick_adapter("0", &laptop), Some(0));
+    assert_eq!(pick_adapter("geforce rtx 3050", &laptop), Some(1));
+    assert_eq!(pick_adapter("NVIDIA", &laptop), Some(1));
+    assert_eq!(pick_adapter("", &laptop), None);
+    // The software adapter, by index or by name.
+    assert_eq!(pick_adapter("2", &laptop), None);
+    assert_eq!(pick_adapter("basic render", &laptop), None);
+    // A model number is no index here: it names the card (it used to match
+    // nothing, and the error ended the run).
+    assert_eq!(pick_adapter("3050", &laptop), Some(1));
+    let desktop = listed(&[
+        ("AMD Radeon RX 6700 XT", false),
+        ("AMD Radeon(TM) Graphics", false),
+    ]);
+    assert_eq!(pick_adapter("6700", &desktop), Some(0));
+    assert_eq!(pick_adapter("radeon(tm)", &desktop), Some(1));
+    assert_eq!(pick_adapter("4090", &desktop), None);
 }
 
 impl Host {
