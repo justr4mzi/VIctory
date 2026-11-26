@@ -3525,7 +3525,12 @@ fn land() {
 fn land_after_submission() {
     static ASIDE: OnceLock<Option<std::sync::mpsc::Sender<()>>> = OnceLock::new();
     let aside = ASIDE.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1") {
+        let on = match std::env::var("VICTORY_LAND_ASIDE").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => !cfg!(test) && std::thread::available_parallelism().ok().is_some_and(|n| n.get() >= 4),
+        };
+        if !on {
             return None;
         }
         let (send, asked) = std::sync::mpsc::channel::<()>();
@@ -7979,13 +7984,28 @@ impl HostList {
 /// turn, each change said in the log (run 112 measured the switch worse,
 /// copies 52 -> 68 ms, in a build whose copies went through the kernel one
 /// by one; they are plain copies with one asking ahead now).
+fn wide_refresh_enabled(setting: Option<&str>, logical_cpus: Option<usize>) -> bool {
+    match setting {
+        Some("1") => true,
+        Some("0") => false,
+        _ => logical_cpus.is_some_and(|n| n >= 4),
+    }
+}
+
 fn wide_refresh() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: OnceLock<u8> = OnceLock::new();
-    match *MODE.get_or_init(|| match std::env::var("VICTORY_WIDE_REFRESH").as_deref() {
-        Ok("1") => 1,
-        Ok("alt") => 2,
-        _ => 0,
+    match *MODE.get_or_init(|| {
+        match std::env::var("VICTORY_WIDE_REFRESH").as_deref() {
+            Ok("alt") => 2,
+            setting => u8::from(
+                !cfg!(test)
+                    && wide_refresh_enabled(
+                        setting.ok(),
+                        std::thread::available_parallelism().ok().map(|n| n.get()),
+                    ),
+            ),
+        }
     }) {
         0 => false,
         1 => true,
@@ -8774,10 +8794,18 @@ impl Meter {
         }
         {
             let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
+            let [sync_us, retain_us, mirror_us, spans_us, refresh_us, tex2_us] =
+                [0, 1, 2, 3, 4, 5].map(|i| crate::draw::HEAP_PASS_BREAKDOWN[i].swap(0, Ordering::Relaxed));
             tracing::info!(
-                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
+                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its pass over textures picked by index; {:.0} buffer slots looked at (breakdown ms: sync_heaps {:.2}, retain {:.2}, mirror_loop {:.2}, spans {:.2}, refresh_many {:.2}, tex {:.2})",
                 texture_us as f64 / 1e3 / frames,
-                slots as f64 / frames
+                slots as f64 / frames,
+                sync_us as f64 / 1e3 / frames,
+                retain_us as f64 / 1e3 / frames,
+                mirror_us as f64 / 1e3 / frames,
+                spans_us as f64 / 1e3 / frames,
+                refresh_us as f64 / 1e3 / frames,
+                tex2_us as f64 / 1e3 / frames,
             );
         }
         crate::shadow::exact_line(frames);
@@ -10760,5 +10788,21 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+#[cfg(test)]
+mod wide_refresh_tests {
+    use super::wide_refresh_enabled;
+
+    #[test]
+    fn parallel_refresh_is_default_on_multicore_and_can_be_overridden() {
+        assert!(wide_refresh_enabled(None, Some(4)));
+        assert!(wide_refresh_enabled(None, Some(16)));
+        assert!(!wide_refresh_enabled(None, Some(2)));
+        assert!(!wide_refresh_enabled(None, None));
+        assert!(wide_refresh_enabled(Some("1"), Some(1)));
+        assert!(!wide_refresh_enabled(Some("0"), Some(16)));
+        assert!(wide_refresh_enabled(Some("auto"), Some(4)));
     }
 }

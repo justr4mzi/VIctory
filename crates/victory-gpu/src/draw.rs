@@ -667,6 +667,9 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// picked by index that runs inside it (`heap_textures`), and the buffer
 /// slots the pass over buffer views looked at; since the last frame line.
 pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Microsecond breakdown inside [`State::heap_buffers`] since the last frame
+/// line: `[sync_heaps, retain, mirror_loop, spans_build, refresh_many, heap_textures]`.
+pub(crate) static HEAP_PASS_BREAKDOWN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1714,23 +1717,28 @@ impl State {
         // Discover raw-byte-copied buffer and placed-texture views before
         // draining `buffer_changes()` and `heap_textures()`, so they are
         // materialized for this frame rather than nulled out at `Host::submit`.
+        let t_sync = std::time::Instant::now();
         crate::descriptor::sync_heaps();
+        HEAP_PASS_BREAKDOWN[0].fetch_add(t_sync.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Per host heap: `(key, shadow, from, to)` each slot's buffer view
-        // reads, kept from pass to pass. Instead of wiping `ranges` every 16
-        // passes, each pass processes `buffer_changes()` plus an amortized 1/32
-        // sweep of active buffer slots, skipping slots whose descriptor key,
-        // made bit, and view liveness are unchanged.
+        // reads, kept from pass to pass. `evict_gen` lets steady frames skip
+        // scanning all 30k+ `ranges` entries when no slot left `buffers` or
+        // became newly tabled.
         type Ranges = std::collections::HashMap<u32, (u64, std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, u64, Ranges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let (evict_gen, passes, ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
-        // Evict slots that left `buffers` or became tabled so `ranges` stops
-        // pinning dead `shadow::exact` copies for 32+ frames.
-        ranges.retain(|&index, _| host.is_active_buffer_slot(index, frame));
+            .or_insert_with(|| (0, 0, Ranges::new()));
+        let t_retain = std::time::Instant::now();
+        let cur_evict_gen = host.buffers_evict_gen();
+        if *evict_gen != cur_evict_gen {
+            ranges.retain(|&index, _| host.is_active_buffer_slot(index, frame));
+            *evict_gen = cur_evict_gen;
+        }
+        HEAP_PASS_BREAKDOWN[1].fetch_add(t_retain.elapsed().as_micros() as u64, Ordering::Relaxed);
         let mut slots = host.buffer_changes();
         host.append_buffer_sweep(&mut slots, *passes as u32, 32);
         slots.sort_unstable();
@@ -1741,6 +1749,7 @@ impl State {
             crate::host::fail(format_args!("host device lost before preparing buffer views: {why}"));
         }
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        let t_mirror = std::time::Instant::now();
         for (n, &index) in slots.iter().enumerate() {
             let Some(handle) = heap.handle(index) else {
                 ranges.remove(&index);
@@ -1800,10 +1809,14 @@ impl State {
                 "host device lost after preparing buffer views: {why}"
             ));
         }
+        HEAP_PASS_BREAKDOWN[2].fetch_add(t_mirror.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let t_spans = std::time::Instant::now();
         let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::with_capacity(ranges.len().min(8192));
+        type SpanMap = std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        static SPANS: std::sync::Mutex<Option<SpanMap>> = std::sync::Mutex::new(None);
+        let mut spans_guard = SPANS.lock().unwrap_or_else(|e| e.into_inner());
+        let spans = spans_guard.get_or_insert_with(|| SpanMap::with_capacity(8192));
+        spans.clear();
         for (_, shadow, from, to) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
@@ -1811,12 +1824,13 @@ impl State {
             span.2 = span.2.max(*to);
         }
         drop(kept);
+        let copies_count = spans.len();
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
         let mut eligible: Vec<(&std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            Vec::with_capacity(spans.len());
+            Vec::with_capacity(copies_count);
         for (shadow, from, to) in spans.values() {
             if shadow.unwatched() {
                 let key = shadow.id() as usize;
@@ -1836,10 +1850,17 @@ impl State {
             }
             eligible.push((shadow, *from, to - from));
         }
+        HEAP_PASS_BREAKDOWN[3].fetch_add(t_spans.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let t_refresh = std::time::Instant::now();
         crate::shadow::Shadow::refresh_many(list, eligible);
+        HEAP_PASS_BREAKDOWN[4].fetch_add(t_refresh.elapsed().as_micros() as u64, Ordering::Relaxed);
+        spans.clear();
+        drop(spans_guard);
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
-        HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let tex_us = textures_began.elapsed().as_micros() as u64;
+        HEAP_PASS_PARTS[0].fetch_add(tex_us, Ordering::Relaxed);
+        HEAP_PASS_BREAKDOWN[5].fetch_add(tex_us, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1850,7 +1871,7 @@ impl State {
             tracing::info!(
                 slots = slots.len(),
                 views,
-                copies = spans.len(),
+                copies = copies_count,
                 mb = bytes >> 20,
                 ms = started.elapsed().as_millis(),
                 "buffer views of the heap made ready for shaders that pick them by index"

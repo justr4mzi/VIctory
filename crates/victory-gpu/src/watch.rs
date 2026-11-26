@@ -846,7 +846,9 @@ fn writes_since_kind_as(
                     if in_placeholder || g.knows(first) {
                         #[cfg(feature = "diagnostics")]
                         let guarding = std::time::Instant::now();
-                        let w = guard_locked(&mut g, first, last, in_placeholder);
+                        let keep = if absent_once() { absent_keep_ms() } else { 0 };
+                        let now = if keep != 0 { guard_ms() } else { 0 };
+                        let w = guard_locked(&mut g, first, last, in_placeholder, now, keep);
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
                         Some(w)
@@ -1114,6 +1116,9 @@ struct Guards {
     hot_until: BTreeMap<usize, u64>,
     /// Recent write-fault streak per block: `(last_frame, hits, backoff_tier)`.
     fault_streak: BTreeMap<usize, (u64, u8, u8)>,
+    /// With [`absent_once`]: for blocks of `absent`, when ([`guard_ms`])
+    /// Windows last said they are uncommitted.
+    verified: BTreeMap<usize, u64>,
 }
 
 impl Guards {
@@ -1184,7 +1189,60 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     hot: RangeSet::new(),
     hot_until: BTreeMap::new(),
     fault_streak: BTreeMap::new(),
+    verified: BTreeMap::new(),
 });
+
+/// `VICTORY_ABSENT_ONCE`: 0 off, 1 on (default in `!cfg!(test)`), 2 in turn.
+fn absent_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_ABSENT_ONCE").as_deref() {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => u8::from(!cfg!(test)),
+    })
+}
+
+fn absent_once() -> bool {
+    match absent_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                let [asked, kept] = absent_looks();
+                tracing::info!(
+                    "blocks of view memory found uncommitted are asked of Windows again only after {} ms from now (VICTORY_ABSENT_ONCE=alt): {}; since the change before: {asked} questions, {kept} blocks from note",
+                    absent_keep_ms(),
+                    if on { "ON" } else { "off" }
+                );
+            }
+            on
+        }
+    }
+}
+
+fn absent_keep_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| match std::env::var("VICTORY_ABSENT_MS").as_deref().map(str::trim) {
+        Ok("told") => u64::MAX,
+        Ok(v) => v.parse::<u64>().map_or(100, |n| n.clamp(1, 1000)),
+        Err(_) => if cfg!(test) { 100 } else { u64::MAX },
+    })
+}
+
+static ABSENT_LOOKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn absent_looks() -> [u64; 2] {
+    [0, 1].map(|i| ABSENT_LOOKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+fn guard_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
 
 fn guards_read() -> RwLockReadGuard<'static, Guards> {
     GUARDS.read().unwrap_or_else(|e| e.into_inner())
@@ -1204,6 +1262,23 @@ pub(crate) fn clean(page: usize) -> bool {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    let keep = if absent_once() { absent_keep_ms() } else { 0 };
+    let now = if keep != 0 { guard_ms() } else { 0 };
+    let written = guard_with_absent(start, end, now, keep);
+    if absent_mode() == 1 {
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if (CALLS.fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(65_536) {
+            let [asked, kept] = absent_looks();
+            tracing::info!(
+                "blocks of view memory found uncommitted are asked of Windows again only after {} ms (VICTORY_ABSENT_ONCE=1): in 65536 askings {asked} questions to Windows, {kept} blocks answered from note",
+                absent_keep_ms()
+            );
+        }
+    }
+    written
+}
+
+fn guard_with_absent(start: usize, end: usize, now: u64, keep: u64) -> Option<Vec<usize>> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
         return Some(Vec::new());
@@ -1222,7 +1297,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 install();
                 let mut g = guards();
                 if in_placeholder || g.knows(first) {
-                    return Some(guard_locked(&mut g, first, last, in_placeholder));
+                    return Some(guard_locked(&mut g, first, last, in_placeholder, now, keep));
                 }
             }
             None => {}
@@ -1233,11 +1308,18 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     install();
     let mut g = guards();
-    Some(guard_locked(&mut g, first, last, in_placeholder))
+    Some(guard_locked(&mut g, first, last, in_placeholder, now, keep))
 }
 
 /// [`guard`] with `g` already held and the handler already installed.
-fn guard_locked(g: &mut Guards, first: usize, last: usize, in_placeholder: bool) -> Vec<usize> {
+fn guard_locked(
+    g: &mut Guards,
+    first: usize,
+    last: usize,
+    in_placeholder: bool,
+    now: u64,
+    keep: u64,
+) -> Vec<usize> {
     // Fast path: the entire range is already clean (O(log intervals), zero
     // allocation). Nearly every refresh in the world hits this.
     if g.clean.contains_range(first, last) {
@@ -1268,22 +1350,48 @@ fn guard_locked(g: &mut Guards, first: usize, last: usize, in_placeholder: bool)
                     block += count;
                     continue;
                 }
-                // Ordinary commits need no runtime mapping notification. Reuse
-                // this asking's query for the following blocks in the same region.
+                // Ordinary commits need no runtime mapping notification. With `keep != 0`,
+                // blocks found uncommitted stay skipped for `keep` ms (or until told).
+                let fresh = keep != 0
+                    && g.verified
+                        .get(&block)
+                        .is_some_and(|&checked| now.saturating_sub(checked) < keep);
+                if fresh {
+                    ABSENT_LOOKS[1].fetch_add(1, Ordering::Relaxed);
+                    if let Some(from) = run.take() {
+                        let pt = std::time::Instant::now();
+                        protect(g, from, block);
+                        protect_us += pt.elapsed().as_micros() as u64;
+                    }
+                    block += 1;
+                    continue;
+                }
                 if block >= uncommitted_until {
                     uncommitted_until = uncommitted_end(block);
+                    if uncommitted_until > block {
+                        ABSENT_LOOKS[0].fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 if block < uncommitted_until {
+                    if keep != 0 {
+                        g.verified.insert(block, now);
+                    }
                     if let Some(from) = run.take() {
                         let pt = std::time::Instant::now();
                         protect(g, from, block);
                         protect_us += pt.elapsed().as_micros() as u64;
                     }
                     let next = g.absent.covered_end(block).min(uncommitted_until).min(gap_hi);
+                    if keep != 0 {
+                        for b in (block + 1)..next {
+                            g.verified.insert(b, now);
+                        }
+                    }
                     block = next.max(block + 1);
                     continue;
                 }
                 g.absent.remove_range(block, block + 1);
+                g.verified.remove(&block);
                 if !is_view(block * BLOCK, (block + 1) * BLOCK) {
                     if let Some(from) = run.take() {
                         let pt = std::time::Instant::now();
@@ -1936,6 +2044,10 @@ fn clear_guards_range(g: &mut Guards, lo: usize, hi: usize) -> bool {
     for block in streak_keys {
         g.fault_streak.remove(&block);
     }
+    let verified_keys: Vec<usize> = g.verified.range(lo..hi).map(|(&k, _)| k).collect();
+    for block in verified_keys {
+        g.verified.remove(&block);
+    }
     changed
 }
 
@@ -2029,6 +2141,23 @@ pub fn title_private_allocated(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
+/// The runtime committed title memory `[at, at + len)` (`XMemVirtualAlloc`):
+/// forgets [`absent_once`] verification timestamps so the next asking re-queries Windows.
+pub fn title_memory_committed(at: usize, len: usize) {
+    if len == 0 || absent_mode() == 0 {
+        return;
+    }
+    let (lo, hi) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if guards_read().verified.range(lo..hi).next().is_none() {
+        return;
+    }
+    let mut g = guards();
+    let keys: Vec<usize> = g.verified.range(lo..hi).map(|(&k, _)| k).collect();
+    for block in keys {
+        g.verified.remove(&block);
+    }
+}
+
 pub fn title_memory_remapped(at: usize, len: usize) {
     // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
     #[cfg(feature = "diagnostics")]
@@ -2066,6 +2195,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let streak_keys: Vec<usize> = g.fault_streak.range(lo..hi).map(|(&k, _)| k).collect();
     for block in streak_keys {
         g.fault_streak.remove(&block);
+    }
+    let verified_keys: Vec<usize> = g.verified.range(lo..hi).map(|(&k, _)| k).collect();
+    for block in verified_keys {
+        g.verified.remove(&block);
     }
     if view_known() {
         // The runtime calls this for two things only (`xmem`: `map` and

@@ -82,6 +82,10 @@ pub(crate) struct HostHeap {
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
     /// buffers from the whole heap.
     buffers: Mutex<std::collections::BTreeSet<u32>>,
+    /// Bumped whenever a slot leaves `buffers` or is freshly marked tabled,
+    /// so `heap_buffers` can skip scanning `RANGES` to evict stale slots on
+    /// steady frames.
+    buffers_evict_gen: std::sync::atomic::AtomicU64,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Mutex<std::collections::HashSet<u32>>,
@@ -1053,6 +1057,7 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
+            buffers_evict_gen: std::sync::atomic::AtomicU64::new(0),
             changed: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
@@ -1663,6 +1668,9 @@ impl HostHeap {
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
+            if Self::skip_tabled_buffers() && self.slot_may(index, SLOT_IN_BUFFERS) {
+                self.buffers_evict_gen.fetch_add(1, Relaxed);
+            }
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
                 if textures.slots.remove(&index).is_some() {
@@ -1718,6 +1726,12 @@ impl HostHeap {
         } else {
             flag.fetch_and(!bit, Relaxed);
         }
+    }
+
+    /// Lock-free generation counter bumped whenever a slot leaves `buffers`
+    /// or a buffer slot is newly marked tabled.
+    pub(crate) fn buffers_evict_gen(&self) -> u64 {
+        self.buffers_evict_gen.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether title slot `index` still holds an active untabled buffer view
@@ -1900,6 +1914,9 @@ impl HostHeap {
         } else if in_buffers || flagged.is_none() {
             let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
             let removed = buffers.remove(&index);
+            if removed {
+                self.buffers_evict_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             self.note_slot(index, SLOT_IN_BUFFERS, false);
             removed
         } else {

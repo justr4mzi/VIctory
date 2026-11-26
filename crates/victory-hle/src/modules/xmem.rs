@@ -159,6 +159,9 @@ pub extern "system" fn XMemVirtualAlloc(
     if placeholder && base.is_null() && !at.is_null() {
         victory_gpu::title_memory_placeholder(at as usize, size);
     }
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        victory_gpu::title_memory_committed(at as usize, size);
+    }
     if base.is_null() {
         // The census keeps what the title asked for (`VICTORY_CENSUS`).
         #[cfg(windows)]
