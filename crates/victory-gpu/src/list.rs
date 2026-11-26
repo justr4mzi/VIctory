@@ -207,6 +207,13 @@ impl Detached {
     pub(crate) fn tables_done(&mut self) {
         self._state.tables_done();
     }
+
+    /// Its submission has run: the dynamic slots of its descriptor tables
+    /// go back now, not when the list is buried 64 submissions later (beloooo,
+    /// avatarmanz/VIctory-7900XTX e942896).
+    pub(crate) fn release_tables(&mut self) {
+        self._state.tables_done();
+    }
 }
 
 /// Whether landed flights release their descriptor tables and landed queue
