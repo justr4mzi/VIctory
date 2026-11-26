@@ -3183,9 +3183,13 @@ fn open_given(g: &Guards, start: usize, end: usize, given: Option<&[usize]>) -> 
     here
 }
 
-/// Gives write access back to `blocks`, guarded ones.
+/// Gives write access back to `blocks`, guarded ones, coalescing contiguous
+/// 64 KiB blocks into single `VirtualProtect` calls to reduce TLB shootdowns.
 fn unguard(g: &Guards, blocks: &[usize]) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    if blocks.is_empty() {
+        return;
+    }
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // All of them before the first can be written: a write through one is a
@@ -3195,7 +3199,7 @@ fn unguard(g: &Guards, blocks: &[usize]) {
         g.clean.remove(block);
         PUBLISHED.clear(block);
     }
-    for &block in blocks {
+    let unguard_one = |block: usize| {
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe {
@@ -3208,11 +3212,52 @@ fn unguard(g: &Guards, blocks: &[usize]) {
             }
         }
         PROTECTED.clear(block);
+    };
+    if blocks.len() == 1 {
+        unguard_one(blocks[0]);
+    } else {
+        let mut sorted = blocks.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut i = 0;
+        while i < sorted.len() {
+            let from = sorted[i];
+            let mut end = from + 1;
+            let mut j = i + 1;
+            while j < sorted.len() && sorted[j] == end {
+                end += 1;
+                j += 1;
+            }
+            if end - from == 1 {
+                unguard_one(from);
+            } else {
+                let mut old = 0;
+                // SAFETY: contiguous blocks we made read-only.
+                let ok = unsafe {
+                    VirtualProtect((from * BLOCK) as *const _, (end - from) * BLOCK, PAGE_READWRITE, &mut old) != 0
+                };
+                if ok && matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+                    for block in from..end {
+                        PROTECTED.clear(block);
+                    }
+                } else {
+                    if ok {
+                        // Restore and handle block by block so non-guarded
+                        // memory keeps its original protection.
+                        unsafe {
+                            VirtualProtect((from * BLOCK) as *const _, (end - from) * BLOCK, old, &mut old);
+                        }
+                    }
+                    for block in from..end {
+                        unguard_one(block);
+                    }
+                }
+            }
+            i = j;
+        }
     }
     #[cfg(feature = "diagnostics")]
-    if !blocks.is_empty() {
-        tally(8, started.elapsed().as_nanos() as u64);
-    }
+    tally(8, started.elapsed().as_nanos() as u64);
 }
 
 /// Before our own write into title memory `[at, at + len)` through the

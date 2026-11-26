@@ -3089,12 +3089,35 @@ impl HostHeap {
         }
     }
 
+    fn copy_null_template(&self, to: u32, kind: u8) -> bool {
+        let (Some(src), Some(host)) = (null_template(kind), host()) else {
+            return false;
+        };
+        #[cfg(feature = "diagnostics")]
+        if let Some(written) = self.written.get(to as usize) {
+            written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+        }
+        // SAFETY: `src` is a pre-created CPU-only null descriptor in `NULL_TEMPLATES`,
+        // and `self.cpu(to)` is a valid slot in this CBV/SRV/UAV heap.
+        unsafe {
+            host.device.CopyDescriptorsSimple(
+                1,
+                self.cpu(to),
+                src,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+        }
+        true
+    }
+
     fn put_null_view(&self, index: u32) {
         if self.slot_null_kind(index) == NULL_SRV_2D {
             return;
         }
-        null_view(self.at(index));
-        self.put(index);
+        if !self.copy_null_template(index, NULL_SRV_2D) {
+            null_view(self.at(index));
+            self.put(index);
+        }
         self.set_slot_null_kind(index, NULL_SRV_2D);
     }
 
@@ -3103,8 +3126,10 @@ impl HostHeap {
         if self.slot_null_kind(index) == kind {
             return;
         }
-        null_for(view, self.at(index));
-        self.put(index);
+        if !self.copy_null_template(index, kind) {
+            null_for(view, self.at(index));
+            self.put(index);
+        }
         self.set_slot_null_kind(index, kind);
     }
 
@@ -3144,8 +3169,10 @@ impl HostHeap {
         if let Some(made) = self.twins.get(index as usize)
             && made.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            null_buffer_view(self.at(self.raw + index));
-            self.put(self.raw + index);
+            if !self.copy_null_template(self.raw + index, NULL_SRV_BUFFER) {
+                null_buffer_view(self.at(self.raw + index));
+                self.put(self.raw + index);
+            }
         }
     }
 
@@ -5265,6 +5292,72 @@ const NULL_UAV_2D_ARRAY: u8 = 8;
 const NULL_UAV_3D: u8 = 9;
 // 10..=18: SRV null_like for texture dimensions 2..=10 (words[1] == 4 maps to NULL_SRV_2D).
 const NULL_SAMPLER: u8 = 19;
+
+/// Pre-created CPU-only null CBV/SRV/UAV descriptors (kinds `1..=18`) so
+/// clearing a slot copies a ready-made template instead of calling
+/// `Create*View` + `CopyDescriptorsSimple` on every null write.
+fn null_template(kind: u8) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    if kind == 0 || kind >= NULL_SAMPLER {
+        return None;
+    }
+    struct Templates {
+        _heap: ID3D12DescriptorHeap,
+        base: usize,
+        stride: usize,
+    }
+    static TEMPLATES: std::sync::OnceLock<Option<Templates>> = std::sync::OnceLock::new();
+    let templates = TEMPLATES.get_or_init(|| {
+        let host = host()?;
+        let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: u32::from(NULL_SAMPLER),
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+            NodeMask: 0,
+        };
+        // SAFETY: plain CPU-only descriptor heap creation.
+        let heap: ID3D12DescriptorHeap = unsafe { host.device.CreateDescriptorHeap(&desc).ok()? };
+        let base = unsafe { heap.GetCPUDescriptorHandleForHeapStart().ptr };
+        let stride = unsafe { host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize };
+        let at = |k: u8| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base + usize::from(k) * stride };
+
+        null_view(at(NULL_SRV_2D));
+        null_buffer_view(at(NULL_SRV_BUFFER));
+        let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+        // SAFETY: valid CPU-only heap slot.
+        unsafe { host.device.CreateConstantBufferView(Some(&cbv), at(NULL_CBV)) };
+        let uav_buf = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            ..Default::default()
+        };
+        // SAFETY: valid CPU-only heap slot.
+        unsafe {
+            host.device.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&uav_buf), at(NULL_UAV_BUFFER));
+        }
+        for (k, dim) in [
+            (NULL_UAV_2D, None),
+            (NULL_UAV_1D, Some(D3D12_UAV_DIMENSION_TEXTURE1D.0 as u32)),
+            (NULL_UAV_1D_ARRAY, Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY.0 as u32)),
+            (NULL_UAV_2D_ARRAY, Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY.0 as u32)),
+            (NULL_UAV_3D, Some(D3D12_UAV_DIMENSION_TEXTURE3D.0 as u32)),
+        ] {
+            let uav = null_uav_desc(dim);
+            // SAFETY: valid CPU-only heap slot.
+            unsafe {
+                host.device.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&uav), at(k));
+            }
+        }
+        for d in 2u32..=10 {
+            let mut words = [0u32; 10];
+            words[1] = d;
+            null_like(&words, at(10 + (d - 2) as u8));
+        }
+        Some(Templates { _heap: heap, base, stride })
+    }).as_ref()?;
+    Some(D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: templates.base + usize::from(kind) * templates.stride,
+    })
+}
 
 fn null_like_kind(words: &[u32; 10]) -> u8 {
     match words[1] {
