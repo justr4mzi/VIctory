@@ -384,7 +384,6 @@ impl Ahead {
         self.most.clear();
     }
 
-    #[cfg(test)]
     fn take(&mut self) -> Vec<(usize, usize)> {
         self.most.clear();
         std::mem::take(&mut self.ranges)
