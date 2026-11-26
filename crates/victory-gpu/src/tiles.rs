@@ -645,6 +645,38 @@ impl Drop for Tiled {
     }
 }
 
+/// Host textures with levels on demand let go while something else may
+/// still name them, with their tiles: a list keeps the `ID3D12Resource`,
+/// so returning tiles immediately can feed another texture's mappings while
+/// an in-flight list still reads through this texture (`ka1qux f10ab5e1`).
+static LET_GO: Mutex<Vec<(ID3D12Resource, Tiled)>> = Mutex::new(Vec::new());
+
+pub(crate) fn let_go(texture: ID3D12Resource, tiled: Tiled) {
+    if crate::host::references(&texture) == 1 {
+        drop(texture);
+        drop(tiled);
+        return;
+    }
+    LET_GO.lock().unwrap_or_else(|e| e.into_inner()).push((texture, tiled));
+}
+
+pub(crate) fn give_back_let_go() {
+    let done: Vec<(ID3D12Resource, Tiled)> = {
+        let mut waiting = LET_GO.lock().unwrap_or_else(|e| e.into_inner());
+        if waiting.is_empty() {
+            return;
+        }
+        let (done, keep): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut *waiting).into_iter().partition(|(texture, _)| crate::host::references(texture) == 1);
+        *waiting = keep;
+        done
+    };
+    for (texture, tiled) in done {
+        drop(texture);
+        drop(tiled);
+    }
+}
+
 /// Keeps a two-dimensional shader view (2D or 2D array) from the levels
 /// before `first` of a texture of `levels` levels: it starts at `first` if
 /// it started before it, shows as many levels fewer (clamped to the

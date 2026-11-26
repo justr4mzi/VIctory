@@ -300,7 +300,13 @@ fn back_list(kind: u32) -> This {
 }
 
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    let cpus = std::thread::available_parallelism().map_or(6, |n| n.get());
+    let default_threads = (cpus / 2).clamp(4, 8);
+    let threads = std::env::var("VICTORY_THIN_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default_threads)
+        .clamp(1, 32);
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");

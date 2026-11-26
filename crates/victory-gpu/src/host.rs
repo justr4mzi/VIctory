@@ -139,15 +139,20 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
-pub(crate) fn available_physical_ram() -> Option<u64> {
+/// Available physical RAM and commit limit headroom on the host in bytes.
+fn memory_status() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then_some((m.ullAvailPhys, m.ullAvailPageFile))
+}
+
+/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
+pub(crate) fn available_physical_ram() -> Option<u64> {
+    memory_status().map(|(phys, _)| phys)
 }
 
 /// How long host copies of textures the title fills must have been idle to
@@ -459,6 +464,7 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::tiles::give_back_let_go();
 }
 
 /// The number of the newest submission begun, and of the newest of which all

@@ -3892,9 +3892,7 @@ fn buffer_uav(
         (shadow, address) = (home, start);
         own.FirstElement = 0;
     }
-    // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+    if !shadow.uav_allowed() {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
@@ -3932,8 +3930,7 @@ fn buffer_uav(
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
-    // SAFETY: a live buffer.
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let width = shadow.width();
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(
@@ -4308,7 +4305,7 @@ fn make_twinned(
             Some(None)
         }
         View::ConsoleSampler(words) => {
-            let desc = crate::sampler::console(words);
+            let desc = crate::sampler::console(words, crate::sampler::aniso_point_mip(device));
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)

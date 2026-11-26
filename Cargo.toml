@@ -77,3 +77,9 @@ debug = "line-tables-only"
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# Final shipping build with fat LTO and single codegen unit (`triippywhale d3baa7a8`).
+[profile.ship]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
