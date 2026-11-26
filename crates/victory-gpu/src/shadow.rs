@@ -2280,8 +2280,9 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
     wide(jobs);
 }
 
-/// About this many bytes to a piece of work for [`wide`].
-const WIDE_JOB: usize = 1 << 20;
+/// About this many bytes to a piece of work for [`wide`] (256 KiB so typical
+/// 1.5-2 MB per-submission snapshots and card-send batches fan out across all workers).
+const WIDE_JOB: usize = 256 << 10;
 
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
 /// (from, to, bytes), taken by [`take_snapshots`].

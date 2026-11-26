@@ -96,8 +96,8 @@ impl Shard {
 }
 
 /// The pages of a part of the journal ([`Notes`]): pieces of
-/// `1 << SHARD_SHIFT` pages (64 MiB), every [`SHARDS`]th piece in one part.
-const SHARD_SHIFT: u32 = 10;
+/// `1 << SHARD_SHIFT` pages (4 MiB), every [`SHARDS`]th piece in one part.
+const SHARD_SHIFT: u32 = 6;
 /// The parts: a bit each in a `u64` ([`shards_of`]).
 const SHARDS: usize = 64;
 
