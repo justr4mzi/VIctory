@@ -79,7 +79,7 @@ impl Placed {
     /// source or destination), title memory at the destination does. Gives
     /// the bytes if it took them.
     pub(super) fn prepare(&self, free: bool) -> Option<Vec<u8>> {
-        if !free && self.from.is_none() {
+        if self.from.is_none() && (!free || self.shadow.in_place()) {
             return None;
         }
         let mut bytes = vec![0u8; self.len];
@@ -89,7 +89,7 @@ impl Placed {
             // SAFETY: the list's own upload memory of that many bytes.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to as *mut u8, self.len) };
         }
-        if !free {
+        if !free || self.shadow.in_place() {
             return None;
         }
         copy_mapped(self.dst as *mut u8, bytes.as_ptr(), self.len, true);
@@ -226,7 +226,7 @@ unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
 /// The host copy of `[src, src + len)` if shaders write it: what it holds at
 /// a place in a list is not what title memory holds at submission.
 fn shaders_own(src: usize, len: usize) -> Option<std::sync::Arc<Shadow>> {
-    crate::shadow::peek(src as u64, len as u64).filter(|s| s.written() && !s.in_place())
+    crate::shadow::peek(src as u64, len as u64).filter(|s| s.written())
 }
 
 impl HostList {
@@ -239,7 +239,7 @@ impl HostList {
         let Some(host) = host() else {
             return false;
         };
-        let Some(to) = crate::shadow::peek(dst as u64, len as u64).filter(|s| !s.in_place()) else {
+        let Some(to) = crate::shadow::peek(dst as u64, len as u64) else {
             return false;
         };
         let own = shaders_own(src, len);
