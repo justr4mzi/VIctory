@@ -201,8 +201,9 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
-    let _mapping = crate::watch::title_memory_reading();
-    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
     if !back.ticket.valid.load(Ordering::Acquire) {
         let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
         if skipped.is_power_of_two() {
@@ -210,41 +211,92 @@ pub(crate) fn land(back: &Back) {
         }
         return;
     }
+    let _mapping = crate::watch::title_memory_reading();
     let (at, end) = back.range();
     let size = end - at;
-    let mut tiled = vec![0u8; size];
-    // Keep title bytes the subresources do not cover.
-    if !crate::host::read_into(at as *const u8, &mut tiled) {
+    SCRATCH.with_borrow_mut(|tiled| {
+        tiled.resize(size, 0);
+        // Keep title bytes the subresources do not cover.
+        if !crate::host::read_into(at as *const u8, &mut tiled[..size]) {
+            return;
+        }
+        let mut data = std::ptr::null_mut();
+        // SAFETY: our read-back buffer, written by the list that has run.
+        unsafe {
+            if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+                return;
+            }
+        }
+        for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
+            let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
+            let f = footprint.Footprint;
+            let pitch = f.RowPitch as usize;
+            let len = pitch * rows as usize * f.Depth as usize;
+            // SAFETY: the subresource's part of the mapped buffer.
+            let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
+            if let Err(e) = back.layout.tile(&mut tiled[..size], mip, slice, linear, pitch, pitch * rows as usize) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+                // SAFETY: mapped above.
+                unsafe { back.buffer.Unmap(0, None) };
+                return;
+            }
+        }
+        // SAFETY: mapped above.
+        unsafe { back.buffer.Unmap(0, None) };
+        let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+        if !back.ticket.valid.load(Ordering::Acquire) {
+            let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
+            if skipped.is_power_of_two() {
+                tracing::info!(skipped, "skipping texture readbacks whose title allocation changed");
+            }
+            return;
+        }
+        crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+        drop(_ticket_guard);
+        let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+        if copied == 1 || copied.is_multiple_of(128) {
+            tracing::info!(copied, bytes = size, "texture readback landed");
+        }
+    });
+}
+
+/// Lands a flight's texture readbacks in order, skipping earlier readbacks to
+/// the exact same allocation and tiling non-overlapping textures in parallel.
+pub(crate) fn land_many(backs: &[Back]) {
+    if backs.is_empty() {
         return;
     }
-    let mut data = std::ptr::null_mut();
-    // SAFETY: our read-back buffer, written by the list that has run.
-    unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
-            return;
-        }
+    if backs.len() == 1 {
+        land(&backs[0]);
+        return;
     }
-    for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
-        let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
-        let f = footprint.Footprint;
-        let pitch = f.RowPitch as usize;
-        let len = pitch * rows as usize * f.Depth as usize;
-        // SAFETY: the subresource's part of the mapped buffer.
-        let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
-        if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
-            // SAFETY: mapped above.
-            unsafe { back.buffer.Unmap(0, None) };
-            return;
+    // Keep only the last readback for any identical `(at, end)` range since
+    // `record` copies all subresources of the texture.
+    let mut active: Vec<&Back> = Vec::with_capacity(backs.len());
+    for (i, back) in backs.iter().enumerate() {
+        let range = back.range();
+        if backs[i + 1..].iter().any(|later| later.range() == range) {
+            continue;
         }
+        active.push(back);
     }
-    // SAFETY: mapped above.
-    unsafe { back.buffer.Unmap(0, None) };
-    crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
-    let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
-    if copied == 1 || copied.is_multiple_of(128) {
-        tracing::info!(copied, bytes = size, "texture readback landed");
+    if active.len() <= 1 {
+        if let Some(&back) = active.first() {
+            land(back);
+        }
+        return;
+    }
+    // If any two distinct ranges overlap, fall back to sequential order.
+    let mut sorted: Vec<(usize, usize)> = active.iter().map(|b| b.range()).collect();
+    sorted.sort_unstable();
+    let overlaps = sorted.windows(2).any(|w| w[0].1 > w[1].0);
+    if overlaps {
+        for back in active {
+            land(back);
+        }
+    } else {
+        crate::land::each_view(false, active.len(), &|i| land(active[i]));
     }
 }
 

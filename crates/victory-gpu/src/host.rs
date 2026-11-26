@@ -4147,9 +4147,12 @@ pub(crate) fn walls_trace() -> bool {
 fn read_backs(list: &HostList) {
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
-    for back in &list.deferred().texture_backs {
-        crate::texback::land(back);
-    }
+    let texture_backs = std::mem::take(&mut list.deferred().texture_backs);
+    crate::texback::land_many(&texture_backs);
+    read_backs_buffers(list);
+}
+
+fn read_backs_buffers(list: &HostList) {
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -5310,8 +5313,13 @@ impl Host {
             telling = match item {
                 Late::Run(flight) => {
                     last = flight.number;
+                    let mut texture_backs = Vec::new();
                     for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
+                        texture_backs.extend(std::mem::take(&mut flight.lists[i].host().deferred().texture_backs));
+                    }
+                    crate::texback::land_many(&texture_backs);
+                    for &i in &flight.order {
+                        read_backs_buffers(flight.lists[i].host());
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -5799,8 +5807,13 @@ impl Host {
                 match item {
                     Late::Run(flight) => {
                         last = flight.number;
+                        let mut texture_backs = Vec::new();
                         for &i in &flight.order {
-                            read_backs(flight.lists[i].host());
+                            texture_backs.extend(std::mem::take(&mut flight.lists[i].host().deferred().texture_backs));
+                        }
+                        crate::texback::land_many(&texture_backs);
+                        for &i in &flight.order {
+                            read_backs_buffers(flight.lists[i].host());
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);

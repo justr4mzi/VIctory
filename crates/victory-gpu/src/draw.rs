@@ -726,6 +726,7 @@ impl BufferSweep {
 }
 
 impl<T> HeapRanges<T> {
+    #[cfg(test)]
     fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
         let _ = self.replace(slot, range);
     }
@@ -751,6 +752,7 @@ impl<T> HeapRanges<T> {
         self.0.iter().skip(part as usize).step_by(parts as usize).flatten()
     }
 
+    #[cfg(test)]
     fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
         self.0.iter().flatten()
     }
