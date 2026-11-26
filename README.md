@@ -1,5 +1,7 @@
 # VIctory on an RX 7900 XTX
 
+> **RX 6700 XT (RDNA2, 12 GB) fork (`v17-ready`):** See [FORK.md](FORK.md) for the RDNA2 send-ahead unlock (`VICTORY_LATE_WAIT=3`), VRAM auto-mip clamping, PR integrations, Zen 3 native build notes, and verified benchmarks.
+
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
 
