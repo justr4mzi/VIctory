@@ -36,38 +36,15 @@ fn cpu_sets() -> Vec<(u32, u8, u8)> {
 fn l3_of_sets() -> Vec<(u32, u32)> {
     use windows_sys::Win32::System::SystemInformation::{
         GetLogicalProcessorInformationEx, GetSystemCpuSetInformation, RelationCache, SYSTEM_CPU_SET_INFORMATION,
-        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    // The largest cache of each logical processor of group 0, by its index.
-    let mut by_processor = [0u32; 64];
     let mut bytes = 0u32;
     // SAFETY: a size query, then the call into a buffer of that size.
     unsafe { GetLogicalProcessorInformationEx(RelationCache, std::ptr::null_mut(), &mut bytes) };
-    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
-    // SAFETY: as above; the buffer holds `bytes` bytes, aligned for the records.
+    let mut buffer = vec![0u8; (bytes as usize).max(1)];
+    // SAFETY: as above; the buffer holds `bytes` bytes.
     let ok = unsafe { GetLogicalProcessorInformationEx(RelationCache, buffer.as_mut_ptr().cast(), &mut bytes) };
-    let mut at = 0usize;
-    while ok != 0 && at + size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() <= bytes as usize {
-        // SAFETY: a record inside the buffer; each says its own size.
-        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()) };
-        if info.Size == 0 {
-            break;
-        }
-        if info.Relationship == RelationCache {
-            // SAFETY: a cache record (asked for), with at least its first group mask.
-            let cache = unsafe { &info.Anonymous.Cache };
-            let mask = unsafe { cache.Anonymous.GroupMask };
-            if mask.Group == 0 {
-                for (p, size) in by_processor.iter_mut().enumerate() {
-                    if mask.Mask >> p & 1 != 0 {
-                        *size = (*size).max(cache.CacheSize);
-                    }
-                }
-            }
-        }
-        at += info.Size as usize;
-    }
+    let by_processor = if ok != 0 { largest_caches(&buffer[..(bytes as usize).min(buffer.len())]) } else { [0; 64] };
     // Processor indices to set ids.
     let mut bytes = 0u32;
     // SAFETY: as for `cpu_sets`.
@@ -91,6 +68,43 @@ fn l3_of_sets() -> Vec<(u32, u32)> {
         at += info.Size as usize;
     }
     sizes
+}
+
+/// The largest cache of each logical processor of group 0, by its index, of
+/// the cache records `GetLogicalProcessorInformationEx` wrote. Each says its
+/// own size, less than the structure's (whose union is as large as its
+/// largest member): the last one, left out where a whole structure was
+/// asked for (an L3 listed last with it), is read too.
+fn largest_caches(records: &[u8]) -> [u32; 64] {
+    use windows_sys::Win32::System::SystemInformation::{RelationCache, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX};
+    let mut by_processor = [0u32; 64];
+    let mut at = 0usize;
+    while let Some(rest) = records.get(at..).filter(|r| r.len() >= 8) {
+        let size = u32::from_ne_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
+        if size == 0 || size > rest.len() {
+            break;
+        }
+        // SAFETY: plain data, of which zeroes are a value.
+        let mut info: SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX = unsafe { std::mem::zeroed() };
+        // The record's own bytes; the rest of the structure stays zero.
+        let n = size.min(size_of_val(&info));
+        // SAFETY: `n` bytes inside both.
+        unsafe { std::ptr::copy_nonoverlapping(rest.as_ptr(), (&raw mut info).cast::<u8>(), n) };
+        if info.Relationship == RelationCache {
+            // SAFETY: a cache record (asked for), with at least its first group mask.
+            let cache = unsafe { &info.Anonymous.Cache };
+            let mask = unsafe { cache.Anonymous.GroupMask };
+            if mask.Group == 0 {
+                for (p, size) in by_processor.iter_mut().enumerate() {
+                    if mask.Mask >> p & 1 != 0 {
+                        *size = (*size).max(cache.CacheSize);
+                    }
+                }
+            }
+        }
+        at += size;
+    }
+    by_processor
 }
 
 /// Whether the cores of the largest last-level cache count as the fast
@@ -293,6 +307,54 @@ mod tests {
     }
 
     const MB: u32 = 1 << 20;
+
+    /// A cache record as the system writes it: as many bytes as it says.
+    fn cache_record(level: u8, bytes: u32, mask: usize) -> Vec<u8> {
+        use windows_sys::Win32::System::SystemInformation::{
+            CACHE_RELATIONSHIP, RelationCache, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        };
+        // SAFETY: plain data.
+        let mut info: SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX = unsafe { std::mem::zeroed() };
+        let size = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous) + size_of::<CACHE_RELATIONSHIP>();
+        info.Relationship = RelationCache;
+        info.Size = size as u32;
+        info.Anonymous.Cache.Level = level;
+        info.Anonymous.Cache.CacheSize = bytes;
+        info.Anonymous.Cache.Anonymous.GroupMask.Mask = mask;
+        // SAFETY: the structure's first `size` bytes.
+        unsafe { std::slice::from_raw_parts((&raw const info).cast::<u8>(), size) }.to_vec()
+    }
+
+    #[test]
+    fn the_last_cache_record_is_read_too() {
+        // Two complexes of eight processors, two to a core; the second
+        // one's L3, the stacked one, listed last.
+        let l2 = |core: usize| cache_record(2, MB, 0x3 << (2 * core));
+        let records: Vec<u8> = (0..4)
+            .map(l2)
+            .chain([cache_record(3, 32 * MB, 0xff)])
+            .chain((4..8).map(l2))
+            .chain([cache_record(3, 96 * MB, 0xff00)])
+            .collect::<Vec<_>>()
+            .concat();
+        // (Shorter than the structure: the last one holds no whole one.)
+        let whole = size_of::<windows_sys::Win32::System::SystemInformation::SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>();
+        assert!(cache_record(3, 0, 0).len() < whole);
+        let by_processor = largest_caches(&records);
+        assert_eq!(by_processor[..16], [[32 * MB; 8], [96 * MB; 8]].concat()[..]);
+        assert!(by_processor[16..].iter().all(|&s| s == 0));
+        // The stacked complex is the fast one (with the last record left
+        // out, its processors had their L2s and the other one was).
+        let sets: Vec<(u32, u8, u8)> = (0..16).map(|i| (i, 0, (i / 2) as u8)).collect();
+        let l3: Vec<(u32, u32)> = (0..16).map(|i| (i, by_processor[i as usize])).collect();
+        assert_eq!(fast_by_cache(&sets, &l3), (8..16).collect::<Vec<_>>());
+        // A record cut short, or one of no size: nothing of it, nor after.
+        assert_eq!(largest_caches(&records[..records.len() - 1])[8], MB);
+        let mut none = cache_record(3, 64 * MB, 0xffff);
+        none[4..8].fill(0);
+        assert_eq!(largest_caches(&[none, records].concat()), [0; 64]);
+        assert_eq!(largest_caches(&[]), [0; 64]);
+    }
 
     /// `n` sets of one class, two to a core, from id 256.
     fn alike(n: u32) -> Vec<(u32, u8, u8)> {
