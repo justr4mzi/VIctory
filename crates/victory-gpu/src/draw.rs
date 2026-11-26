@@ -3631,6 +3631,21 @@ impl State {
                                 }
                                 None => crate::port_cbv::copied(true),
                             }
+                        } else {
+                            let cbv_bytes = u64::from(size.min(64 << 10).next_multiple_of(256));
+                            if cbv_bytes > 0
+                                && crate::port::cbv_direct()
+                                && crate::port::touches_u64(address, cbv_bytes)
+                                && let Some(shadow) = crate::shadow::find(address, cbv_bytes)
+                                && shadow.in_place()
+                            {
+                                let gpu = shadow.gpu(address);
+                                if gpu.is_multiple_of(256) && shadow.left(address) >= cbv_bytes {
+                                    host.constant_at(index, &shadow.buffer, gpu, size);
+                                    crate::port::direct_cbv(u64::from(size));
+                                    continue;
+                                }
+                            }
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);

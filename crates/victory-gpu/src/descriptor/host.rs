@@ -3550,6 +3550,11 @@ impl HostHeap {
         {
             return Some(view);
         }
+        // Lock-free fast path for unmade slots whose title record holds no
+        // view: avoids taking `made.lock(index)` ~14k times/frame during heap sync.
+        if !for_draw && tag != VIEW_TAG && self.made.get(index) == Some(0) {
+            return None;
+        }
         let held = self.made.lock(index);
         let shown = self.made.get(index).unwrap_or(0);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();

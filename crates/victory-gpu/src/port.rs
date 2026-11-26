@@ -262,9 +262,31 @@ pub(crate) fn forget(at: usize, len: usize) {
 }
 
 /// Whether `[at, at + len)` touches ported memory (a quick look).
-fn touches(at: usize, len: usize) -> bool {
+/// Whether 256-byte-aligned table constant buffers inside ported in-place
+/// memory bind directly to their ported GPU address instead of copying into
+/// per-list upload scratch (`VICTORY_PORT_CBV_DIRECT=0` turns it off).
+pub(crate) fn cbv_direct() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_PORT_CBV_DIRECT").is_none_or(|v| v != "0"))
+}
+
+/// Counts direct in-place CBV bindings (count, bytes) since the last log line.
+static DIRECT_CBV: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Fast bounds check for whether `[at, at + len)` intersects any ported region.
+pub(crate) fn touches_u64(at: u64, len: u64) -> bool {
     let hi = BOUNDS[1].load(Ordering::Relaxed);
-    hi != 0 && (at as u64) < hi && (at as u64).saturating_add(len as u64) > BOUNDS[0].load(Ordering::Relaxed)
+    hi != 0 && at < hi && at.saturating_add(len) > BOUNDS[0].load(Ordering::Relaxed)
+}
+
+/// Records a table CBV bound directly in place without a CPU scratch copy.
+pub(crate) fn direct_cbv(len: u64) {
+    DIRECT_CBV[0].fetch_add(1, Ordering::Relaxed);
+    DIRECT_CBV[1].fetch_add(len, Ordering::Relaxed);
+}
+
+fn touches(at: usize, len: usize) -> bool {
+    touches_u64(at as u64, len as u64)
 }
 
 /// A fill of upload memory read `len` bytes at `src` on the CPU.
@@ -291,9 +313,12 @@ pub(crate) fn log(frames: f64) {
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     let per: Vec<f64> = STATS[9..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let direct_n = DIRECT_CBV[0].swap(0, Ordering::Relaxed) as f64 / frames;
+    let direct_kb = DIRECT_CBV[1].swap(0, Ordering::Relaxed) as f64 / (1024.0 * frames);
     tracing::info!(
         "renderer port 1 (VICTORY_PORT_CONSTANTS=1): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
-         (no host copy, nothing sent up or fetched back for them); per frame on the CPU: {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies \
+         (no host copy, nothing sent up or fetched back for them); per frame: {direct_n:.0} CBVs bound directly ({direct_kb:.1} KB, zero copy), \
+         on the CPU: {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies \
          touching them ({:.1} KB); since the start refused: {} not one stretch of a section, {} not committed, {} by the host, {} no buffer; {} regions \
          forgotten (other pages mapped there)",
         s[0],
