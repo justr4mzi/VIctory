@@ -671,7 +671,7 @@ fn spread() -> bool {
 /// `each(i)` for every `i` below `n`, on the threads kept for landing if
 /// [`spread`] and there are enough; what each returns, in order.
 fn spread_each<T: Send>(n: usize, each: impl Fn(usize) -> T + Sync) -> Vec<T> {
-    if !spread() || n < 4 {
+    if !spread() || n < 2 {
         return (0..n).map(each).collect();
     }
     let out: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
@@ -1044,20 +1044,112 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
-    let mut spent = crate::timeline::span("asking: ahead");
+    let mut spent = crate::timeline::span("asking: once");
     ask_once_end();
-    // Both parts under one hold of everything: a second hold waited for the
-    // other threads' askings again (0.5 ms a time, run fills-ab3), and no
-    // other asking comes between the two parts.
+    // Filter, sort, and drop contained ranges in O(N log N) before taking the
+    // asking hold, then ask both grouped and solo runs in a single parallel
+    // pass and commit them under one `journal_mut()` lock.
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    if pieces.is_empty() {
+        spent.end();
+        return;
+    }
+    pieces.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    let mut max_end = 0;
+    pieces.retain(|&(_, end)| {
+        if end <= max_end {
+            false
+        } else {
+            max_end = end;
+            true
+        }
+    });
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len()
+            && pieces[k].0 <= last + AHEAD_GAP
+            && last.max(pieces[k].1) - first <= AHEAD_MAX
+        {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        runs.push(i..k);
+        i = k;
+    }
     let _all = Asking::hold_all();
-    ask_ahead_held(ranges, true);
-    spent.next("asking: the rest");
-    ask_rest(ranges, true);
+    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    for (a, w) in spread_each(runs.len(), |r| {
+        let (mut a, mut w) = (Vec::new(), Vec::new());
+        ask_run_all(&pieces[runs[r].clone()], &mut a, &mut w);
+        (a, w)
+    }) {
+        asked.extend(a);
+        written.extend(w);
+    }
+    spent.next("asking: note");
+    note_hot(&written);
+    if port_journal() {
+        let now = note_shared(&written);
+        let mut j = journal_mut();
+        j.ahead_asked = now;
+        j.kept = !asked.is_empty();
+        j.ahead.set(asked);
+        spent.end();
+        return;
+    }
+    let mut j = journal_mut();
+    let now = next_asking();
+    j.ahead_asked = now;
+    for (page, parts) in written {
+        j.notes.note(page, parts, now);
+    }
+    j.kept = !asked.is_empty();
+    j.ahead.set(asked);
     spent.end();
+}
+
+/// Like [`ask_run`], but also asks leaf ranges of length 1 directly so
+/// [`ask_once`] completes in a single pass with no `ask_rest` follow-up.
+fn ask_run_all(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
+    if pieces.is_empty() {
+        return;
+    }
+    if pieces.len() == 1 {
+        let (first, last) = pieces[0];
+        #[cfg(feature = "diagnostics")]
+        let asking = std::time::Instant::now();
+        let found = kernel_written(first, last);
+        #[cfg(feature = "diagnostics")]
+        alone(first * PAGE, last * PAGE, found.as_ref().map_or(0, Vec::len), asking.elapsed());
+        if let Some(pages) = found {
+            written.extend(pages);
+            asked.push((first, last));
+        }
+        return;
+    }
+    let first = pieces[0].0;
+    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if let Some(pages) = kernel_written(first, last) {
+        written.extend(pages);
+        asked.push((first, last));
+        return;
+    }
+    let (a, b) = pieces.split_at(pieces.len() / 2);
+    ask_run_all(a, asked, written);
+    ask_run_all(b, asked, written);
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
+#[cfg(test)]
 fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     let _all = (!held).then(Asking::hold_all);
     let mut ahead = {
