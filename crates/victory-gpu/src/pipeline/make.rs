@@ -77,6 +77,9 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            if known_bad(&self.key) {
+                return None;
+            }
             let _building = crate::timeline::span("pipeline: build a host pipeline");
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
@@ -116,6 +119,49 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 pub(crate) fn hashes(p: &Pending) -> String {
     let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();
     hashes.join("+")
+}
+
+/// Whether `victory warm` named this pipeline in `warm-bad.txt` (#60).
+///
+/// There a pipeline whose driver compile crashes or hangs ends a child
+/// process and is listed; the running title made the same pipelines in its
+/// own process and died in the driver's compiler (`amdxc64.dll+0x861b9f` on
+/// an RX 9070 XT, the same address before and after a warm-up). A listed
+/// pipeline now gets no host pipeline, as a refused one: its draws are
+/// dropped, the run goes on. `VICTORY_WARM_BAD=0` makes them as before (to
+/// try them again after a driver update, or delete the file).
+fn known_bad(key: &str) -> bool {
+    static BAD: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    let bad = BAD.get_or_init(|| {
+        if std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
+            return Default::default();
+        }
+        let Some(dir) = super::library::folder() else {
+            return Default::default();
+        };
+        let bad = bad_keys(&std::fs::read_to_string(dir.join("warm-bad.txt")).unwrap_or_default());
+        if !bad.is_empty() {
+            tracing::info!(
+                pipelines = bad.len(),
+                "warm-bad.txt: these pipelines are not made (VICTORY_WARM_BAD=0 makes them)"
+            );
+        }
+        bad
+    });
+    let listed = bad.contains(key);
+    if listed {
+        tracing::warn!(key, "pipeline listed in warm-bad.txt not made; its draws are dropped");
+    }
+    listed
+}
+
+/// The keys of `warm-bad.txt`: the first word of each line ("<key> <why>").
+fn bad_keys(text: &str) -> std::collections::HashSet<String> {
+    text.lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|key| key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 /// Signalled whenever a worker has made a pipeline.
@@ -750,6 +796,18 @@ mod low_memory_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_bad_lines_give_their_keys() {
+        let key = "0123456789abcdef0123456789ABCDEF";
+        let text = format!("{key} exit code 0xc0000005\r\n\nnot-a-key why\n{}\n", &key[..31]);
+        let bad = bad_keys(&text);
+        assert_eq!(bad.len(), 1);
+        assert!(bad.contains(&key.to_ascii_lowercase()));
+        // The same form as a pipeline's own key.
+        let p = Pending::new(Vec::new(), None);
+        assert_eq!(bad_keys(&format!("{} hung", p.key())).len(), 1);
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {

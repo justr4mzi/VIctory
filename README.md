@@ -82,6 +82,10 @@ target\diag\victory.exe shaders <the shader archives>   # every shader translate
 target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
 ```
 
+A pipeline whose driver compile crashes or hangs in `warm` is listed in
+`warm-bad.txt` beside the pipeline cache, and runs then leave it out instead of
+crashing in the driver too (`VICTORY_WARM_BAD=0` makes it again).
+
 Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.
