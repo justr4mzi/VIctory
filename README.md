@@ -40,6 +40,9 @@ It started at 280 ms a frame in the same scenes three days earlier.
 |---|---|
 | `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
 | `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
+| `VICTORY_PORT_CBV=1` | Constant buffers read directly in place as raw bytes (`VICTORY_OUTPUT` e.g. `1920x1080` or `1280x720`, and `VICTORY_RENDER_SCALE` also available) |
+
+See [FORK.md](FORK.md) for the **RX 6700 XT (RDNA2, 12 GB VRAM, 48 GB RAM)** `v16-ready` tuning guide (`AI-assisted`).
 
 What is known to be wrong:
 
