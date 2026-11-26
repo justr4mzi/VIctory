@@ -2232,6 +2232,8 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
             assert!(same, "{name} of {:?}: {x} ({was:#x}), now {y} ({is:#x})", case.map(f32::from_bits));
         }
     }
+}
+
 /// A program that moves a typed buffer's 16-bit channels
 /// (`buffer_load_format_d16_xyzw` from the table's first view,
 /// `buffer_store_format_d16_xyzw` to its second) names both places for the
