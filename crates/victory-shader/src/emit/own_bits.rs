@@ -479,7 +479,8 @@ impl Ctx<'_> {
             }
             pattern.insert(u);
         }
-        if cur != r && !self.joins(cur).is_empty() {
+        // (a scalar join is the set itself: carried out of the loop it is the OR's last bit)
+        if !self.joins(cur).is_empty() {
             return Err((head, USED));
         }
         let (Some(idx), Some((nx, bit))) = (idx, next) else {
@@ -902,6 +903,40 @@ mod tests {
         // (reading s14 there without counting in it is nothing of the loop's)
         let p = light_loop(true, &[ADD_BIT_NUMBER], &[], &[0x7E0C_020E]);
         assert_eq!(found(&p).totals.len(), 1);
+    }
+
+    #[test]
+    fn the_last_bits_left_read_after_a_scalar_loop_are_not_the_lanes_own() {
+        // The loop of `light_loop` with the bits still to visit joined in s8 itself (no
+        // VGPR copy, no first-lane read): s8 leaves the loop holding the OR's highest bit.
+        let program = |after: &[u32]| {
+            let mut w = WAVE_OR_V7_TO_S7.to_vec();
+            w.extend_from_slice(&[
+                0xBF06_8007, // s_cmp_eq_u32 s7, 0
+                0xBF85_000E, // s_cbranch_scc1 past the loop
+                0xBE88_0307, // s_mov_b32 s8, s7
+                0xBF82_0001, // s_branch to the loop's head
+                0xBE88_0309, // again: s_mov_b32 s8, s9
+                0xBE8A_1308, // head: s_ff1_i32_b32 s10, s8
+                0x8F0B_0A81, // s_lshl_b32 s11, 1, s10
+                0x3608_0E0B, // v_and_b32 v4, s11, v7
+                0xBE8C_047E, // s_mov_b64 s[12:13], exec
+                0x7DAA_0880, // v_cmpx_ne_u32 exec, 0, v4
+                0xBF88_0001, // s_cbranch_execz past the body
+                ADD_BIT_NUMBER,
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                0x8909_080B, // s_xor_b32 s9, s11, s8
+                0xBF06_0B08, // s_cmp_eq_u32 s8, s11
+                0xBF84_FFF4, // s_cbranch_scc0 again
+            ]);
+            w.extend_from_slice(after);
+            w.push(0xBF81_0000); // s_endpgm
+            let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            crate::ir::build(&code, true, 256).unwrap()
+        };
+        assert_eq!(found(&program(&[])).totals.len(), 1);
+        // v_mov_b32 v6, s8: the last bit of the OR, which another lane may have set
+        assert!(found(&program(&[0x7E0C_0208])).totals.is_empty());
     }
 
     #[test]
