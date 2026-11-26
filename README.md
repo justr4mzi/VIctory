@@ -59,6 +59,7 @@ the frame now is the one thread that submits the title's work to the card
 | `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
 | `VICTORY_UI_VIEWBOX=1` | With `VICTORY_OUTPUT=1280x720`, fit dynamic UI panels to the output. Corrects oversized dialogue subtitles and movement hints on the Series X profile. |
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
+| `VICTORY_BORDERLESS=1` | The window covers the primary display with no border or title bar (windowed borderless: the picture is stretched to it, the render size stays; `play.ps1 -Borderless`) |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
 
