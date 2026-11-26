@@ -3556,6 +3556,14 @@ impl HostHeap {
             } else {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
+            // A texture the card had no memory for: the slot is not noted as
+            // made from this record, so the next ask makes it again (it kept
+            // its null view for good, #256).
+            let retry = kept.is_none()
+                && matches!(view, View::Shader(resource, _) if crate::resource::retrying(resource as crate::object::This));
+            if retry {
+                self.made.set(index, 0);
+            }
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.at(index));
             }
@@ -3564,7 +3572,7 @@ impl HostHeap {
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
             self.keep(index, kept.flatten());
-            self.quick_is(index, if later { 0 } else { key });
+            self.quick_is(index, if later || retry { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
         }
