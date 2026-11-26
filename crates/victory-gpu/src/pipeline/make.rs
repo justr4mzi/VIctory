@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
-use super::host::{GraphicsState, HostPipeline};
+use super::host::{GraphicsState, HostPipeline, TargetFormats};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -33,6 +33,11 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// The formats its state declares for what a draw draws into (zeros
+    /// without a graphics state).
+    pub(crate) formats: TargetFormats,
+    /// Chain of variants for alternate bound render target formats.
+    variant: OnceLock<Arc<Pending>>,
     /// Why it is not made, if it is not ([`left_out`]).
     left_out: Option<&'static str>,
     /// When a worker began it ([`slow`]).
@@ -164,6 +169,8 @@ impl Pending {
         let key = key.finalize().to_hex()[..32].to_owned();
         let left_out = left_out(&shaders).or_else(|| skipped_pipeline(&key, &shaders));
         Pending {
+            formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
+            variant: OnceLock::new(),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -296,6 +303,49 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         }
     }
     p.made.get()?.as_ref()
+}
+
+/// Pipelines made again for the formats bound at a draw, since the start.
+static VARIANTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a draw into views of other formats than its pipeline declares
+/// gets a host pipeline for those formats ([`for_formats`]). On by
+/// default; `VICTORY_TARGET_VARIANTS=0` disables.
+fn variants_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_VARIANTS").is_none_or(|v| v != "0"))
+}
+
+/// Returns a host pipeline matching `bound` render target formats when `p`
+/// declares different formats for those bound slots.
+#[cold]
+pub(crate) fn for_formats<'a>(p: &'a Arc<Pending>, bound: &TargetFormats) -> Option<&'a HostPipeline> {
+    match p.graphics.as_deref() {
+        Some(g) if variants_on() => ready(variant(p, g, &super::host::formats_for(&p.formats, bound))),
+        _ => ready(p),
+    }
+}
+
+fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) -> &'a Arc<Pending> {
+    let mut at = p;
+    for _ in 0..64 {
+        let next = at.variant.get_or_init(|| {
+            let so_far = VARIANTS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                pipeline = ?p.shaders,
+                declared = ?p.formats,
+                bound = ?bound,
+                so_far,
+                "a pipeline is made again for the render target formats bound at its draw (VICTORY_TARGET_VARIANTS=0 disables)"
+            );
+            Arc::new(Pending::new(p.shaders.clone(), Some(Box::new(g.with_formats(bound)))))
+        });
+        if next.formats == *bound {
+            return next;
+        }
+        at = next;
+    }
+    p
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -563,16 +613,27 @@ const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
 
+/// Priority pipeline queue: graphics pipelines always precede compute
+/// pipelines, and compute compilation leaves at least one worker free
+/// when multiple workers exist so draw pipelines start without waiting.
 struct Queue {
-    early: VecDeque<Arc<Pending>>,
-    requested: VecDeque<Arc<Pending>>,
+    requested_graphics: VecDeque<Arc<Pending>>,
+    requested_compute: VecDeque<Arc<Pending>>,
+    early_graphics: VecDeque<Arc<Pending>>,
+    early_compute: VecDeque<Arc<Pending>>,
+    compute_busy: usize,
+    workers: usize,
 }
 
 impl Queue {
     const fn new() -> Self {
         Self {
-            early: VecDeque::new(),
-            requested: VecDeque::new(),
+            requested_graphics: VecDeque::new(),
+            requested_compute: VecDeque::new(),
+            early_graphics: VecDeque::new(),
+            early_compute: VecDeque::new(),
+            compute_busy: 0,
+            workers: usize::MAX,
         }
     }
 
@@ -584,22 +645,53 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
-            self.requested.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
+        match (priority == REQUESTED, p.computes()) {
+            (true, false) => self.requested_graphics.push_back(p.clone()),
+            (true, true) => self.requested_compute.push_back(p.clone()),
+            (false, false) => self.early_graphics.push_back(p.clone()),
+            (false, true) => self.early_compute.push_back(p.clone()),
         }
         Some(prev == NOT_QUEUED)
     }
 
+    fn take_early(list: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
+        // An early entry can have been promoted and claimed already.
+        std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+    }
+
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
-        p.queue_state.store(MAKING, Ordering::Relaxed);
-        Some(p)
+        if let Some(p) = self
+            .requested_graphics
+            .pop_front()
+            .or_else(|| Self::take_early(&mut self.early_graphics))
+        {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            return Some(p);
+        }
+        let allow_compute = self.workers <= 1 || self.compute_busy + 1 < self.workers;
+        if allow_compute
+            && let Some(p) = self
+                .requested_compute
+                .pop_front()
+                .or_else(|| Self::take_early(&mut self.early_compute))
+        {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            self.compute_busy += 1;
+            return Some(p);
+        }
+        None
+    }
+}
+
+struct ComputeBusyGuard(bool);
+
+impl Drop for ComputeBusyGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+            queue.compute_busy = queue.compute_busy.saturating_sub(1);
+            AVAILABLE.notify_all();
+        }
     }
 }
 
@@ -654,7 +746,10 @@ fn spawn_worker(name: String) -> std::io::Result<()> {
                 let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             }
             loop {
-                next().make();
+                let p = next();
+                let _busy = ComputeBusyGuard(p.computes());
+                p.make();
+                drop(_busy);
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                     drained();
                 } else {
@@ -684,6 +779,7 @@ fn workers() -> bool {
             std::env::var("VICTORY_PIPELINE_WORKERS").ok().as_deref(),
             cpus,
         );
+        QUEUE.lock().unwrap_or_else(|e| e.into_inner()).workers = workers;
         for i in 0..workers {
             let spawned = spawn_worker(format!("victory-pipelines-{i}"));
             if let Err(e) = spawned {
@@ -859,5 +955,64 @@ mod tests {
         assert_eq!(worker_count(Some("0"), 16), 1);
         assert_eq!(worker_count(Some("99"), 16), 16);
         assert_eq!(worker_count(Some("abc"), 16), 8);
+    }
+
+    #[test]
+    fn a_pipeline_for_bound_formats_is_made_once() {
+        let p = Arc::new(Pending::new(Vec::new(), Some(Box::new(GraphicsState::declaring(24)))));
+        assert_eq!(p.formats, [24, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let g = p.graphics.as_deref().unwrap();
+        let (a, b) = ([26, 0, 0, 0, 0, 0, 0, 0, 0], [28, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let first = variant(&p, g, &a);
+        assert_eq!(first.formats, a);
+        assert_ne!(first.key, p.key);
+        assert!(Arc::ptr_eq(first, variant(&p, g, &a)));
+        let second = variant(&p, g, &b);
+        assert_eq!(second.formats, b);
+        assert!(!Arc::ptr_eq(first, second));
+        assert_ne!(second.key, first.key);
+        assert!(Arc::ptr_eq(first, variant(&p, g, &a)));
+        assert!(Arc::ptr_eq(second, variant(&p, g, &b)));
+        assert_eq!(first.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+    }
+
+    #[test]
+    fn graphics_pipelines_pop_before_compute_and_reserve_one_worker() {
+        let compute = || {
+            let shader = Arc::new(Shader {
+                stage: "compute",
+                container: Vec::new(),
+                hash: String::new(),
+                full_hash: [0; 32],
+                translated: OnceLock::new(),
+                walks: OnceLock::new(),
+                resolves_light: false,
+                draws_sky: false,
+                ends_reflections: false,
+            });
+            Arc::new(Pending::new(vec![shader], None))
+        };
+        let gfx = || Arc::new(Pending::new(Vec::new(), None));
+        let mut q = Queue::new();
+        q.workers = 3;
+        let c1 = compute();
+        let c2 = compute();
+        let c3 = compute();
+        let g1 = gfx();
+        let ge = gfx();
+        q.push(&c1, REQUESTED);
+        q.push(&c2, REQUESTED);
+        q.push(&c3, REQUESTED);
+        q.push(&ge, EARLY);
+        q.push(&g1, REQUESTED);
+        assert!(Arc::ptr_eq(&q.pop().unwrap(), &g1));
+        assert!(Arc::ptr_eq(&q.pop().unwrap(), &ge));
+        assert!(Arc::ptr_eq(&q.pop().unwrap(), &c1));
+        assert!(Arc::ptr_eq(&q.pop().unwrap(), &c2));
+        // With 2 of 3 workers busy on compute, c3 waits so 1 worker stays free for graphics.
+        assert!(q.pop().is_none());
+        q.compute_busy -= 1;
+        assert!(Arc::ptr_eq(&q.pop().unwrap(), &c3));
     }
 }

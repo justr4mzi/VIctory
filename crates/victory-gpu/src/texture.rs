@@ -612,6 +612,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         && !list.touches(placed)
         && let Some(copy) = crate::resource::host_copy(source)
     {
+        let _ = list.alias_source_changed(to, from);
         let _ = list.transition(source, COPY_SOURCE);
         card_writes(list, placed, to, None);
         crate::list::ensure_state(list, placed, COPY_DEST);
@@ -623,6 +624,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         });
         return true;
     }
+    // An upload from title memory earlier in the list may have already marked
+    // `first_use`; track the last GPU alias source so the alias copy still runs.
+    let new_source = list.alias_source_changed(to, from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -637,7 +641,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);

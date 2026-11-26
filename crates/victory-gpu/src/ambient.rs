@@ -363,6 +363,8 @@ void main(uint3 at : SV_DispatchThreadID) {
         // Reflections: no brighter than a part of the light around.
         const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
         float3 seen_there = unpack(light[at.xy]);
+        // Filter out magenta uninitialized resolve texels (green far below red and blue).
+        if (seen_there.g < 0.5 * min(seen_there.r, seen_there.b) && max(seen_there.r, seen_there.b) > 0.02) seen_there = 0.0;
         float most = dot(from_around(), LUMA) * held;
         float has = dot(seen_there, LUMA);
         float3 floor_light = from_around() * floor_part;
