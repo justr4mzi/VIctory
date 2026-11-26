@@ -263,18 +263,18 @@ pub(crate) fn land(back: &Back) {
 
 /// Lands a flight's texture readbacks in order, skipping earlier readbacks to
 /// the exact same allocation and tiling non-overlapping textures in parallel.
-pub(crate) fn land_many(backs: &[Back]) {
+pub(crate) fn land_many(backs: &[&Back]) {
     if backs.is_empty() {
         return;
     }
     if backs.len() == 1 {
-        land(&backs[0]);
+        land(backs[0]);
         return;
     }
     // Keep only the last readback for any identical `(at, end)` range since
     // `record` copies all subresources of the texture.
     let mut active: Vec<&Back> = Vec::with_capacity(backs.len());
-    for (i, back) in backs.iter().enumerate() {
+    for (i, &back) in backs.iter().enumerate() {
         let range = back.range();
         if backs[i + 1..].iter().any(|later| later.range() == range) {
             continue;

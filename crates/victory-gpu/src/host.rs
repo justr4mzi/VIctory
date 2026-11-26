@@ -4147,8 +4147,10 @@ pub(crate) fn walls_trace() -> bool {
 fn read_backs(list: &HostList) {
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
-    let texture_backs = std::mem::take(&mut list.deferred().texture_backs);
+    let deferred = list.deferred();
+    let texture_backs: Vec<&crate::texback::Back> = deferred.texture_backs.iter().collect();
     crate::texback::land_many(&texture_backs);
+    drop(deferred);
     read_backs_buffers(list);
 }
 
@@ -5313,11 +5315,12 @@ impl Host {
             telling = match item {
                 Late::Run(flight) => {
                     last = flight.number;
-                    let mut texture_backs = Vec::new();
-                    for &i in &flight.order {
-                        texture_backs.extend(std::mem::take(&mut flight.lists[i].host().deferred().texture_backs));
+                    {
+                        let guards: Vec<_> = flight.lists.iter().map(|l| l.host().deferred()).collect();
+                        let texture_backs: Vec<&crate::texback::Back> =
+                            flight.order.iter().flat_map(|&i| guards[i].texture_backs.iter()).collect();
+                        crate::texback::land_many(&texture_backs);
                     }
-                    crate::texback::land_many(&texture_backs);
                     for &i in &flight.order {
                         read_backs_buffers(flight.lists[i].host());
                     }
@@ -5807,11 +5810,12 @@ impl Host {
                 match item {
                     Late::Run(flight) => {
                         last = flight.number;
-                        let mut texture_backs = Vec::new();
-                        for &i in &flight.order {
-                            texture_backs.extend(std::mem::take(&mut flight.lists[i].host().deferred().texture_backs));
+                        {
+                            let guards: Vec<_> = flight.lists.iter().map(|l| l.host().deferred()).collect();
+                            let texture_backs: Vec<&crate::texback::Back> =
+                                flight.order.iter().flat_map(|&i| guards[i].texture_backs.iter()).collect();
+                            crate::texback::land_many(&texture_backs);
                         }
-                        crate::texback::land_many(&texture_backs);
                         for &i in &flight.order {
                             read_backs_buffers(flight.lists[i].host());
                         }
