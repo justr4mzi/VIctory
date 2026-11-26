@@ -6127,9 +6127,16 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
+        // The card's compare is sent in an ExecuteCommandLists call of its
+        // own, after the title's lists: a title list can leave a buffer
+        // promoted to COPY_DEST, and buffers decay to COMMON only between
+        // calls (D3D12 error 538 otherwise; trustno1-coder/VIctory-NVIDIA
+        // d1fe0bd0). Where it starts among the lists.
+        let mut check_at = None;
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             #[cfg(feature = "diagnostics")]
             marks.push((lists.len(), crate::copystat::Timed::Compare));
+            check_at = Some(lists.len());
             lists.push(Some(check));
         }
         #[cfg(feature = "diagnostics")]
@@ -6151,6 +6158,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
             lists.insert(0, Some(ahead));
+            check_at = check_at.map(|at| at + 1);
             marks.iter_mut().for_each(|m| m.0 += 1);
             marks.insert(0, (0, crate::copystat::Timed::Other));
             marks.push((lists.len(), crate::copystat::Timed::Other));
@@ -6170,10 +6178,14 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
+                check_at = check_at.map(|at| at + 1);
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
-            let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            let mut cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            cuts.extend(check_at.filter(|&at| at > 0));
+            cuts.sort_unstable();
+            cuts.dedup();
             // SAFETY: closed lists; the fence is ours; `QUEUE_SUBMIT`
             // serializes queue operations against relay, upq, and demote readbacks.
             let signalled = {
@@ -6233,10 +6245,16 @@ impl Host {
                 .map(|(&(a, kind), b)| (&lists[a..b], kind))
                 .collect()
         } else {
-            vec![(&lists[..], crate::copystat::Timed::Other)]
+            match check_at.filter(|&at| at > 0) {
+                Some(at) => vec![(&lists[..at], crate::copystat::Timed::Other), (&lists[at..], crate::copystat::Timed::Compare)],
+                None => vec![(&lists[..], crate::copystat::Timed::Other)],
+            }
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [(&lists[..], ())];
+        let groups: Vec<(&[Option<ID3D12CommandList>], ())> = match check_at.filter(|&at| at > 0) {
+            Some(at) => vec![(&lists[..at], ()), (&lists[at..], ())],
+            None => vec![(&lists[..], ())],
+        };
         submitting(2, runs.len());
         let frame = crate::frame::current();
         for (i, &(group, _kind)) in groups.iter().enumerate() {
