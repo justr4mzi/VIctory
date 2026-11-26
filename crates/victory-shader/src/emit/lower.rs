@@ -304,6 +304,9 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// Whether those slots hold constant buffer views, by the same key
+    /// (only with [`super::shader::constant_marks`]).
+    constant_slots: HashMap<(usize, Site, u8), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -2089,6 +2092,7 @@ impl<'a> Lower<'a> {
             },
             handles: HashMap::new(),
             strides: HashMap::new(),
+            constant_slots: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -6802,7 +6806,12 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            // Only a slot marked as a constant buffer is read as one; any
+            // other non-buffer gives zeros (`SLOT_STRIDE_CONSTANT`).
+            let other = match self.slot_is_constant(src)? {
+                Some(is_constant) => is_constant,
+                None => self.s.m.cmp(self.cur, pred::EQ, stride, zero),
+            };
             let at = self.begin_guarded(Some(other));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
@@ -8166,9 +8175,29 @@ impl<'a> Lower<'a> {
             &[h, byte, iu, mask, align],
         );
         let f = self.s.m.extract(c, r, 0);
-        let v = self.as_int(f);
+        let mut v = self.as_int(f);
+        if super::shader::constant_marks() {
+            // The mark of a constant buffer slot has no buffer stride or integer bits.
+            let mark = self.s.m.i32(super::shader::SLOT_STRIDE_CONSTANT);
+            let is_constant = self.s.m.cmp(c, pred::EQ, v, mark);
+            let zero = self.s.m.i32(0);
+            self.constant_slots.insert(key, is_constant);
+            v = self.s.m.select(c, is_constant, zero, v);
+        }
         self.strides.insert(key, v);
         Ok(Some(v))
+    }
+
+    /// With [`super::shader::constant_marks`]: whether the slot
+    /// [`Self::slot_stride`] read holds a constant buffer view.
+    fn slot_is_constant(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        if !super::shader::constant_marks() || self.slot_word(src)?.is_none() {
+            return Ok(None);
+        }
+        let Source::Loaded { load, first } = src else {
+            return Ok(None);
+        };
+        Ok(self.constant_slots.get(&(self.cur, *load, *first)).copied())
     }
 
     /// The heap index of a descriptor that may differ between lanes,

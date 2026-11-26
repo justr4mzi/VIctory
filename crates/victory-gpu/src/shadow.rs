@@ -32,8 +32,9 @@ pub(crate) struct Shadow {
     landings: Mutex<Vec<u64>>,
     /// Whether any is.
     landing: std::sync::atomic::AtomicBool,
-    /// The bytes of `buffer`, once asked.
+    /// The bytes of `buffer` and whether it allows UAV writes, once asked.
     width: std::sync::OnceLock<u64>,
+    uav_allowed: std::sync::OnceLock<bool>,
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
@@ -1467,7 +1468,9 @@ type Job = Box<dyn FnOnce() + Send>;
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
 struct Workers {
-    jobs: Mutex<std::collections::VecDeque<Job>>,
+    /// Each job with the call of [`wide`] that queued it: a caller helps
+    /// only with its own, never with another thread's (`triippywhale d51efcf8`).
+    jobs: Mutex<std::collections::VecDeque<(u64, Job)>>,
     more: std::sync::Condvar,
     /// How many jobs there are, for [`spin`].
     there: std::sync::atomic::AtomicUsize,
@@ -1515,7 +1518,7 @@ fn workers() -> &'static Workers {
                         spin(|| workers.there.load(Ordering::Acquire) > 0);
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
-                            if let Some(job) = jobs.pop_front() {
+                            if let Some((_, job)) = jobs.pop_front() {
                                 workers.there.fetch_sub(1, Ordering::AcqRel);
                                 break job;
                             }
@@ -1540,6 +1543,8 @@ fn wide(jobs: Vec<Job>) {
         }
         return;
     }
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
@@ -1548,21 +1553,24 @@ fn wide(jobs: Vec<Job>) {
         for job in jobs {
             let left = left.clone();
             workers.there.fetch_add(1, Ordering::AcqRel);
-            queue.push_back(Box::new(move || {
+            queue.push_back((call, Box::new(move || {
                 job();
                 let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
                 if *n == 0 {
                     left.1.notify_all();
                 }
-            }));
+            })));
         }
     }
     workers.more.notify_all();
     loop {
-        let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        let job = {
+            let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            queue.iter().position(|(c, _)| *c == call).and_then(|at| queue.remove(at))
+        };
         match job {
-            Some(job) => {
+            Some((_, job)) => {
                 workers.there.fetch_sub(1, Ordering::AcqRel);
                 job()
             }
@@ -3172,6 +3180,15 @@ impl Shadow {
         *self.width.get_or_init(|| unsafe { self.buffer.GetDesc() }.Width)
     }
 
+    /// Whether the host buffer permits unordered access views (cached).
+    pub(crate) fn uav_allowed(&self) -> bool {
+        *self.uav_allowed.get_or_init(|| {
+            // SAFETY: a live buffer.
+            let flags = unsafe { self.buffer.GetDesc() }.Flags;
+            flags.0 & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
+        })
+    }
+
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
@@ -3180,6 +3197,7 @@ impl Shadow {
             landings: Mutex::default(),
             landing: Default::default(),
             width: Default::default(),
+            uav_allowed: Default::default(),
             buffer,
             data,
             gpu,
@@ -5614,9 +5632,14 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
-/// bytes), each with the asking that last took it; and the askings so far.
+/// bytes), each with the asking that last took it, its buffer capacity, and
+/// askings/last-prune ticks.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: Mutex<(u64, u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64, u64)>)> =
+    Mutex::new((0, 0, BTreeMap::new()));
+#[allow(clippy::type_complexity)]
+static EXACT_POOL: Mutex<(usize, BTreeMap<u64, Vec<(ID3D12Resource, usize, u64)>>)> =
+    Mutex::new((0, BTreeMap::new()));
 
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -5642,34 +5665,86 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     /// idle one stays for.
     const MANY: usize = 256;
     const LATELY: u64 = 512;
+    const POOL_BUCKET_CAP: usize = 512;
+    const POOL_TOTAL_CAP: usize = 4096;
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    let mut idle: Vec<(u64, ID3D12Resource, usize, u64)> = Vec::new();
+    {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let (tick, last_prune, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((shadow, used, _)) = map.get_mut(&(address, len)) {
+            *used = now;
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            return Some(shadow.clone());
+        }
+        // Adaptive prune cadence (`max(map.len(), 4096)`) and cheap recency/refcount
+        // check before the COM `references()` call, recycling into `EXACT_POOL`.
+        let prune_every = (map.len() as u64).max(4096);
+        if map.len() >= MANY && now.saturating_sub(*last_prune) >= prune_every {
+            *last_prune = now;
+            map.retain(|_, (shadow, used, cap)| {
+                if *used + LATELY <= now
+                    && Arc::strong_count(shadow) == 1
+                    && crate::host::references(&shadow.buffer) == 1
+                {
+                    idle.push((*cap, shadow.buffer.clone(), shadow.data as usize, shadow.gpu));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+    if !idle.is_empty() {
+        let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let (total, buckets) = &mut *pool;
+        for (cap, buffer, data, gpu) in idle {
+            if *total < POOL_TOTAL_CAP {
+                let bucket = buckets.entry(cap).or_default();
+                if bucket.len() < POOL_BUCKET_CAP {
+                    bucket.push((buffer, data, gpu));
+                    *total += 1;
+                }
+            }
+        }
+    }
+    let cap = len.next_multiple_of(256);
+    let recycled = {
+        let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let (total, buckets) = &mut *pool;
+        buckets.get_mut(&cap).and_then(|bucket| {
+            let item = bucket.pop()?;
+            *total -= 1;
+            Some(item)
+        })
+    };
+    let (buffer, data, gpu) = match recycled {
+        Some((buffer, data, gpu)) => (buffer, data as *mut u8, gpu),
+        None => {
+            let (buffer, data) = host()?.shared_buffer(cap)?;
+            crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            (buffer, data, gpu)
+        }
+    };
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
+    let (tick, _, map) = &mut *guard;
     let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+    if let Some((existing, used, _)) = map.get_mut(&(address, len)) {
         *used = now;
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        return Some(shadow.clone());
+        return Some(existing.clone());
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
-    }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    map.insert((address, len), (shadow.clone(), now, cap));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -5686,7 +5761,7 @@ pub(crate) fn exact_line(frames: f64) {
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).2.len();
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",

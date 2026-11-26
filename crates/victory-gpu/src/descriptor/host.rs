@@ -2360,7 +2360,7 @@ impl HostHeap {
             let old = view_at(shown as u32, (shown >> 32) as u32);
             let kept = old.is_some_and(|old| match kin(&old, &view) {
                 Kin::Same => true,
-                kin => kin.kept(keep_shown()),
+                kin => crate::resource::room_lately() && kin.kept(keep_shown()),
             });
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
@@ -2756,9 +2756,18 @@ impl HostHeap {
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
+            // Constant buffer views marked: programs read no other non-buffer
+            // slot as one (`SLOT_STRIDE_CONSTANT`, `ka1qux e2d8b0ce`).
+            let entry = match (stride, view) {
+                (Some(s), _) => s | kind,
+                (None, Some(View::Constant(..))) if victory_shader::emit::constant_marks() => {
+                    victory_shader::emit::SLOT_STRIDE_CONSTANT
+                }
+                _ => kind,
+            };
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(entry) };
             write_view_address(*data, index, view);
         }
         let was = if stride.is_some() {
@@ -3291,7 +3300,7 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = kin.kept(keep_shown());
+                    let kept = crate::resource::room_lately() && kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
                         drop(held);
@@ -3321,7 +3330,7 @@ impl HostHeap {
                 let old = view_at(shown as u32, (shown >> 32) as u32);
                 let kept = old.is_some_and(|old| match kin(&old, &view) {
                     Kin::Same => true,
-                    kin => kin.kept(keep_shown()),
+                    kin => crate::resource::room_lately() && kin.kept(keep_shown()),
                 });
                 if shown == 0 || !kept {
                     #[cfg(feature = "diagnostics")]
@@ -3964,9 +3973,7 @@ fn buffer_uav(
         (shadow, address) = (home, start);
         own.FirstElement = 0;
     }
-    // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+    if !shadow.uav_allowed() {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
@@ -5932,6 +5939,32 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    #[test]
+    fn constant_buffer_slots_are_marked_in_the_stride_table() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if !victory_shader::emit::constant_marks() {
+            return; // turned off for this run
+        }
+        let entry = |index: u32| -> u32 {
+            let (_, _, data) = heap.strides.as_ref().expect("a view heap has a table of strides");
+            // SAFETY: inside the mapping.
+            unsafe { (*data as *const u32).add(index as usize).read_volatile() }
+        };
+        let _ = heap.note_buffer(3, Some(&View::Constant(0x1000, 256)), false);
+        assert_eq!(entry(3), victory_shader::emit::SLOT_STRIDE_CONSTANT);
+        // 64x64 BC7, one mip, at an address no test and no title uses.
+        let at = 0x7fec_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let texture = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        let _ = heap.note_buffer(3, Some(&texture), false);
+        assert_eq!(entry(3), 0);
+        let _ = heap.note_buffer(4, None, false);
+        assert_eq!(entry(4), 0);
     }
 }
 

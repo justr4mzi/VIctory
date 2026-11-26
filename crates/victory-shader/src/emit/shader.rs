@@ -35,6 +35,20 @@ pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Dwords of the [`SLOT_STRIDES`] buffer's strides: heap indices are
 /// clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// The [`SLOT_STRIDES`] entry of a slot that holds a constant buffer view.
+/// A program reads a slot it picks as a constant buffer only where this
+/// mark is; a slot whose entry is 0 holds neither a buffer nor a constant
+/// buffer, and the read gives zeros (`ka1qux e2d8b0ce` / `PR #1216`).
+/// `VICTORY_CONSTANT_MARKS=0` goes back to reading every non-buffer slot as
+/// a constant buffer.
+pub const SLOT_STRIDE_CONSTANT: u32 = u32::MAX;
+
+/// Whether [`SLOT_STRIDE_CONSTANT`] is in use: read once, by the host and
+/// the translator alike.
+pub fn constant_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CONSTANT_MARKS").is_none_or(|v| v != "0"))
+}
 /// Where the [`SLOT_STRIDES`] buffer's second table begins (bytes): two
 /// dwords per view heap slot, the title address of the buffer view (or
 /// ray-tracing structure) there, low 32 bits first; 0 for anything else.
