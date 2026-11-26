@@ -156,17 +156,8 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
-/// How long host copies of textures the title fills must have been idle to
-/// be let go, in milliseconds, and how many bytes of them go at most (the
-/// longest idle first): none but those of ten minutes while what is in use
-/// of the card (`used`: without what our own blocks have free, with what is
-/// kept free for others) is under 88 % of its budget, else enough to come
-/// down to 85 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
-/// all that are idle; `=1`: that rule with its two longer times.
-///
-/// (By those times everything idle for 2.5 s went from 75 % of the budget
-/// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
-/// 80 %, of which 13,000 were made and uploaded again.)
+/// Idle timeout (ms) and byte trim cap for host texture copies by VRAM pressure.
+/// `VICTORY_TEXTURE_KEEP=0` uses [`vram_idle_ms`].
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const WARM_MS: u64 = 30_000;
@@ -187,14 +178,8 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     }
 }
 
-/// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
-/// scaled down under VRAM pressure. Never returns less than 1,000 ms so
-/// handles not yet recorded into a list or slot remain protected.
-///
-/// With room on the card nothing has to go: in session play-1125-0127 88,000
-/// of them (31 GB) went after 5 s with 7 GB of the card free, and 24,700
-/// (12 GB) had to be made and uploaded again.
-/// `VICTORY_TEXTURE_KEEP=0`: 5 s there too, as before.
+/// Idle timeout (ms) for VRAM-backed host textures (`>= 1,000 ms`).
+/// `VICTORY_TEXTURE_KEEP=0` uses 5 s baseline.
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
     static KEEP: OnceLock<bool> = OnceLock::new();
     let keep = *KEEP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP").is_none_or(|v| v != "0"));
@@ -3961,6 +3946,7 @@ fn late_line(frames: f64) {
     crate::port::log(frames);
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
+    crate::port_journal::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -5920,7 +5906,13 @@ impl Host {
         ahead.part(13);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
-        let mut heaps_synced = Some(crate::descriptor::begin_sync_heaps());
+        // Renderer port #7 (from renderer patch #4): the round asked for when
+        // the title submitted it, if that is known (`crate::port_journal`).
+        let heaps_on = crate::port_journal::on();
+        let mut heaps_synced = Some(match crate::port_journal::needed() {
+            0 => crate::descriptor::begin_sync_heaps(),
+            mark => crate::descriptor::begin_sync_heaps_after(mark),
+        });
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -6114,7 +6106,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
+        let heaps_began = std::time::Instant::now();
         drop(heaps_synced);
+        crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -7777,6 +7771,11 @@ impl HostList {
                     batch.fill();
                     batch.title_written();
                     crate::port::copied(dst, src, len);
+                    // Renderer port #7: into a heap's records, the rounds
+                    // asked earlier did not see it.
+                    if crate::descriptor::in_shader_heap(dst, len) {
+                        crate::port_journal::prep_wrote();
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7804,6 +7803,9 @@ impl HostList {
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
+                    if crate::descriptor::in_shader_heap(p.dst, p.len) {
+                        crate::port_journal::prep_wrote();
+                    }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
@@ -7829,6 +7831,8 @@ impl HostList {
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        // (It may write anywhere, a heap's records too.)
+                        crate::port_journal::prep_wrote();
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();

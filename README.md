@@ -29,7 +29,8 @@ RX 7900 XTX, ray tracing off.
 
 | | |
 |---|---|
-| City street, Series S profile, renderer patches 1, 2, 5 and 6 on | about 45 ms a frame (about 22 fps), p95 47 ms |
+| City street, Series S profile, renderer patches 1, 2, 5, 6 and 7 on | about 45 ms a frame (about 22 fps, 44.9 ms in run merge-5) |
+| Same, patches 1, 2, 5 and 6 | 45.6 ms, p95 47 ms |
 | Same, patches 1, 2 and 5 | 47.3 ms (about 21 fps), p95 49 ms |
 | Series X profile, patches 1+2 | about 53 ms (about 19 fps) |
 | Same scene before the patches | 57-75 ms (13-17 fps) |
@@ -38,7 +39,7 @@ RX 7900 XTX, ray tracing off.
 
 It started at 280 ms a frame in the same scenes three days earlier. What sets
 the frame now is the one thread that submits the title's work to the card
-(about 42 ms); the card itself needs about 36 ms.
+(about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
 
 ### Renderer patches (off by default while they are tested)
 
@@ -48,6 +49,7 @@ the frame now is the one thread that submits the title's work to the card
 | `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
 | `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes (~22,000 fills a frame to none; -4.7 ms) |
 | `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it (title threads' waits 29 ms to ~2 ms a frame; -2 ms) |
+| `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own (the submit thread's waits ~5 ms + 1 ms to ~0.3 ms; -1 to -3 ms) |
 
 ### Other switches
 
