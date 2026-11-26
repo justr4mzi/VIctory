@@ -203,6 +203,32 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    pub(crate) fn tables_done(&mut self) {
+        self._state.tables_done();
+    }
+}
+
+/// Whether landed flights release their descriptor tables and landed queue
+/// immediately without holding back `bury_lag()` flights (`VICTORY_LATE_FLUSH_TABLES=0`
+/// restores the delayed release; default on for RDNA2 send-ahead stability, issue #113).
+#[cfg(windows)]
+pub(crate) fn late_flush_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_FLUSH_TABLES").is_none_or(|v| v != "0"))
+}
+
+/// Gives descriptor tables' dynamic slots back for every landed flight in
+/// submission order before advancing `FINISHED` / `bury` (issue #113).
+#[cfg(windows)]
+pub(crate) fn tables_back(landed: &mut [(Vec<Detached>, Vec<usize>)]) {
+    for (lists, order) in landed {
+        for &i in order.iter() {
+            if let Some(list) = lists.get_mut(i) {
+                list.tables_done();
+            }
+        }
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of

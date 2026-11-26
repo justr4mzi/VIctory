@@ -3537,7 +3537,11 @@ pub(crate) fn settle_for_fence() {
 fn land() {
     let landed: Vec<_> = {
         let mut line = line();
-        let n = line.landed.len().saturating_sub(bury_lag() as usize);
+        let n = if crate::list::late_flush_tables() {
+            line.landed.len()
+        } else {
+            line.landed.len().saturating_sub(bury_lag() as usize)
+        };
         line.landed.drain(..n).collect()
     };
     for (lists, order) in landed {
@@ -4468,12 +4472,6 @@ impl Host {
         clock.sent.notify_one();
     }
 
-    /// The highest value completed on the host's main queue fence.
-    pub(crate) fn completed_fence(&self) -> u64 {
-        // SAFETY: a plain query on a live fence.
-        unsafe { self.fence.GetCompletedValue() }
-    }
-
     /// Copies each `(src_vram_buffer, byte_len)` from card memory into a
     /// transient CPU-visible staging buffer on `self.queue`, waits for a
     /// dedicated fence, and returns the exact bytes of each buffer. Returns
@@ -5348,6 +5346,9 @@ impl Host {
                 }
             };
         }
+        if crate::list::late_flush_tables() {
+            crate::list::tables_back(&mut landed);
+        }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             bury(last);
@@ -5811,6 +5812,9 @@ impl Host {
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                     Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
                 }
+            }
+            if crate::list::late_flush_tables() {
+                crate::list::tables_back(&mut landed);
             }
             if last > 0 {
                 FINISHED.store(last, Ordering::Release);

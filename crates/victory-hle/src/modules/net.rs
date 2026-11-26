@@ -68,11 +68,11 @@ type Handle = *mut c_void;
 
 /// Logs `what` for `destination` the first time (no payload, ever).
 fn once(what: &'static str, destination: String) {
-    static SEEN: Mutex<Vec<(&str, String)>> = Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.iter().any(|(w, d)| *w == what && *d == destination) {
+    static SEEN: Mutex<Option<std::collections::HashSet<(&'static str, String)>>> = Mutex::new(None);
+    let mut guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = guard.get_or_insert_with(std::collections::HashSet::new);
+    if seen.len() < 256 && seen.insert((what, destination.clone())) {
         tracing::info!(%destination, "{what}");
-        seen.push((what, destination));
     }
 }
 
