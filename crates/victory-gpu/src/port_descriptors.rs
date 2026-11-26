@@ -317,22 +317,24 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
         CHECKED[3].fetch_add(1, Relaxed);
         return;
     }
-    let n = CHECKED[1].fetch_add(1, Relaxed);
-    MISSED_ALL.fetch_add(1, Relaxed);
+    CHECKED[1].fetch_add(1, Relaxed);
+    let total_missed = MISSED_ALL.fetch_add(1, Relaxed);
     let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
-    let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
-    let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };
-    {
-        let mut by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
-        *by.entry(writer.clone()).or_default() += 1;
-    }
-    if n < 20 || n.is_power_of_two() {
+    if total_missed < 10 {
+        let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
+        let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };
         tracing::warn!(
             slot = index,
             handle = format_args!("{handle:#x}"),
             %writer,
             "renderer port 2: a view record in the title's heap that no store told of (found by the fallback; made now)"
         );
+    }
+    let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
+    let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };
+    {
+        let mut by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+        *by.entry(writer).or_default() += 1;
     }
 }
 

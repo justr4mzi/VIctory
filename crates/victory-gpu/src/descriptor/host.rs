@@ -193,6 +193,12 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// CPU-side shadow of `strides` (cached RAM) to skip redundant uncached
+    /// PCIe `write_volatile` writes when a slot's stride|kind is unchanged.
+    strides_shadow: Vec<std::sync::atomic::AtomicU32>,
+    /// CPU-side shadow of `VIEW_ADDRESSES` to skip redundant uncached PCIe
+    /// `write_volatile` writes when a slot's title address is unchanged.
+    view_addr_shadow: Vec<std::sync::atomic::AtomicU64>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1779,6 +1785,20 @@ impl HostHeap {
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            strides_shadow: if strides.is_some() {
+                (0..victory_shader::emit::SLOT_STRIDES_COUNT)
+                    .map(|_| std::sync::atomic::AtomicU32::new(0))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            view_addr_shadow: if strides.is_some() {
+                (0..victory_shader::emit::SLOT_STRIDES_COUNT)
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect()
+            } else {
+                Vec::new()
+            },
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
@@ -2902,19 +2922,27 @@ impl HostHeap {
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
+            let i = index as usize;
             // Constant buffer views marked: programs read no other non-buffer
             // slot as one (`SLOT_STRIDE_CONSTANT`, `ka1qux e2d8b0ce`).
-            let entry = match (stride, view) {
+            let val = match (stride, view) {
                 (Some(s), _) => s | kind,
                 (None, Some(View::Constant(..))) if victory_shader::emit::constant_marks() => {
                     victory_shader::emit::SLOT_STRIDE_CONSTANT
                 }
                 _ => kind,
             };
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(entry) };
-            write_view_address(*data, index, view);
+            if self.strides_shadow[i].load(std::sync::atomic::Ordering::Relaxed) != val {
+                self.strides_shadow[i].store(val, std::sync::atomic::Ordering::Relaxed);
+                // SAFETY: inside the mapping; shaders read it while we write (a
+                // dword, either value is one the slot had).
+                unsafe { (*data as *mut u32).add(i).write_volatile(val) };
+            }
+            let addr = view.and_then(view_address).unwrap_or(0);
+            if self.view_addr_shadow[i].load(std::sync::atomic::Ordering::Relaxed) != addr {
+                self.view_addr_shadow[i].store(addr, std::sync::atomic::Ordering::Relaxed);
+                write_view_address_raw(*data, index, addr);
+            }
         }
         let was = if stride.is_some() {
             self.buffers.put(index);
@@ -3826,12 +3854,11 @@ pub(crate) fn view_address(view: &View) -> Option<u64> {
 /// after the strides in the mapping at `data`
 /// (`victory_shader::emit::VIEW_ADDRESSES`): shaders that pick a view at a
 /// computed index and read its address as a pointer read it there.
-fn write_view_address(data: usize, index: u32, view: Option<&View>) {
+fn write_view_address_raw(data: usize, index: u32, address: u64) {
     use victory_shader::emit::{SLOT_STRIDES_COUNT, VIEW_ADDRESSES};
     if index >= SLOT_STRIDES_COUNT {
         return;
     }
-    let address = view.and_then(view_address).unwrap_or(0);
     let at = (data + VIEW_ADDRESSES as usize) as *mut u32;
     // SAFETY: inside the mapping (`SLOT_STRIDES_BYTES`); shaders read it
     // while we write (each dword is one the slot had or has).
@@ -3839,6 +3866,11 @@ fn write_view_address(data: usize, index: u32, view: Option<&View>) {
         at.add(2 * index as usize).write_volatile(address as u32);
         at.add(2 * index as usize + 1).write_volatile((address >> 32) as u32);
     }
+}
+
+#[cfg(test)]
+fn write_view_address(data: usize, index: u32, view: Option<&View>) {
+    write_view_address_raw(data, index, view.and_then(view_address).unwrap_or(0));
 }
 
 /// The title memory the host slot of buffer view `view` is made on
