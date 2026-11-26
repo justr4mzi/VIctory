@@ -40,6 +40,9 @@
 
 use crate::frame_rate::Patched;
 
+#[cfg(any(windows, test))]
+mod viewbox;
+
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
 pub const MODES: [(u32, u32); 5] = [(1280, 720), (1664, 936), (1920, 1080), (2560, 1440), (3840, 2160)];
 
@@ -300,6 +303,12 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
         asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
+        if viewbox::requested((w, h), std::env::var_os("VICTORY_UI_VIEWBOX").as_deref())
+            // SAFETY: the mapped image is live and the output override has not been applied.
+            && unsafe { matches(base, size, &OUTPUT) } == Patched::Done
+        {
+            asked.push((&viewbox::SITE, viewbox::FITTED.to_vec(), format!("{w}x{h}")));
+        }
         if (w, h) != (3840, 2160) {
             asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
         }
