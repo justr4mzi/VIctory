@@ -1,8 +1,19 @@
-# Fork: `justr4mzi/VIctory` (`v14-ready` RX 6700 XT Edition, AI-assisted)
+# Fork: `justr4mzi/VIctory` (`v15-ready` RX 6700 XT Edition, AI-assisted)
 
-Personal fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (built atop `v13-ready` / [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) and curated PRs across Waves 1–2 for Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT RDNA2 + 48 GB RAM). Branches `v14-rx6700xt`, `v13-rx6700xt`, `v12-rx6700xt`, `v11-rx6700xt`, `v9-rx6700xt`, `ultimate-rx6700xt`, and `main` target this hardware profile.
+Personal fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (built atop `v14-ready` / [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork) and curated PRs across Waves 1–2 for Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT RDNA2 + 48 GB RAM). Branches `v15-rx6700xt`, `v14-rx6700xt`, `v13-rx6700xt`, `v12-rx6700xt`, `v11-rx6700xt`, `v9-rx6700xt`, `ultimate-rx6700xt`, and `main` target this hardware profile.
 
-Nothing here is upstream-approved; please direct upstream feedback to the original repositories and PR authors. **Zero game data, filenames, executables, hashes, or offsets are included** (`cargo xtask policy` verified: **`211 files ok`**). This fork, its conflict resolutions, and its local fixes/defaults are **AI-assisted**.
+Nothing here is upstream-approved; please direct upstream feedback to the original repositories and PR authors. **Zero game data, filenames, executables, hashes, or offsets are included** (`cargo xtask policy` verified: **`213 files ok`**). This fork, its conflict resolutions, and its local fixes/defaults are **AI-assisted**.
+
+## `v15` (`v15-ready`, `v15-rx6700xt`) Changelog & Verification
+
+- **Verified offline tests (`cargo test --workspace -- --test-threads=1`):** **855 passed, 0 failed, 24 ignored** (`victory-gpu --features diagnostics`: **314 passed, 0 failed, 13 ignored**; `cargo xtask policy`: **213 files ok**; all `.rs` files `<= 524,288` B via `host/tests.rs` split).
+- **Builds (Thin LTO, `codegen-units = 1`):** Release `9,500,672` B (`SHA-256: 9BE1EDE8A6CC70C9E25DBE4511268CE71DEC0C0590499B0B0463D0C8CFD2D1F7`); Diagnostics `12,600,320` B (`SHA-256: 7725A3ED0E7A5A6BB94394D50F24FE23669C7164C013932224B1A2346B8486EC`).
+- **Wave 1 (`b65376c6`):**
+  - `heap_pass.rs` (`VICTORY_HEAP_PASS_MARKED` default ON), `MIN_KB=64` & `CARD_HASH_LEN=1` (`shadow.rs`), `VICTORY_LOOKUP_CACHE` (`RwLock<BufferMap>` + `LOOSE`), `VICTORY_LIST_REUSE`, `VICTORY_FILLS_PLAIN`, `VICTORY_STEP_INDEX`, `VICTORY_CARD_SYNC_BATCH`, `xmem` PR `#1185`.
+- **Wave 2 (`d2cf592a`):**
+  - `#2301`, `#2449`, `#911`/`#1206` 64 KiB CBV cap, `4d0c6345` dynamic free-run wrap-around, `#1210` `ResourceMinLODClamp`, `Belobug 81ebb7bd` magenta filter, `#1241` `alias_source_changed` + `VICTORY_DECLARE_ONCE`, `VICTORY_TARGET_VARIANTS` + `VICTORY_BIND_CACHE`, PR `#3025` graphics-first queue, and diagnostic `W/A/S/D` + `I/J/K/L` sticks.
+- **Live RX 6700 XT Run (`v15-diag`, `1,902` 3D samples over 3h20m):**
+  - `1.90 FPS` median (`534.3 ms`, `p95 667.1 ms`, `max 3,248.0 ms`), `gpu 132.85 ms` (`p95 188.3`), `back 50.40 ms`, `WARN=306`, `heap_ms=399.05 ms` (`mirror_loop` `247–556 ms` serial identified for `v16`).
 
 ## `v14` (`v14-ready`, `v14-rx6700xt`) Changelog & Verification
 

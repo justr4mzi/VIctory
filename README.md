@@ -1,9 +1,27 @@
-# `justr4mzi/VIctory` — `v14-ready` RX 6700 XT Edition (`AI-assisted`)
+# `justr4mzi/VIctory` — `v15-ready` RX 6700 XT Edition (`AI-assisted`)
 
-> **Personal fork (`AI-assisted`)** built on `v13-ready` / [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork), adding Wave 1 + Wave 2 optimizations and visual fixes (**sky-following ambient light**, **held reflection glaze fix**, **`2048 MB` card buffer cap**, **changed-list tracking**, **absent-once guard cache**, **XMA 10-bit VLC & quant LUTs**, **`v_dot8_i32_i4` shader lowering**, **save version cleanup**), targeting **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64) + 48 GB RAM**.
-> Previous milestones are preserved on `backup-v6-final`, `backup-v7-final`, `backup-v8-final`, `backup-v9-base2`, `v10-final`, `v11-ready`, `v12-ready`, and `v13-ready`.
+> **Personal fork (`AI-assisted`)** built on `v14-ready` / [`fxceless/victory-fork`](https://github.com/fxceless/victory-fork), adding Wave 1 + Wave 2 optimizations and stability fixes (**marked buffer heap pass**, **`VICTORY_LOOKUP_CACHE`**, **`VICTORY_CARD_BUFFERS_MIN_KB=64` + `CARD_HASH_LEN=1`**, **`VICTORY_CARD_SYNC_BATCH`**, **`VICTORY_LIST_REUSE`**, **`VICTORY_FILLS_PLAIN`**, **`VICTORY_STEP_INDEX`**, **`VICTORY_TARGET_VARIANTS`**, **`VICTORY_BIND_CACHE`**, **`VICTORY_DECLARE_ONCE`**, **`PR #3025` graphics-first pipeline queue**, **`#2301`/`#2449`/`#911`/`#1206`/`#1210`/`#1241`/`#1185`/`4d0c6345`**, **`Belobug 81ebb7bd` magenta filter**, and **`x86_64` diagnostic camera sticks**), targeting **Windows 11 + AMD Ryzen 5 5600 + AMD Radeon RX 6700 XT (RDNA2, 12 GB VRAM, native wave32 + wave64) + 48 GB RAM**.
+> Previous milestones are preserved on `backup-v6-final`, `backup-v7-final`, `backup-v8-final`, `backup-v9-base2`, `v10-final`, `v11-ready`, `v12-ready`, `v13-ready`, and `v14-ready`.
 > Full changelog and PR comparison ledger: see **[FORK.md](FORK.md)**.
-> Zero game files, assets, filenames, hashes, or offsets are included (`cargo xtask policy`: **211 files ok**).
+> Zero game files, assets, filenames, hashes, or offsets are included (`cargo xtask policy`: **213 files ok**).
+
+## `v15` Highlights & Verified Checks (`v15-ready`, `v15-rx6700xt`)
+
+- **Workspace & GPU tests:**
+  - `cargo test --workspace -- --test-threads=1`: **855 passed, 0 failed, 24 ignored**.
+  - `cargo test -p victory-gpu --features diagnostics -- --test-threads=1`: **314 passed, 0 failed, 13 ignored**.
+  - `cargo xtask policy`: **213 files ok** (all `.rs` files `<= 524,288` B without modifying `xtask/src/policy.rs`, after splitting `host/tests.rs`).
+- **Release & diag builds (Thin LTO + `codegen-units = 1`):**
+  - Release: `9,500,672` B (`SHA-256: 9BE1EDE8A6CC70C9E25DBE4511268CE71DEC0C0590499B0B0463D0C8CFD2D1F7`).
+  - Diagnostics: `12,600,320` B (`SHA-256: 7725A3ED0E7A5A6BB94394D50F24FE23669C7164C013932224B1A2346B8486EC`).
+- **Wave 1 (`b65376c6`):**
+  - `heap_pass.rs` (`VICTORY_HEAP_PASS_MARKED=1` default), `VICTORY_CARD_BUFFERS_MIN_KB=64` & `VICTORY_CARD_HASH_LEN=1`, `VICTORY_LOOKUP_CACHE=1` (`RwLock<BufferMap>` + `LOOSE`), `VICTORY_LIST_REUSE=1`, `VICTORY_FILLS_PLAIN=1`, `VICTORY_STEP_INDEX=1`, `VICTORY_CARD_SYNC_BATCH=1`, and `xmem` PR `#1185`.
+- **Wave 2 (`d2cf592a`):**
+  - `#2301` unaligned shader bytecode + `host_pipeline_for`, `#2449` null CBV + `RtvRecord::key`, `#911`/`#1206` 64 KiB `constant_view_size` cap before rounding, `4d0c6345` `HostHeap::dynamic` free-run wrap-around, `#1210` `ResourceMinLODClamp` preservation, `Belobug 81ebb7bd` magenta filter, `#1241` `alias_source_changed` + `VICTORY_DECLARE_ONCE`, `VICTORY_TARGET_VARIANTS` + `VICTORY_BIND_CACHE`, **PR `#3025`** graphics-first pipeline queue with `compute_busy + 1 < workers`, and diagnostic `W/A/S/D` + `I/J/K/L` stick emulation.
+- **Live RX 6700 XT Benchmark (`v15-diag`, 3h20m run, `1,902` 3D samples):**
+  - Ran cleanly for 3h18m (`424,966` log lines, `WARN=306` vs `406` in `v14`, `0` shader translation errors) before a late `0x887A0006` device hung at `07:49:56Z`.
+  - Median `1.90 FPS` (`534.3 ms/frame`, `p95 667.1 ms`, `max 3,248.0 ms` vs `7,809 ms` in `v14`), `gpu p95` improved `217.3 -> 188.3 ms`, `back` improved `54.1 -> 50.4 ms`, `LOOKUP_CACHE` ~83% hit rate.
+  - Profiling isolated the primary remaining CPU bottleneck for `v16`: `heap_ms = 399.05 ms` (75% of total frame time, dominated by single-threaded `mirror_loop` `247–556 ms`, `shadow::exact` pruning/pool exhaustion, and `Picked::spans()`).
 
 ## `v14` Highlights & Verified Checks (`v14-ready`, `v14-rx6700xt`)
 
