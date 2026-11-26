@@ -34,6 +34,9 @@ pub(crate) const MIN_PREFIX: u64 = 32 << 10;
 /// Bytes of levels kept in memory at most (the rest is read from the folder
 /// when asked).
 const KEPT: u64 = 4 << 30;
+/// Textures waiting for the store's thread at most (each a copy of its
+/// memory): the rest are kept the next time they are read whole.
+const WAITING: usize = 8;
 
 /// A texture's shape: width, height, format, levels.
 pub(crate) type Shape = [u32; 4];
@@ -58,7 +61,7 @@ struct Store {
     index: Mutex<HashMap<Key, Entry>>,
     kept: Mutex<HashMap<u128, Arc<Vec<u8>>>>,
     kept_bytes: AtomicU64,
-    jobs: Mutex<mpsc::Sender<Job>>,
+    jobs: Mutex<mpsc::SyncSender<Job>>,
     /// Contents given to it this run (digests of whole textures).
     seen: Mutex<std::collections::HashSet<u128>>,
 }
@@ -104,7 +107,7 @@ fn store() -> Option<&'static Store> {
                 keys = index.len(),
                 "texture store: larger levels kept from earlier runs (VICTORY_TEXTURE_STORE)"
             );
-            let (send, receive) = mpsc::channel::<Job>();
+            let (send, receive) = mpsc::sync_channel::<Job>(WAITING);
             let to = folder.clone();
             std::thread::Builder::new()
                 .name("texture store".into())
@@ -170,7 +173,7 @@ pub(crate) fn key_levels(layout: &victory_formats::texture::Layout, mips: u32) -
 /// A texture of `shape` was read whole: `tiled` is its memory (all levels),
 /// `parts` where the host lays out each of its levels (offset, row pitch,
 /// rows). Detiled and kept on the store's thread, unless that content is
-/// known.
+/// known or [`WAITING`] textures wait there already.
 pub(crate) fn keep(shape: Shape, layout: &victory_formats::texture::Layout, tiled: &[u8], parts: Vec<(u64, u32, u32)>) {
     let Some(store) = store() else {
         return;
@@ -180,7 +183,17 @@ pub(crate) fn keep(shape: Shape, layout: &victory_formats::texture::Layout, tile
         return;
     }
     let job = Job { shape, layout: layout.clone(), tiled: tiled.to_vec(), parts, blob };
-    let _ = store.jobs.lock().unwrap_or_else(|e| e.into_inner()).send(job);
+    queue(&store.jobs, &store.seen, job);
+}
+
+/// `job` to the store's thread, unless [`WAITING`] wait for it already:
+/// then its content is not seen yet, to be kept another time.
+fn queue(jobs: &Mutex<mpsc::SyncSender<Job>>, seen: &Mutex<std::collections::HashSet<u128>>, job: Job) {
+    let blob = job.blob;
+    // (A thread that is gone keeps nothing: seen as before.)
+    if let Err(mpsc::TrySendError::Full(_)) = jobs.lock().unwrap_or_else(|e| e.into_inner()).try_send(job) {
+        seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&blob);
+    }
 }
 
 /// A texture to keep ([`keep`]).
@@ -290,5 +303,39 @@ mod tests {
         assert_eq!(k, key);
         assert_eq!((e.blob, e.levels), (entry.blob, entry.levels));
         assert!(parse_line("1 2 3").is_none());
+    }
+
+    /// While the store's thread is behind, textures given to it wait no more
+    /// than [`WAITING`] (each a copy of its memory); the others are not
+    /// seen, so they are kept the next time they are read whole.
+    #[test]
+    fn textures_wait_for_the_store_in_bounds() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 64,
+            height: 64,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap();
+        let job = |blob| Job { shape: [64, 64, 28, 1], layout: layout.clone(), tiled: vec![0; 64 * 64 * 4], parts: Vec::new(), blob };
+        let (send, waiting) = mpsc::sync_channel::<Job>(WAITING);
+        let (jobs, seen) = (Mutex::new(send), Mutex::new(std::collections::HashSet::new()));
+        for blob in 0..WAITING as u128 + 5 {
+            seen.lock().unwrap().insert(blob);
+            queue(&jobs, &seen, job(blob));
+        }
+        assert_eq!(waiting.try_iter().map(|j| j.blob).collect::<Vec<_>>(), (0..WAITING as u128).collect::<Vec<_>>());
+        assert_eq!(seen.lock().unwrap().len(), WAITING);
+        // A thread that is gone: not given again and again.
+        drop(waiting);
+        seen.lock().unwrap().insert(100);
+        queue(&jobs, &seen, job(100));
+        assert!(seen.lock().unwrap().contains(&100));
     }
 }
