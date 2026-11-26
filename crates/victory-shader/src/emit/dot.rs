@@ -283,6 +283,26 @@ impl<'a> Lower<'a> {
                 }
                 write_dot_int(self, r)
             }
+            "v_dot8_i32_i4" => {
+                let (s0, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let down = self.s.m.i32(28);
+                let mut dot = self.s.m.i32(0);
+                for i in 0..8 {
+                    let up = self.s.m.i32(28 - i * 4);
+                    let a_sh = self.s.m.bin(c, Bin::Shl, s0, up);
+                    let a = self.s.m.bin(c, Bin::AShr, a_sh, down);
+                    let b_sh = self.s.m.bin(c, Bin::Shl, s1, up);
+                    let b = self.s.m.bin(c, Bin::AShr, b_sh, down);
+                    let prod = self.s.m.bin(c, Bin::Mul, a, b);
+                    dot = self.s.m.bin(c, Bin::Add, dot, prod);
+                }
+                let r = if v.clamp {
+                    sat_i32_add(self, dot, s2)
+                } else {
+                    self.s.m.bin(c, Bin::Add, dot, s2)
+                };
+                write_dot_int(self, r)
+            }
             _ => Err("an unhandled dot product"),
         }
     }

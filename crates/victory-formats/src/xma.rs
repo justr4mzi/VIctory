@@ -168,6 +168,15 @@ struct Bits<'a> {
 
 impl Bits<'_> {
     fn peek32(&self) -> u32 {
+        let byte = self.pos / 8;
+        if let Some(chunk) = self.data.get(byte..byte + 8) {
+            let v = u64::from_be_bytes(chunk.try_into().unwrap());
+            return ((v << (self.pos & 7)) >> 32) as u32;
+        }
+        self.peek32_tail()
+    }
+
+    fn peek32_tail(&self) -> u32 {
         let mut v = 0u64;
         let byte = self.pos / 8;
         for i in 0..5 {
@@ -205,11 +214,17 @@ impl Bits<'_> {
 /// A prefix code built like FFmpeg's `ff_vlc_init_from_lengths`: codes are
 /// handed out in table order, each the next free one of its length.
 struct Vlc {
+    /// Primary `FAST_BITS`-bit direct lookup table: `(symbol, len)` when
+    /// `len != 0`, else `(start_index_in_codes, 0)` for codes longer than
+    /// `FAST_BITS`.
+    fast: Box<[(i32, u8); 1 << Self::FAST_BITS]>,
     /// Left-aligned code, length, symbol; sorted by code.
     codes: Vec<(u32, u8, i32)>,
 }
 
 impl Vlc {
+    const FAST_BITS: usize = 10;
+
     fn new(entries: impl Iterator<Item = (i32, u8)>) -> Vlc {
         let mut code = 0u64;
         let mut codes = Vec::new();
@@ -217,15 +232,75 @@ impl Vlc {
             codes.push((code as u32, len, symbol));
             code += 1 << (32 - len);
         }
-        Vlc { codes }
+        let mut fast = vec![(-1i32, 0u8); 1 << Self::FAST_BITS].into_boxed_slice();
+        for (idx, &(c, len, symbol)) in codes.iter().enumerate() {
+            let prefix = (c >> (32 - Self::FAST_BITS)) as usize;
+            if usize::from(len) <= Self::FAST_BITS {
+                let span = 1usize << (Self::FAST_BITS - usize::from(len));
+                fast[prefix..prefix + span].fill((symbol, len));
+            } else if fast[prefix].0 < 0 {
+                fast[prefix] = (idx as i32, 0);
+            }
+        }
+        for slot in &mut fast {
+            if slot.1 == 0 && slot.0 < 0 {
+                slot.0 = 0;
+            }
+        }
+        Vlc {
+            fast: fast.try_into().unwrap(),
+            codes,
+        }
     }
 
     fn read(&self, bits: &mut Bits) -> i32 {
+        let v = bits.peek32();
+        let (sym, len) = self.fast[(v >> (32 - Self::FAST_BITS)) as usize];
+        if len != 0 {
+            bits.pos += len as usize;
+            return sym;
+        }
+        self.read_slow(bits, v, sym as usize)
+    }
+
+    #[cold]
+    fn read_slow(&self, bits: &mut Bits, v: u32, start: usize) -> i32 {
+        let slice = &self.codes[start..];
+        let i = slice.partition_point(|c| c.0 <= v) - 1;
+        let (_, len, symbol) = slice[i];
+        bits.pos += len as usize;
+        symbol
+    }
+
+    #[cfg(test)]
+    fn read_binary_search(&self, bits: &mut Bits) -> i32 {
         let v = bits.peek32();
         let i = self.codes.partition_point(|c| c.0 <= v) - 1;
         let (_, len, symbol) = self.codes[i];
         bits.pos += len as usize;
         symbol
+    }
+}
+
+/// Cached `10^(exp / 20)` quantization multipliers for integer exponents
+/// `[-128, 256)`, bit-exact with `10f32.powf(exp as f32 / 20.0)`.
+const QUANT_MIN: i32 = -128;
+const QUANT_LEN: usize = 384;
+
+fn quant_factor(exp: i32) -> f32 {
+    static TABLE: OnceLock<Box<[f32; QUANT_LEN]>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = vec![0.0f32; QUANT_LEN].into_boxed_slice();
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = 10f32.powf((QUANT_MIN + i as i32) as f32 / 20.0);
+        }
+        t.try_into().unwrap()
+    });
+    let idx = exp.wrapping_sub(QUANT_MIN) as u32 as usize;
+    if let Some(&q) = table.get(idx) {
+        q
+    } else {
+        10f32.powf(exp as f32 / 20.0)
     }
 }
 
@@ -934,7 +1009,7 @@ impl Decoder {
                 for band in 0..self.num_bands {
                     let end = sfb[band + 1].min(subframe_len);
                     let exp = ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
-                    let quant = 10f32.powf(exp as f32 / 20.0);
+                    let quant = quant_factor(exp);
                     for (t, &c) in tmp[sfb[band]..end].iter_mut().zip(&ch.coeffs[sfb[band]..end]) {
                         *t = c * quant;
                     }
@@ -1242,6 +1317,66 @@ mod tests {
                 best.1
             );
             assert!(errors == 0 && snr > 40.0);
+        }
+    }
+
+    /// Tabled VLC lookup matches binary search on every code word, range
+    /// boundary (exact code, code + span - 1, and random bitstreams).
+    #[test]
+    fn tabled_vlc_matches_binary_search() {
+        let c = codes();
+        let all = [
+            ("scale", &c.scale),
+            ("scale_rl", &c.scale_rl),
+            ("coef0", &c.coef[0]),
+            ("coef1", &c.coef[1]),
+            ("vec4", &c.vec4),
+            ("vec2", &c.vec2),
+            ("vec1", &c.vec1),
+        ];
+        for (name, vlc) in all {
+            for &(code, len, _) in &vlc.codes {
+                let end = code.wrapping_add((1u64 << (32 - len)).wrapping_sub(1) as u32);
+                for word in [code, end] {
+                    let bytes = word.to_be_bytes();
+                    let mut a = Bits { data: &bytes, pos: 0, end: 32 };
+                    let mut b = Bits { data: &bytes, pos: 0, end: 32 };
+                    assert_eq!(
+                        (vlc.read(&mut a), a.pos),
+                        (vlc.read_binary_search(&mut b), b.pos),
+                        "{name} word {word:#010x}"
+                    );
+                }
+            }
+            let mut rng = 0x1234_5678_9abc_def0u64;
+            let mut buf = vec![0u8; 4096];
+            for byte in &mut buf {
+                rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                *byte = (rng >> 56) as u8;
+            }
+            let (mut a, mut b) = (
+                Bits { data: &buf, pos: 0, end: buf.len() * 8 - 32 },
+                Bits { data: &buf, pos: 0, end: buf.len() * 8 - 32 },
+            );
+            while a.pos < a.end {
+                assert_eq!(
+                    (vlc.read(&mut a), a.pos),
+                    (vlc.read_binary_search(&mut b), b.pos),
+                    "{name} stream pos {}",
+                    a.pos
+                );
+            }
+        }
+    }
+
+    /// `quant_factor` returns the exact `f32` bits of `10f32.powf(exp / 20.0)`
+    /// both inside and outside the cached range.
+    #[test]
+    fn quant_table_matches_powf_bits() {
+        for exp in -200..=300 {
+            let got = quant_factor(exp).to_bits();
+            let want = 10f32.powf(exp as f32 / 20.0).to_bits();
+            assert_eq!(got, want, "exp {exp}");
         }
     }
 }

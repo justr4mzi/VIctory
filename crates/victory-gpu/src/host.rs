@@ -74,10 +74,14 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+static RETIRED: Mutex<Vec<(u64, std::time::Instant, Retired)>> = Mutex::new(Vec::new());
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Minimum lifetime of retired host objects in live runs (menus submit
+/// rapidly so a submission finishes before older command lists / heaps stop
+/// referencing a released resource). Kept zero in unit tests.
+const KEEP_TIME: std::time::Duration = std::time::Duration::from_secs(if cfg!(test) { 0 } else { 8 });
 
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
@@ -264,7 +268,7 @@ fn sweep() {
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
+    if cfg!(test) && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
         return;
@@ -273,19 +277,19 @@ pub(crate) fn retire<T: 'static>(object: T) {
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+        .push((started, std::time::Instant::now(), Retired(Box::new(object))));
 }
 
-/// Drops what waited for submissions up to `finished`.
+/// Drops what waited for submissions up to `finished` and past [`KEEP_TIME`].
 fn bury(finished: u64) {
-    let done: Vec<(u64, Retired)> = {
+    let done: Vec<(u64, std::time::Instant, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
             return;
         }
         let (done, keep) = std::mem::take(&mut *retired)
             .into_iter()
-            .partition(|(at, _)| *at <= finished);
+            .partition(|(at, since, _)| *at <= finished && since.elapsed() >= KEEP_TIME);
         *retired = keep;
         done
     };
@@ -6859,19 +6863,7 @@ impl HostList {
         if crate::shot::recording() {
             crate::shot::known(std::sync::Arc::as_ptr(&copy) as usize, resource as usize);
         }
-        let before = {
-            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-            match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert((wanted, wanted, copy.clone()));
-                    None
-                }
-                std::collections::hash_map::Entry::Occupied(mut o) => Some(std::mem::replace(&mut o.get_mut().1, wanted)),
-            }
-        }?;
-        if before == wanted {
-            return None;
-        }
+        let before = self.transition_copy(&copy, wanted)?;
         // A frame shot copies a texture where it leaves a state shaders
         // write in, and leaves it in that state: the caller's move is the
         // same as in any other frame.
@@ -6880,6 +6872,27 @@ impl HostList {
             crate::shot::leaves(&self.list, std::ptr::from_ref(self) as usize, Some(self), None, &copy, before, wanted);
         }
         Some((texture, before))
+    }
+
+    /// As [`HostList::transition`], for a host copy held by the caller (the
+    /// title's object may be gone): the state it leaves, if that is a change.
+    pub(crate) fn transition_copy(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<u32> {
+        let wanted = legal_state(&copy.texture, wanted);
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, copy.clone()));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then_some(before)
+            }
+        }
     }
 
     /// Moves host texture `copy` to `wanted` (a host state) in this list,

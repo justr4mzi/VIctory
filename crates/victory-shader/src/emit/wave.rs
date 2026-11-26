@@ -1424,14 +1424,14 @@ mod tests {
             let saved = insts[0].write(Reg::S(0)).unwrap();
             let v0_in = insts[1].read(Reg::V(0)).unwrap();
             let s1 = insts[insts.len() - 3].write(Reg::S(1)).unwrap();
-            let sec = &sections(&p, 0)[&0];
+            let sec = &sections(&p, 0, true)[&0];
             (sec.shapes.get(&s1).copied(), v0_in, saved)
         };
 
         let (zero_shape, v0_in, saved) = run(128);
         assert_eq!(
             zero_shape,
-            Some(Shape::Half(Op::AddH, v0_in, saved, 0, 31))
+            Some(Shape::Active(Op::AddH, v0_in, saved, 0))
         );
         for c in 240..=248u16 {
             let (shape, _, _) = run(c);

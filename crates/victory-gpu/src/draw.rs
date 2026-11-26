@@ -777,6 +777,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
+        if srv && list.first_use(shadow.buffer.as_raw() as usize) {
+            list.keep(&shadow.buffer);
+        }
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
@@ -1172,6 +1175,11 @@ impl State {
         }
         if !self.bind(list, p, false) {
             return false;
+        }
+        if p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
         }
         let l = &list.list;
         // Vertex buffers the input layout reads.
@@ -2454,7 +2462,11 @@ impl State {
     /// After a dispatch of `p`: the least indirect light, if it is the
     /// program that resolves that (after Belobug/VIctory-Belobug-AMD).
     fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
-        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+        let Some(stage) = p
+            .stages
+            .first()
+            .filter(|s| s.shader.resolves_light || s.shader.ends_reflections)
+        else {
             return false;
         };
         let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
@@ -2468,6 +2480,13 @@ impl State {
             };
             crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
         };
+        if !stage.shader.resolves_light {
+            // The reflections, held to the light around.
+            return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::hold(list, r as This),
+                _ => false,
+            };
+        }
         let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
             Some(View::Unordered(r, ..)) => r,
             _ => 0,
