@@ -48,11 +48,14 @@ pub(crate) fn on() -> bool {
 }
 
 /// How many threads land, the relay's own counted (`VICTORY_LAND_THREADS`).
+/// Scales up to 8 threads on 16+ thread CPUs (434+ parallel merge jobs/frame).
 fn threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
         let asked = std::env::var("VICTORY_LAND_THREADS").ok().and_then(|v| v.trim().parse().ok());
-        asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4)).clamp(1, 16)
+        asked
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 3).clamp(1, 8))
+            .clamp(1, 16)
     })
 }
 
@@ -348,7 +351,12 @@ pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync))
     static POOLS: [OnceLock<&'static Pool>; 2] = [const { OnceLock::new() }; 2];
     POOLS[usize::from(records)]
         .get_or_init(|| {
-            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if records { 6usize } else { 4 });
+            let default = if records {
+                std::thread::available_parallelism().map_or(6, |n| n.get() / 3).clamp(4, 8)
+            } else {
+                4
+            };
+            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
             Pool::new(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16))
         })
         .each(count, f);
