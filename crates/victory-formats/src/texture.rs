@@ -809,6 +809,27 @@ impl Layout {
                 + m.offset
                 + u64::from(self.pattern[2][inner as usize]);
             let z_lin = z as usize * depth_pitch;
+            // While tiling, finish the rows of one destination block before
+            // visiting the next block across a wide texture.
+            let runs_per_block = self.block[0] as usize * self.desc.element_bytes as usize / W;
+            if !DETILE && body.len() > runs_per_block {
+                let block_rows = self.block[1] as usize;
+                for (block_y, rows) in row_off.chunks(block_rows).enumerate() {
+                    let first_row = z_lin + block_y * block_rows * row_pitch;
+                    for (block_x, cols) in body.chunks(runs_per_block).enumerate() {
+                        for (dy, &row) in rows.iter().enumerate() {
+                            let linear = first_row + dy * row_pitch + block_x * runs_per_block * W;
+                            copy_body::<W, false>(src, dst, (base + row) as usize, linear, cols);
+                        }
+                    }
+                    if plan.tail.is_some() {
+                        for (dy, &row) in rows.iter().enumerate() {
+                            copy_row_tail::<false>(src, dst, (base + row) as usize, first_row + dy * row_pitch, plan);
+                        }
+                    }
+                }
+                continue;
+            }
             let height = m.height as usize;
             let mut y = 0;
             if pair {
