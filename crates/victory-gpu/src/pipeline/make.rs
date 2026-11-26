@@ -20,6 +20,10 @@
 //! pipelines they were dropped; that run had no lamps and no diffuse light to
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
+//!
+//! Each pipeline has a budget of its own as well, over all frames
+//! ([`each_budget`]): one whose build outlasts the frame's budget, or that is
+//! never made, no longer takes it again in every frame that binds it (#73).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -43,6 +47,9 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// Microseconds draws have waited for it, over all frames
+    /// ([`each_budget`]).
+    waited_us: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -68,6 +75,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -79,7 +87,7 @@ impl Pending {
         self.made.get_or_init(|| {
             let _building = crate::timeline::span("pipeline: build a host pipeline");
             let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let made = refused_on_panic(&self.shaders, || HostPipeline::new(&self.shaders, self.graphics.as_deref()));
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
@@ -87,6 +95,18 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// `make()`, with a panic taken as a refusal (#73). Unwound past the worker,
+/// a panic would end it with `made` never set: the pipeline would stay
+/// MAKING for good (never queued again), its place in [`WAITING`] and a slow
+/// slot ([`Queue::slow_now`]) would never be given back, and every frame
+/// that binds it would wait for it again.
+fn refused_on_panic(shaders: &[Arc<Shader>], make: impl FnOnce() -> Option<HostPipeline>) -> Option<HostPipeline> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(make)).unwrap_or_else(|_| {
+        tracing::warn!(?shaders, "making a host pipeline panicked: taken as refused");
+        None
+    })
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -142,6 +162,35 @@ fn screen_budget() -> Duration {
         let millis = std::env::var("VICTORY_SCREEN_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10_000);
         Duration::from_millis(millis)
     })
+}
+
+/// Waiting allowed for one pipeline over all frames, `None` for no limit
+/// (#73). The frame's budget alone let a pipeline whose build outlasts it,
+/// or that is never made, take the whole budget again in every frame that
+/// binds it: four such pipelines held every world frame at 500 ms waited
+/// (fxceless/victory-fork#1181; #61 and #67 have that shape). Past it a draw
+/// is dropped at once, as one past the frame's budget, and finds the
+/// pipeline when a worker has made it.
+/// `VICTORY_PIPELINE_WAIT_EACH_MS` (500 by default; 0: no limit, as before).
+/// Passes over the screen are allowed their own budget ([`screen_budget`]),
+/// once in all instead of in every frame.
+fn each_budget(screen: bool) -> Option<Duration> {
+    static EACH: OnceLock<Option<Duration>> = OnceLock::new();
+    let each = *EACH.get_or_init(|| {
+        let millis = std::env::var("VICTORY_PIPELINE_WAIT_EACH_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(500);
+        tracing::info!(millis, "host pipeline wait budget per pipeline (0: none)");
+        (millis != 0).then(|| Duration::from_millis(millis))
+    });
+    each.map(|each| if screen { screen_budget() } else { each })
+}
+
+/// What is left of a pipeline's own budget (`each`) once `waited` was
+/// waited for it.
+fn pipeline_left(each: Option<Duration>, waited: Duration) -> Duration {
+    each.map_or(Duration::MAX, |each| each.saturating_sub(waited))
 }
 
 /// Whether passes over the screen go before the others.
@@ -201,11 +250,19 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waits for `p` while frame `frame` and `p` itself ([`each_budget`]) have
+/// budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
+        return;
+    }
+    let own = pipeline_left(
+        each_budget(screen),
+        Duration::from_micros(p.waited_us.load(Ordering::Relaxed)),
+    );
+    if own.is_zero() {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
@@ -218,7 +275,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(own);
         if shared {
             spent.1 += left;
         }
@@ -240,6 +297,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
     waiting.end();
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
@@ -504,6 +562,50 @@ mod tests {
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
             std::thread::yield_now();
         }
+        assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn a_pipelines_own_budget_is_what_was_not_waited_of_it() {
+        let ms = Duration::from_millis;
+        assert_eq!(pipeline_left(Some(ms(500)), ms(200)), ms(300));
+        assert_eq!(pipeline_left(Some(ms(500)), ms(600)), Duration::ZERO);
+        assert_eq!(pipeline_left(None, ms(60_000)), Duration::MAX);
+    }
+
+    /// A pipeline that is never made is waited for until its own budget is
+    /// spent, then no more, frame after frame (#73).
+    #[test]
+    fn a_pipeline_that_stays_being_made_stops_taking_the_frame_budget() {
+        let Some(each) = each_budget(false) else { return };
+        if wait_budget().is_zero() {
+            return;
+        }
+        let p = Pending::new(Vec::new(), None);
+        // Never queued, so never made; 20 ms of its own budget left.
+        let nearly = each.saturating_sub(Duration::from_millis(20));
+        p.waited_us.store(nearly.as_micros() as u64, Ordering::Relaxed);
+
+        let started = Instant::now();
+        wait(&p, u64::MAX - 73);
+        assert!(started.elapsed() >= Duration::from_millis(15));
+        assert!(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)) >= each - Duration::from_millis(1));
+
+        // Later frames have their whole budget, the pipeline none.
+        for frame in [u64::MAX - 72, u64::MAX - 71] {
+            let started = Instant::now();
+            wait(&p, frame);
+            assert!(started.elapsed() < Duration::from_millis(10), "waited again in frame {frame}");
+        }
+    }
+
+    /// A panic while making a pipeline is a refusal, not a worker that ends
+    /// with the pipeline left "being made" for good (#73).
+    #[test]
+    fn a_panic_while_making_is_a_refusal() {
+        assert!(refused_on_panic(&[], || panic!("(expected)")).is_none());
+        let p = Pending::new(Vec::new(), None);
+        p.made.get_or_init(|| refused_on_panic(&p.shaders, || panic!("(expected)")));
         assert!(matches!(p.made.get(), Some(None)));
     }
 
