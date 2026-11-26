@@ -1,130 +1,40 @@
-# VIctory on an RX 7900 XTX
+# VIctory v16 (RX 6700 XT Fork)
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+Fork of [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) (originally forked from [Marvisak/VIctory](https://github.com/Marvisak/VIctory)), tuned for **Windows 11 + AMD Ryzen 5 5600 (6C/12T) + AMD Radeon RX 6700 XT (12 GB VRAM, RDNA2) + 48 GB RAM**.
 
-## The goal
+**This repository contains no game files, code or assets.** You need your own copy of the title. It is not affiliated with or endorsed by any developer or publisher.
 
-**A stable 30 fps or more without ray tracing, then as high a frame rate and as
-low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
-32 GB (later 16 GB) of RAM.
+See [FORK.md](FORK.md) for the complete changelog, multi-fork integrations, offline test results, and live RX 6700 XT status.
 
-The way there is **porting, not emulating**: patching the title's renderer so it
-behaves the way a PC renderer does, rather than having the layer watch and copy
-the console's shared memory every frame. Shaders are translated ahead of time
-into a versioned store that is kept between builds. Ray tracing stays optional
-and off by default. The picture comes after the frame rate: texture pop-in and
-lighting that is too bright or too dark when walking indoors are next in line.
+## Status on RX 6700 XT (RDNA2, 2026-11-26)
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+- **Build & Offline Tests (`v16-beta`):**
+  - `cargo xtask policy`: **passed (`251 files ok`)**.
+  - `[profile.ship]` (fat LTO, `codegen-units = 1`) and `[profile.diag]` (`diagnostics` feature) build cleanly.
+  - Non-`victory-gpu` workspace tests: **604 passed, 0 failed, 11 ignored**.
+  - `victory-gpu` (`diagnostics`): **388 lib + 1 replay passed, 1 failed (`descriptor::host::tests::views_are_made_beside_the_heap_and_copied_in`, pre-existing upstream RDNA2 CPU-vs-SV descriptor byte assertion), 35 ignored**.
+- **Live GPU Status on RX 6700 XT:**
+  - Enters the 3D scene cleanly (`WORLD=2`, ~10x faster heap pass `3.3–73.9 ms` vs `v15`'s `399 ms`, crisp lighting), but hits `DXGI_ERROR_DEVICE_RESET` (`0x887A0007`) within 0–12 s of entering 3D on RDNA2 even with `VICTORY_VIEW_COPY=0`, `VICTORY_TEXTURE_POOL=0`, `VICTORY_HELD_LEVELS=0`, `VICTORY_SHOW_NEW_LATER=0`, `VICTORY_LIBRARY_MAP=0`, `VICTORY_UNDER_WIDE=0`, and `VICTORY_LAND_ECHO=0`.
+  - Use **`v15-ready`** for multi-hour stable gameplay on RX 6700 XT until the RDNA2 `0x887A0007` device reset is isolated with `VICTORY_D3D12_DEBUG=1`.
 
-## Where it stands (2026-11-26)
+## How to run
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, the Series X profile, ray tracing off.
-
-| | |
-|---|---|
-| City street, renderer patches 1+2 on | about 53 ms a frame (about 19 fps) |
-| Same scene before the patches | 57-75 ms (13-17 fps) |
-| Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 35 GB of private memory: **64 GB of RAM recommended** for now |
-
-It started at 280 ms a frame in the same scenes three days earlier.
-
-### Renderer patches (off by default while they are tested)
-
-| Switch | What it does |
-|---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
-| `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
-
-What is known to be wrong:
-
-- Trees, signs and far objects flicker in the distance in some places.
-- Lighting is too bright or too dark after walking indoors, until the title has
-  run for a while; rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run of a new build stutters while the driver makes pipelines
-  (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
-
-## How to run it
-
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with Shader Model 6.6 and mesh shaders, Rust `1.98.1`, MSVC build tools, and your own copy of the title.
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+cargo build --locked --profile ship -p victory
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+For RDNA2 (`RX 6700 XT`) live testing, avoid forcing `VICTORY_CARD_BUFFERS_MB=2048` (let the automatic 12 GB VRAM budget apply) and keep `VICTORY_VIEW_COPY=0`, `VICTORY_TEXTURE_POOL=0`, `VICTORY_HELD_LEVELS=0`, `VICTORY_SHOW_NEW_LATER=0`, `VICTORY_LIBRARY_MAP=0`, `VICTORY_MAP_THREADS=1`, and `VICTORY_TITLE_PRIORITIES=0`.
 
-Before the first run, ahead of time (both can be stopped and go on later):
+## Credits & License
 
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
+- **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** — upstream loader, HLE, D3D12 backend, and shader recompiler.
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** — base architecture (`VICTORY_THIN`, `VICTORY_JOIN_PARTS`, `VICTORY_PORT_CONSTANTS`, `VICTORY_PORT_DESCRIPTORS`, `VICTORY_SHOW_AFTER`, `VICTORY_UPLOAD_AHEAD`, `ambient.rs`, `replay`).
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)** (`4e1b16a8`) — magenta filter, VRAM eviction thresholds, `keep_shown` room guard, lock-free compiler VEH + `warm-bad.txt`.
+- **[ka1qux](https://github.com/ka1qux/VIctory)** (`4bf4354d`, `f10ab5e1`) — anisotropic point-mip filtering probe and `tiles::let_go` deferred reclaim.
+- **[triippywhale](https://github.com/triippywhale/VIctory)** (`0de380d8`) — commit-headroom idle cache trimming.
+- **This fork (`v16-rx6700xt`)** — **AI-assisted** integration, profiling, and RX 6700 XT tuning (`EXACT_POOL`, cached `Shadow::uav_allowed()`, `VICTORY_THIN_THREADS` calibration, `VICTORY_KEYS_FILE` / `WASD` diag input, `[profile.ship]`).
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
-
-## What is different here
-
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
-
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
-
-## Credits
-
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
-
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
-
-## License
-
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE) and [docs/asset-policy.md](docs/asset-policy.md).
