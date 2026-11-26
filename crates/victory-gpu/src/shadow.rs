@@ -5665,8 +5665,8 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     /// idle one stays for.
     const MANY: usize = 256;
     const LATELY: u64 = 512;
-    const POOL_BUCKET_CAP: usize = 512;
-    const POOL_TOTAL_CAP: usize = 4096;
+    const POOL_BUCKET_CAP: usize = 32;
+    const POOL_TOTAL_CAP: usize = 256;
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
@@ -5684,9 +5684,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             shadow.used.store(crate::host::moment(), Ordering::Relaxed);
             return Some(shadow.clone());
         }
-        // Adaptive prune cadence (`max(map.len(), 4096)`) and cheap recency/refcount
+        // Adaptive prune cadence (`clamp(512, 2048)`) and cheap recency/refcount
         // check before the COM `references()` call, recycling into `EXACT_POOL`.
-        let prune_every = (map.len() as u64).max(4096);
+        let prune_every = (map.len() as u64).clamp(512, 2048);
         if map.len() >= MANY && now.saturating_sub(*last_prune) >= prune_every {
             *last_prune = now;
             map.retain(|_, (shadow, used, cap)| {
@@ -5748,6 +5748,25 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
+}
+
+/// Drops all pooled `EXACT_POOL` buffers outside the pool lock.
+pub(crate) fn trim_exact_pool() {
+    let drained: Vec<(ID3D12Resource, usize, u64)> = {
+        let mut pool = EXACT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let (total, buckets) = &mut *pool;
+        if *total == 0 && buckets.is_empty() {
+            return;
+        }
+        *total = 0;
+        let mut all = Vec::new();
+        for (_, bucket) in buckets.iter_mut() {
+            all.append(bucket);
+        }
+        buckets.clear();
+        all
+    };
+    drop(drained);
 }
 
 /// Copies of single views' bytes made since the start.

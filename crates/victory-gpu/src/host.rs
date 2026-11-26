@@ -166,6 +166,7 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    const GIB: u64 = 1 << 30;
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
@@ -173,12 +174,20 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(82) {
+    if budget > 14 * GIB {
+        if used < share(82) {
+            (KEPT_MS, u64::MAX)
+        } else if used < share(90) {
+            (IDLE_MS, used - share(78))
+        } else {
+            (SHORT_MS, used - share(80))
+        }
+    } else if used < share(76) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(90) {
-        (IDLE_MS, used - share(78))
+    } else if used < share(85) {
+        (IDLE_MS, used - share(72))
     } else {
-        (SHORT_MS, used - share(80))
+        (SHORT_MS, used - share(75))
     }
 }
 
@@ -558,6 +567,9 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
+    }
+    if !keep_freed() || crate::residency::pressured() {
+        crate::shadow::trim_exact_pool();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -8915,9 +8927,21 @@ impl Meter {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
 
+    /// `VICTORY_METER_OCCLUDED=1` keeps counting when `Present` returns
+    /// `DXGI_STATUS_OCCLUDED` (used in isolated headless benchmark runs).
+    fn meter_occluded() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_METER_OCCLUDED").is_some_and(|v| v == "1"))
+    }
+
     /// Record a frame once the swap chain has accepted it.
     fn record_present(&mut self, hwnd: HWND, status: windows::core::HRESULT) -> bool {
-        use windows::Win32::Foundation::S_OK;
+        use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, S_OK};
+        if status == DXGI_STATUS_OCCLUDED && Self::meter_occluded() {
+            self.last_present = status;
+            self.frame(hwnd);
+            return true;
+        }
         if status != S_OK && status != self.last_present {
             tracing::warn!(?status, "swap chain did not present the frame");
         }
@@ -11048,6 +11072,9 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(vram_keep(100 * gib, 85 * gib), (5_000, 7 * gib));
         assert_eq!(vram_keep(100 * gib, 95 * gib), (1_500, 15 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 40 * gib));
+        assert_eq!(vram_keep(11 * gib, 8 * gib).0, 600_000);
+        assert_eq!(vram_keep(11 * gib, 9 * gib), (5_000, 9 * gib - (11 * gib / 100 * 72)));
+        assert_eq!(vram_keep(11 * gib, 10 * gib), (1_500, 10 * gib - (11 * gib / 100 * 75)));
         assert_eq!(vram_keep(0, 7).0, 5_000);
     }
 
