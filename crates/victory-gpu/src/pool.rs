@@ -68,11 +68,41 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     }
 }
 
+/// `VICTORY_SPARES_BY_HEADROOM=1` (off by default): how many empty blocks
+/// are kept follows the card's headroom below 85 % of its budget, instead
+/// of the all-or-nothing 4 GiB of [`SPARE_KEPT`]. A 16 GB card 12 GB in
+/// held 4 GiB of empty blocks with about a GB of its budget left, and the
+/// paging that followed ran at about a frame a second (#94; #76's 8-16 GB
+/// runs, `VICTORY_SPARES_BY_HEADROOM=0`: the binary choice, as before).
+/// At most half of what is left is kept, so what the title makes next has
+/// room; a 24 GB card 10 GB in keeps all 64 blocks, and one at 85 % or
+/// past it, or asked not to keep (memory pressure, [`room`]), keeps
+/// [`SPARE`] as before.
+fn by_headroom() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPARES_BY_HEADROOM").is_some_and(|v| v == "1"))
+}
+
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
-    match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
-        _ => SPARE,
+    spares_of(memory, keep, by_headroom())
+}
+
+/// [`spares`], the choice made for it: [`SPARE_KEPT`] below 85 % of the
+/// budget as before, or with `by_headroom` at most half of what is left
+/// below it, in blocks.
+fn spares_of(memory: Option<[u64; 4]>, keep: bool, by_headroom: bool) -> usize {
+    let Some([budget, used, ..]) = memory else {
+        return SPARE;
+    };
+    if !keep {
+        return SPARE;
     }
+    if !by_headroom {
+        return if u128::from(used) * 100 < u128::from(budget) * 85 { SPARE_KEPT } else { SPARE };
+    }
+    let ceiling = u128::from(budget) * 85 / 100;
+    let headroom = ceiling.saturating_sub(u128::from(used));
+    ((headroom / 2 / u128::from(BLOCK)) as usize).clamp(SPARE, SPARE_KEPT)
 }
 
 /// Milliseconds until a piece given back is used again. (It was three
@@ -788,6 +818,26 @@ mod tests {
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    /// `VICTORY_SPARES_BY_HEADROOM=1`: at most half of what is left below
+    /// 85 % of the budget, in blocks, the ends kept as they are (#94).
+    #[test]
+    fn spares_follow_the_cards_headroom_when_asked() {
+        const GIB: u64 = 1 << 30;
+        let budget_of = |gib: u64| gib * GIB;
+        // A 24 GB card 10 GB in keeps all 64 blocks.
+        assert_eq!(spares_of(Some([budget_of(24), budget_of(10), 0, 0]), true, true), SPARE_KEPT);
+        // A 16 GB card 12 GB in: half of the ~1.6 GB left below 85 %, in
+        // 64 MiB blocks, is 12 blocks, not 4 GiB of them.
+        assert_eq!(spares_of(Some([budget_of(16), budget_of(12), 0, 0]), true, true), 12);
+        // Past 85 %, or told not to keep, or nothing reported: as before.
+        assert_eq!(spares_of(Some([budget_of(16), budget_of(15), 0, 0]), true, true), SPARE);
+        assert_eq!(spares_of(Some([budget_of(16), budget_of(12), 0, 0]), false, true), SPARE);
+        assert_eq!(spares_of(None, true, true), SPARE);
+        // Off: the binary choice.
+        assert_eq!(spares_of(Some([budget_of(16), budget_of(12), 0, 0]), true, false), SPARE_KEPT);
+        assert_eq!(spares_of(Some([budget_of(16), budget_of(15), 0, 0]), true, false), SPARE);
     }
 
     #[test]
