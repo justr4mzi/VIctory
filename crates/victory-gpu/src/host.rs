@@ -5616,6 +5616,18 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
+        if crate::list::async_land() && !relay() {
+            let mut l = line();
+            if l.landed.is_empty() {
+                return;
+            }
+            if l.landed.len() < 24 {
+                l.poke = true;
+                drop(l);
+                LINE_MOVED.notify_one();
+                return;
+            }
+        }
         let _landing = crate::timeline::span("landed lists reset and given back");
         land();
     }

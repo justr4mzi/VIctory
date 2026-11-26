@@ -231,6 +231,14 @@ pub(crate) fn tables_back(landed: &mut [(Vec<Detached>, Vec<usize>)]) {
     }
 }
 
+/// Offloads landed command-list reset/recycle (`land()`) to `late_helper` when
+/// `VICTORY_ASYNC_LAND=1` (off by default), saving ~7-10 ms/frame on the submit thread.
+#[cfg(windows)]
+pub(crate) fn async_land() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_LAND").is_some_and(|v| v == "1"))
+}
+
 /// A host list that has run and waits to be used again, and the bytes of
 /// upload memory it keeps.
 #[cfg(windows)]
