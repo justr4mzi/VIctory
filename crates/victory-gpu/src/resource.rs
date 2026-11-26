@@ -3296,6 +3296,7 @@ impl HostTexture {
             ahead: crate::texture::ahead::fresh(),
             prefill: Default::default(),
             prefilled: Default::default(),
+            uploads: Default::default(),
             flags,
         }
     }

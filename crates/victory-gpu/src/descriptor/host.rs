@@ -136,6 +136,10 @@ impl DynamicBits {
         Self { words: vec![0; len.div_ceil(64)], len }
     }
 
+    fn is_taken(&self, index: usize) -> bool {
+        index >= self.len || (self.words[index / 64] & (1u64 << (index % 64))) != 0
+    }
+
     /// Index of the first set bit in `[start, end)`, or `None` if all are 0.
     fn first_taken(&self, start: usize, end: usize) -> Option<usize> {
         let mut at = start;
@@ -2746,7 +2750,7 @@ impl HostHeap {
         if self.dynamic > 0 {
             let guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
             for dyn_idx in 0..self.dynamic as usize {
-                if guard.1.get(dyn_idx).copied().unwrap_or(true) {
+                if guard.1.is_taken(dyn_idx) {
                     continue;
                 }
                 let index = self.count + dyn_idx as u32;
