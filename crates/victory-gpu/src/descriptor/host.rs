@@ -4295,22 +4295,14 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
 pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Whether raw twins of buffer views that do not begin on 16 bytes begin at
-/// the view's own dword (on by default; `VICTORY_TWIN_EXACT=0`: a null view,
-/// as before, unless [`move_raw`] can move a staged one). Read once.
-///
-/// D3D12 asks raw views to begin on 16 bytes; AMD's hardware and RADV read a
-/// raw buffer from any dword. Null, such a twin read zeros: the tree culling
-/// (`InstanceCulling:CS_Tree_BatchCull`) runs in two dispatches a frame, and
-/// the second one's batch list begins right after the first one's 4-byte
-/// entries, so in every frame whose split left it off 16 bytes the second
-/// dispatch read a list of zeros and its trees were not drawn: whole trees
-/// and palms dropped out for single frames while the camera moved (the
-/// "Just Like Paradise" title shot, frames 1 and 2 of capture title3; up to
-/// 1,000 such twins a frame in play). With the twins exact: 0 flicker frames
-/// (run titleTX).
+/// the view's own dword (off by default; `VICTORY_TWIN_EXACT=1`: opt-in for
+/// Proton/RADV, since native Windows D3D12 rejects raw views whose
+/// `FirstElement` is not a multiple of 4 with `DXGI_ERROR_INVALID_CALL`,
+/// removing the device). Without it, [`move_raw`] moves staged descriptors
+/// on AMD hardware, and unmovable ones fall back to a null view. Read once.
 fn twin_exact() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TWIN_EXACT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TWIN_EXACT").is_some_and(|v| v != "0"))
 }
 
 /// Moves the raw view at `at`, a slot of our heaps the card does not see,
@@ -5081,6 +5073,7 @@ fn show_prefilled(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, levels: u32) {
 /// Shifts an explicit 2D / 2D-array shader resource view description for a
 /// host texture created starting at console mip `base` (`host_levels` mips on
 /// the host), clamping `MostDetailedMip`, `MipLevels`, and `ResourceMinLODClamp`.
+#[cfg(test)]
 pub(crate) fn adjust_srv_for_base_mip(
     desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
     base: u32,
