@@ -414,16 +414,12 @@ impl Section {
     /// `VICTORY_SECTION_WINDOW=0`: a view for each write, as before.
     fn window(&self, index: usize, n: usize) -> Option<usize> {
         use std::sync::atomic::Ordering;
-        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("VICTORY_SECTION_WINDOW").is_none_or(|v| v != "0"));
         if !*ON || index + n > self.pages {
             return None;
         }
-        let base = *self.window.get_or_init(|| {
-            // SAFETY: the whole of a section we own.
-            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
-        });
+        let base = self.whole();
         if base == 0 {
             return None;
         }
@@ -447,6 +443,153 @@ impl Section {
             page += run;
         }
         Some(base + index * PAGE)
+    }
+
+    /// The view of the whole section ([`Section::window`]), mapped the
+    /// first time it is asked for; 0 if the host gave none.
+    fn whole(&self) -> usize {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        *self.window.get_or_init(|| {
+            // SAFETY: the whole of a section we own; reserved pages stay
+            // uncommitted until a view commits them.
+            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
+        })
+    }
+
+    /// `VICTORY_KEEP_PAGES=1` ([`keeping`]): reads the `n` committed pages
+    /// from `index` on once through the whole-section view, which puts
+    /// them in our working set there, so unmapping the title's last view
+    /// of them does not send them to the modified list (and the pagefile).
+    fn keep(&self, index: usize, n: usize) {
+        if !keeping() || index >= self.pages {
+            return;
+        }
+        let Some(&base) = self.window.get().filter(|&&b| b != 0) else {
+            return;
+        };
+        if !keep_room() {
+            return;
+        }
+        let n = n.min(self.pages - index);
+        let start = base + index * PAGE;
+        for at in (start..start + n * PAGE).step_by(4096) {
+            // SAFETY: inside the whole-section view, at a committed page.
+            unsafe { std::ptr::read_volatile(at as *const u8) };
+        }
+    }
+}
+
+// `VICTORY_KEEP_PAGES=1`, after fxceless/victory-fork#1294 (flxppr): when
+// the title unmaps the last view of physical pages it wrote (it remaps all
+// the time), Windows puts them on the modified list and writes them to the
+// pagefile, though the title still holds them. Measured there on a SATA SSD
+// with 48 GB: 8.5 GB of pagefile writes in 8 minutes and reads stalled
+// behind them; with the switch 0.3 GB. On 16 GB with an NVMe it was neutral
+// to slightly worse (Windows trims us anyway). Each section gets its whole
+// view at allocation ([`Section::whole`], never unmapped before the section
+// goes) and each page a view commits is read once through it. Nothing is
+// locked and no working-set minimum is set: Windows may still trim us. The
+// read faults in a page the title never touched, so the switch can raise
+// our resident memory; below `VICTORY_KEEP_PAGES_FREE_MB` (default 512, 0:
+// no limit) of free RAM it stops reading pages in until free RAM is back
+// above that plus a quarter. The floor is only for near exhaustion: on a
+// 32 GB PC (RTX 2070 SUPER, Series S) free RAM stayed at 1.9 GB or more
+// with the switch and no floor (0.5 GB at worst without the switch), and a
+// 2 GB floor paused it just when it helped. Off by default and under Wine
+// (its sections are sparse files).
+
+fn keeping() -> bool {
+    static KEEP: LazyLock<bool> =
+        LazyLock::new(|| !on_wine() && keep_switch(std::env::var("VICTORY_KEEP_PAGES").ok().as_deref()));
+    *KEEP
+}
+
+/// Whether `VICTORY_KEEP_PAGES` turns keeping on: only `1`.
+fn keep_switch(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// `VICTORY_KEEP_PAGES_FREE_MB` in bytes; unset or unreadable: 512 MiB.
+fn keep_headroom(value: Option<&str>) -> u64 {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(512).saturating_mul(1 << 20)
+}
+
+/// Whether to go on reading pages in with `free` bytes of RAM free: below
+/// `headroom` it stops, and starts again only above `headroom` and a
+/// quarter, so it does not flip at every sample.
+fn keep_band(was: bool, free: u64, headroom: u64) -> bool {
+    if was { free >= headroom } else { free >= headroom.saturating_add(headroom / 4) }
+}
+
+/// [`keep_band`] on the host's free RAM, sampled at most every 100 ms.
+fn keep_room() -> bool {
+    use std::sync::atomic::AtomicBool;
+    static HEADROOM: LazyLock<u64> =
+        LazyLock::new(|| keep_headroom(std::env::var("VICTORY_KEEP_PAGES_FREE_MB").ok().as_deref()));
+    static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    static NEXT_MS: AtomicU64 = AtomicU64::new(0);
+    static ROOM: AtomicBool = AtomicBool::new(true);
+    if *HEADROOM == 0 {
+        return true;
+    }
+    let now = START.elapsed().as_millis() as u64;
+    let next = NEXT_MS.load(Ordering::Relaxed);
+    if now < next || NEXT_MS.compare_exchange(next, now + 100, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return ROOM.load(Ordering::Relaxed);
+    }
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
+    if unsafe { K32GetPerformanceInfo(&mut info, info.cb) } == 0 {
+        return ROOM.load(Ordering::Relaxed);
+    }
+    let free = info.PhysicalAvailable as u64 * info.PageSize as u64;
+    let was = ROOM.load(Ordering::Relaxed);
+    let room = keep_band(was, free, *HEADROOM);
+    if room != was {
+        ROOM.store(room, Ordering::Relaxed);
+        tracing::info!(
+            free_mb = free >> 20,
+            headroom_mb = *HEADROOM >> 20,
+            "VICTORY_KEEP_PAGES: {}",
+            if room { "free RAM is back, reading pages in again" } else { "free RAM low, pages no longer read in" }
+        );
+    }
+    room
+}
+
+/// Gives a new section of `size` bytes its whole view when keeping, and
+/// logs what was asked and granted: the first section, then each time the
+/// total passes another GiB, and every refusal.
+fn keep_section(section: &Section, size: usize) {
+    static ASKED: AtomicU64 = AtomicU64::new(0);
+    static GRANTED: AtomicU64 = AtomicU64::new(0);
+    static SECTIONS: AtomicU64 = AtomicU64::new(0);
+    if !keeping() {
+        return;
+    }
+    let granted = section.whole() != 0;
+    let size = size as u64;
+    let before = ASKED.fetch_add(size, Ordering::Relaxed);
+    let granted_total = match granted {
+        true => GRANTED.fetch_add(size, Ordering::Relaxed) + size,
+        false => GRANTED.load(Ordering::Relaxed),
+    };
+    let granted_mb = granted_total >> 20;
+    let sections = SECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    let asked_mb = (before + size) >> 20;
+    if !granted {
+        tracing::warn!(size, error = %std::io::Error::last_os_error(), asked_mb, granted_mb, "VICTORY_KEEP_PAGES: no kept view for physical pages");
+    } else if before == 0 || before >> 30 != (before + size) >> 30 {
+        tracing::info!(
+            sections,
+            asked_mb,
+            granted_mb,
+            headroom_mb = keep_headroom(std::env::var("VICTORY_KEEP_PAGES_FREE_MB").ok().as_deref()) >> 20,
+            "VICTORY_KEEP_PAGES=1: physical pages held in our working set by a kept view per section (nothing locked; Windows may still trim)"
+        );
     }
 }
 
@@ -691,6 +834,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
     });
+    keep_section(&section, size);
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
@@ -762,6 +906,7 @@ impl View {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }
+        slice.section.keep(slice.index, n);
         Some(view)
     }
 
@@ -1788,6 +1933,7 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    slice.section.keep(slice.index, len.div_ceil(PAGE));
     true
 }
 
@@ -2066,6 +2212,41 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
+    }
+
+    #[test]
+    fn keep_pages_is_on_only_for_1() {
+        assert!(!keep_switch(None));
+        assert!(keep_switch(Some("1")));
+        assert!(keep_switch(Some(" 1 ")));
+        for off in ["0", "", "true", "yes", "2"] {
+            assert!(!keep_switch(Some(off)), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn keep_headroom_defaults_to_512_mib_and_0_turns_it_off() {
+        const M: u64 = 1 << 20;
+        assert_eq!(keep_headroom(None), 512 * M);
+        assert_eq!(keep_headroom(Some("junk")), 512 * M);
+        assert_eq!(keep_headroom(Some(" 4096 ")), 4096 * M);
+        assert_eq!(keep_headroom(Some("0")), 0);
+        assert_eq!(keep_headroom(Some(&u64::MAX.to_string())), u64::MAX);
+    }
+
+    #[test]
+    fn keep_band_stops_below_headroom_and_resumes_a_quarter_above() {
+        const M: u64 = 1 << 20;
+        let headroom = 2048 * M;
+        assert!(keep_band(true, 2048 * M, headroom));
+        assert!(!keep_band(true, 2047 * M, headroom));
+        // Stopped: not back until 2.5 GiB free.
+        assert!(!keep_band(false, 2048 * M, headroom));
+        assert!(!keep_band(false, 2559 * M, headroom));
+        assert!(keep_band(false, 2560 * M, headroom));
+        // No limit.
+        assert!(keep_band(true, 0, 0));
+        assert!(keep_band(false, 0, 0));
     }
 
     #[test]
