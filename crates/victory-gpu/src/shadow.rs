@@ -68,6 +68,11 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// With `VICTORY_WC_NO_BACK=1`: ranges shaders wrote and that were not
+    /// copied back ([`crate::wc::no_back`]): title memory there is older
+    /// than the copy for good, so a refresh that cannot tell what the CPU
+    /// wrote (not watched) leaves them out.
+    card_owned: Mutex<crate::wc::Ranges>,
     /// Lock-free mirror of `!pending.is_empty()` (updated under `pending`).
     has_pending: std::sync::atomic::AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
@@ -3991,6 +3996,7 @@ impl Shadow {
             copied: RwLock::new(CopiedState::new(pages as usize)),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            card_owned: Mutex::default(),
             has_pending: Default::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -4761,6 +4767,15 @@ impl Shadow {
         })
     }
 
+    /// Shaders write `[address, address + len)` and it is not copied back
+    /// (`VICTORY_WC_NO_BACK`, [`crate::wc::skip_back`]): the copy holds the
+    /// newest bytes there from now on (see [`Shadow::update`]).
+    pub(crate) fn card_owns(&self, address: usize, len: usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        self.card_owned.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
@@ -4775,15 +4790,28 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        if self.has_pending.load(Ordering::Acquire) {
-            let mut busy: Vec<(usize, usize)> = self
-                .pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .copied()
-                .filter(|&(a, e)| a < to && e > from)
-                .collect();
+        // Ranges the card keeps (`VICTORY_WC_NO_BACK`): left out where the
+        // write watch cannot say which pages the CPU wrote, so a whole copy
+        // would put the title's old bytes over what shaders wrote.
+        let owned: Vec<(usize, usize)> = if matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            Vec::new()
+        } else {
+            let owned = self.card_owned.lock().unwrap_or_else(|e| e.into_inner());
+            if owned.is_empty() { Vec::new() } else { owned.overlapping(from, to).collect() }
+        };
+        if self.has_pending.load(Ordering::Acquire) || !owned.is_empty() {
+            let mut busy: Vec<(usize, usize)> = if self.has_pending.load(Ordering::Acquire) {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .copied()
+                    .filter(|&(a, e)| a < to && e > from)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            busy.extend(owned);
             if !busy.is_empty() {
                 // Around ranges shaders are writing: the gaps, each as below
                 // (in the world most submissions have such ranges; copying the
