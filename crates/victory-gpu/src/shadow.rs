@@ -6705,6 +6705,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 /// and makes a new window without the lock (`VICTORY_LOOSE_UNLOCKED=1`, or
 /// named in `VICTORY_AB`; after Belobug PR #443). Unset: as before.
 fn loose_unlocked() -> bool {
+    #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_LOOSE_UNLOCKED") {
         return on;
     }

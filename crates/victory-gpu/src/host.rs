@@ -642,6 +642,7 @@ fn bury(finished: u64) {
 /// rest" of the landing's line), and the title is told that the card is
 /// done only by the next landing.
 fn bury_aside_on() -> bool {
+    #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_BURY_ASIDE") {
         return on;
     }
