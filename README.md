@@ -148,6 +148,31 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   to title memory (from fxceless and Geckomacabre, on by default here).
 - **Frame record and replay** with per-pass times and shader variants compared
   turn by turn ([docs/replay.md](docs/replay.md)).
+- **Series X can upscale with AMD FidelityFX on the host** (diagnostics build):
+  `VICTORY_UPSCALER=7` switches the title's upscaler to it and
+  `VICTORY_FFX_SCALE=<scale>` sets the render scale (`0.5` renders 1080p for a
+  4K output). Run with `--console series-x` and point `VICTORY_FIDELITYFX_DIR`
+  at the FidelityFX SDK's `Kits/FidelityFX/signedbin` folder.
+  Use `scripts/play.ps1 -Safe` and pass the FidelityFX switches with `-More`.
+  The default thin recording path can produce a black screen with host FSR.
+  At 4K output, set `VICTORY_FFX_SCALE` below `1.0` to avoid the title's
+  native-4K renderer startup failure.
+  The Series X patches, extra device feature answers and compiler-crash
+  guard take effect only after a host upscaler loads from that folder.
+  `VICTORY_FIDELITYFX_FRAMEGEN=1` adds AMD frame generation with the built-in
+  Frame Generation 3.x providers of `amd_fidelityfx_framegeneration_dx12.dll`
+  from the same folder (RGBA8 swap chains only).
+  `VICTORY_FRAMEGEN_HUDLESS=1` lets Series X FG3 use a copy of the scene
+  taken before the HUD blend, when the matched draw writes the displayed
+  texture. Use the normal HUD for this test.
+  Set `VICTORY_FRAMEGEN_ONLY_GENERATED=1` to inspect generated frames on screen.
+  Compare the same camera movement with frame generation off. Use a screen
+  recording for this comparison because VIctory's frame capture saves the game
+  image before AMD inserts frames.
+  With FG3, `VICTORY_AB=8,VICTORY_FRAMEGEN_HIDE_HUD` hides the candidate HUD
+  blend every other eight-second interval. Use the same camera turn in both
+  intervals to check whether hiding that draw removes the compass while
+  leaving the scene intact.
 
 ## Credits
 

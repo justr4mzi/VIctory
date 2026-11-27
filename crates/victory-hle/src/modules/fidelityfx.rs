@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use victory_gpu::object::Object;
 use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
 use windows::core::Interface;
 
 use crate::{HleModule, hle_export};
@@ -37,6 +38,7 @@ const OK: u32 = 0;
 const UNKNOWN_TYPE: u32 = 2;
 const NO_PROVIDER: u32 = 4;
 const PARAMETER: u32 = 6;
+const FFX_RGBA16_FLOAT: u32 = 4;
 
 // Description types.
 const CREATE_UPSCALE: u64 = 0x1_0000;
@@ -236,6 +238,16 @@ pub fn use_host_dir(dir: &Path) -> Result<(), String> {
     HOST.set(host)
         .map_err(|_| String::from("FidelityFX provider already initialized"))?;
     tracing::info!(folder = %dir.display(), version, "FidelityFX: selected PC upscaler");
+    victory_gpu::external::enable_host_fidelityfx();
+    #[cfg(feature = "diagnostics")]
+    if let Ok(mode) = std::env::var("VICTORY_FIDELITYFX_FRAMEGEN")
+        && matches!(mode.as_str(), "1" | "4")
+    {
+        match victory_gpu::external::use_frame_generation(dir, mode == "4") {
+            Ok(dll) => tracing::info!(dll, mode, "FidelityFX: frame generation on the title's upscaled frames"),
+            Err(why) => tracing::warn!("FidelityFX frame generation: {why}; off"),
+        }
+    }
     Ok(())
 }
 
@@ -650,6 +662,8 @@ fn record_dispatch(
     output_size: [u32; 2],
 ) -> u32 {
     let output = dispatch.resources[6].resource.cast::<Object>();
+    #[cfg(feature = "diagnostics")]
+    let title = *dispatch;
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
     let mut backing_extents = [None; 7];
@@ -698,6 +712,9 @@ fn record_dispatch(
             );
             return PARAMETER;
         }
+        if desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+            r.description[1] = FFX_RGBA16_FLOAT;
+        }
         r.resource = texture.as_raw();
         textures.push(texture);
     }
@@ -710,6 +727,12 @@ fn record_dispatch(
     let code = unsafe { (host.dispatch)(context, &raw mut dispatch.header) };
     if code == OK {
         victory_gpu::external::output_written(output);
+        #[cfg(feature = "diagnostics")]
+        list.frame_generation_inputs(
+            title.resources[1].resource.cast::<Object>(),
+            title.resources[2].resource.cast::<Object>(),
+            frame_inputs(&title, ctx.creation.description.flags),
+        );
         ctx.first_dispatch.call_once(|| {
             tracing::info!(render = ?dispatch.render_size, output = ?output_size, ?backing_extents,
                 jitter = ?dispatch.jitter, motion_vector_scale = ?dispatch.motion_scale,
@@ -723,6 +746,23 @@ fn record_dispatch(
         );
     }
     code
+}
+
+#[cfg(feature = "diagnostics")]
+fn frame_inputs(dispatch: &DispatchUpscale, flags: u32) -> victory_gpu::external::FrameInputs {
+    // The SDK tail starts with sharpening and ends with the dispatch flags.
+    let settings = &dispatch.settings;
+    victory_gpu::external::FrameInputs {
+        render: dispatch.render_size,
+        jitter: dispatch.jitter,
+        motion_scale: dispatch.motion_scale,
+        frame_time_ms: f32::from_bits(settings[2]),
+        reset: settings[4] & 0xff != 0,
+        camera: [settings[5], settings[6], settings[7], settings[8]].map(f32::from_bits),
+        flags,
+        depth_desc: dispatch.resources[1].description,
+        motion_desc: dispatch.resources[2].description,
+    }
 }
 
 pub(crate) fn module() -> HleModule {
@@ -742,6 +782,35 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn frame_generation_reads_the_upscales_constants() {
+        let mut resources = [Resource { resource: null_mut(), description: [0; 8], state: 0 }; 7];
+        resources[1].description[1] = 7;
+        resources[2].description[1] = 9;
+        let mut settings = [0; 10];
+        settings[2] = 33.3_f32.to_bits();
+        settings[4] = 1;
+        settings[5..9].copy_from_slice(&[0.1_f32, 1000.0, 1.2, 1.0].map(f32::to_bits));
+        let dispatch = DispatchUpscale {
+            header: Header { kind: DISPATCH_UPSCALE, next: null_mut() },
+            list: null_mut(),
+            resources,
+            jitter: [0.25, -0.5],
+            motion_scale: [1920.0, 1080.0],
+            render_size: [1920, 1080],
+            upscale_size: [3840, 2160],
+            settings,
+        };
+
+        let frame = frame_inputs(&dispatch, 0x29);
+        assert_eq!(frame.render, dispatch.render_size);
+        assert_eq!((frame.jitter, frame.motion_scale), (dispatch.jitter, dispatch.motion_scale));
+        assert_eq!((frame.frame_time_ms, frame.reset, frame.flags), (33.3, true, 0x29));
+        assert_eq!(frame.camera, [0.1, 1000.0, 1.2, 1.0]);
+        assert_eq!((frame.depth_desc[1], frame.motion_desc[1]), (7, 9));
+    }
 
     #[test]
     fn validates_logical_rectangles_against_the_current_context() {

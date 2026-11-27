@@ -58,6 +58,12 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let fsr = fsr_4k::FsrPreset::requested()?;
+    if fsr.is_none()
+        && let Some(dir) = cfg.fidelityfx_dir.as_deref()
+        && let Err(error) = victory_hle::modules::fidelityfx::use_host_dir(dir)
+    {
+        tracing::warn!(folder = %dir.display(), %error, "FidelityFX: using the title's upscaler");
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -232,14 +238,18 @@ pub fn run(
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
     // VICTORY_UPSCALER; each off without it). With a FidelityFX profile
     // (VICTORY_FSR_4K) the output size alone: the profile has its own scale
-    // and upscaler, written in the places the others change.
+    // and upscaler, written in the places the others change. When serving the
+    // host SDK under diagnostics without a profile, title_patch owns the paired
+    // picker and FFX scale patches.
     #[cfg(windows)]
     if execute {
         let size = image.info().size_of_image as usize;
+        let host_fidelityfx_patches = cfg!(feature = "diagnostics")
+            && victory_hle::modules::fidelityfx::serving();
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe {
             if fsr.is_none() {
-                victory_loader::resolution::apply_asked(image.base(), size);
+                victory_loader::resolution::apply_asked(image.base(), size, host_fidelityfx_patches);
             } else {
                 victory_loader::resolution::apply_output(image.base(), size);
             }
@@ -254,7 +264,7 @@ pub fn run(
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
-    diagnostics(&image, &cfg);
+    diagnostics(&image, &cfg, fsr.is_none())?;
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
@@ -276,10 +286,18 @@ pub fn run(
     Ok(())
 }
 
-/// The debugging aids (README): scheduled stack dumps, watched values and
-/// memory saved on a crash.
+/// The debugging aids (README): title code patches, scheduled stack dumps,
+/// watched values and memory saved on a crash. An error stops the launch.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
+fn diagnostics(
+    image: &victory_loader::LoadedImage,
+    cfg: &victory_core::Config,
+    patch_fidelityfx: bool,
+) -> Result<()> {
+    // First, before any thread started below can read or write the image.
+    if patch_fidelityfx && victory_hle::modules::fidelityfx::serving() {
+        crate::title_patch::apply(image)?;
+    }
     victory_loader::dump_stacks_on_schedule();
     victory_loader::profile_on_schedule(victory_hle::frame_phase);
     victory_hle::modules::audio::capture::start();
@@ -303,6 +321,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
             })
             .collect(),
     );
+    Ok(())
 }
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each

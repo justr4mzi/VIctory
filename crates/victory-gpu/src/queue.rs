@@ -1058,6 +1058,9 @@ extern "system" fn present(
             crate::resource::host_transition(over_res, over_state);
         }
         let _ = host;
+    } else {
+        #[cfg(feature = "diagnostics")]
+        let _ = crate::framegen::hudless::take(None);
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);

@@ -672,6 +672,9 @@ impl Work for Job {
                         (&ov.texture, st)
                     });
                     super::show_planes(&texture.texture, state, over, shown);
+                } else {
+                    #[cfg(feature = "diagnostics")]
+                    let _ = crate::framegen::hudless::take(None);
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }

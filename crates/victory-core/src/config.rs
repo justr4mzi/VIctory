@@ -15,7 +15,7 @@ use crate::policy::ensure_outside_repo;
 pub struct Config {
     /// The user's dump of the title.
     pub game_dir: Option<PathBuf>,
-    /// Folder containing the PC FidelityFX upscaler for the optional FSR profile.
+    /// Folder containing the PC FidelityFX upscaler for host FSR.
     pub fidelityfx_dir: Option<PathBuf>,
     /// Root for all derived data. Always outside the repository.
     pub cache_dir: PathBuf,
