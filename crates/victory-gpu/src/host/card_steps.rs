@@ -786,7 +786,12 @@ impl Taken {
         // The host copies its steps held go; its commands stay until the
         // next use resets it.
         drop(std::mem::take(&mut *self.own.list.deferred()));
-        POOL.lock().unwrap_or_else(|e| e.into_inner()).push(self.own);
+        // Each kept one holds a command allocator (`VICTORY_CARD_STEPS_POOL`,
+        // unset: no bound, as before; Belobug PR #620).
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool_most().is_none_or(|most| pool.len() < most) {
+            pool.push(self.own);
+        }
     }
 }
 
@@ -1588,4 +1593,10 @@ mod tests {
         eprintln!("settles for title memory under shader writes: {}", LATE_STATS[WHY_STALE].load(Ordering::Relaxed));
         assert!(done >= 20, "only {done} copies were done on the card");
     }
+}
+
+/// The most landed lists kept in [`POOL`] (`VICTORY_CARD_STEPS_POOL`).
+fn pool_most() -> Option<usize> {
+    static MOST: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_CARD_STEPS_POOL").ok().and_then(|v| v.trim().parse().ok()))
 }

@@ -397,12 +397,42 @@ pub(crate) fn recycle_landed(lists: Vec<Detached>, ran: &[usize]) {
     }
 }
 
+/// The most host lists kept idle (`VICTORY_IDLE_LISTS`, at most
+/// [`IDLE_MOST`]'s 512, the default). Each idle list holds a command
+/// allocator; AMD's driver removes the device at about 2,048 live ones on
+/// RDNA 2 (Belobug PR #620, RX 6750 XT). Too few and the lists the relay
+/// lands in a burst are made anew: 64 there cost half the frame, 256 held.
+#[cfg(windows)]
+fn idle_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_IDLE_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(IDLE_MOST.0).min(IDLE_MOST.0)
+    })
+}
+
+/// The most host lists alive before lists that have run are let go instead
+/// of kept, and the idle ones with them (`VICTORY_LIST_CEILING`; unset: no
+/// ceiling, as before). Belobug PR #620: about 1,260 alive in play on an
+/// RX 6750 XT; 900 made the layer remake ~200 lists a frame; 1,600 held.
+#[cfg(windows)]
+fn list_ceiling() -> Option<u64> {
+    static MOST: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_LIST_CEILING").ok().and_then(|v| v.trim().parse().ok()))
+}
+
 /// Resets the host lists that ran and keeps them for [`fresh_list`], up to
-/// [`IDLE_MOST`]; the others go.
+/// [`idle_most`]; the others go.
 #[cfg(windows)]
 fn keep_idle(hosts: impl Iterator<Item = crate::host::HostList>, ran: &[usize]) {
     for (i, host) in hosts.enumerate() {
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= idle_most() {
+            continue;
+        }
+        // Over the ceiling of live lists: this one goes, and the idle ones
+        // with it (each holds a command allocator).
+        if list_ceiling().is_some_and(|most| crate::host::ALIVE[0].load(std::sync::atomic::Ordering::Relaxed) > most) {
+            let spare = std::mem::take(&mut *IDLE.lock().unwrap_or_else(|e| e.into_inner()));
+            drop(spare);
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -410,7 +440,7 @@ fn keep_idle(hosts: impl Iterator<Item = crate::host::HostList>, ran: &[usize]) 
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < idle_most() && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
