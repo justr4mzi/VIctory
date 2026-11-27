@@ -6504,15 +6504,29 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    let unlocked = loose_unlocked();
     // The window is there already (nearly always): readers share the lock.
-    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+    // With `VICTORY_LOOSE_UNLOCKED` the window to take among those there
+    // (tails, a finer grid) is chosen under the shared lock too (Belobug PR
+    // #443: it was chosen only under the write lock, which every list thread
+    // then queued for, 16.5% of their time in a profile).
+    if unlocked || !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
+        let key = if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end)
+        } else if any && fine() && !unsized_ask {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            holder(there, address, end).or(Some(named))
+        } else {
+            Some(named)
+        };
+        if let Some(shadow) = key.and_then(|key| map.get(&key)) {
             note(shadow);
             return Some(shadow.clone());
         }
     }
-    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
@@ -6529,13 +6543,35 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(shadow);
         return Some(shadow.clone());
     }
+    // With `VICTORY_LOOSE_UNLOCKED` the window is made without the lock
+    // (driver calls: every reader queued behind them, 15.6% of the list
+    // threads in Belobug PR #443's profile) and put in after, unless another
+    // thread put the same one in meanwhile (ours is then dropped, its bytes
+    // given back by `Drop for Shadow`).
+    let mut held = Some(map);
+    if unlocked {
+        held = None;
+    }
+    let finish = |held: Option<std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, u64), Arc<Shadow>>>>,
+                  shadow: Arc<Shadow>|
+     -> Option<Arc<Shadow>> {
+        let mut map = held.unwrap_or_else(|| LOOSE.write().unwrap_or_else(|e| e.into_inner()));
+        if let Some(theirs) = map.get(&(start, len)) {
+            note(theirs);
+            return Some(theirs.clone());
+        }
+        if shadow.card.is_some() && shadow.window && !shadow.mapped {
+            register_card(&shadow);
+        }
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        Some(shadow)
+    };
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
+        return finish(held, shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
     if let Some((buffer, data)) = window_mapped_for(len) {
@@ -6545,10 +6581,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.window = true;
         shadow.mapped = true;
-        let shadow = Arc::new(shadow);
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
+        return finish(held, Arc::new(shadow));
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -6583,13 +6616,18 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
-    let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        register_card(&shadow);
+    finish(held, Arc::new(shadow))
+}
+
+/// Whether [`loose`] chooses among the windows there under the shared lock
+/// and makes a new window without the lock (`VICTORY_LOOSE_UNLOCKED=1`, or
+/// named in `VICTORY_AB`; after Belobug PR #443). Unset: as before.
+fn loose_unlocked() -> bool {
+    if let Some(on) = crate::ab::pick("VICTORY_LOOSE_UNLOCKED") {
+        return on;
     }
-    note(&shadow);
-    map.insert((start, len), shadow.clone());
-    Some(shadow)
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOSE_UNLOCKED").is_some_and(|v| v == "1"))
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
