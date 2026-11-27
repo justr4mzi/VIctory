@@ -1222,6 +1222,25 @@ fn windows_own() -> bool {
 }
 
 /// [`window_card_for`] in the card's own memory.
+/// The share of the card's budget, in percent, up to which windows go to
+/// the card's memory ([`window_room_for`]): 80 unless
+/// `VICTORY_CARD_WINDOWS_ROOM_PERCENT` says another (50 to 97). A window
+/// left in the PC's memory is read over the bus at every draw; on the
+/// Series X profile the card is past 80 % before most windows are asked for
+/// (textures take up to `VICTORY_TEXTURE_ROOM_PERCENT`), so a higher share
+/// here with a lower one there gives windows the room (leonidaavenger
+/// d1cbc37f: the card's lists 38.5 -> 34.2 ms, frame 43 -> 38 ms, with 94 /
+/// 85 and `VICTORY_CARD_WINDOWS_MB=2560`).
+fn window_card_room_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_CARD_WINDOWS_ROOM_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(80, |p| p.clamp(50, 97))
+    })
+}
+
 fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     let most = window_card_most();
     if most == 0 || !cards() {
@@ -1232,7 +1251,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_card_room_percent()
     {
         return None;
     }
