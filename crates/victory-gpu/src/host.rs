@@ -9900,6 +9900,14 @@ struct FramegenCounts {
     presents: u32,
 }
 
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy)]
+struct FramegenRates {
+    rendered: f64,
+    generated: f64,
+    presented: f64,
+}
+
 struct Meter {
     last_present: windows::core::HRESULT,
     since: std::time::Instant,
@@ -9908,6 +9916,8 @@ struct Meter {
     framegen_counts: Option<FramegenCounts>,
     #[cfg(feature = "diagnostics")]
     framegen_at_last_line: Option<FramegenCounts>,
+    #[cfg(feature = "diagnostics")]
+    framegen_rates: Option<FramegenRates>,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -9927,6 +9937,8 @@ impl Meter {
             framegen_counts: None,
             #[cfg(feature = "diagnostics")]
             framegen_at_last_line: None,
+            #[cfg(feature = "diagnostics")]
+            framegen_rates: None,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -9986,18 +9998,18 @@ impl Meter {
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
         #[cfg(feature = "diagnostics")]
-        let framegen_rates = {
+        {
             let previous = std::mem::replace(&mut self.framegen_at_last_line, self.framegen_counts);
-            previous.zip(self.framegen_counts).and_then(|(from, to)| {
+            self.framegen_rates = previous.zip(self.framegen_counts).and_then(|(from, to)| {
                 if from.generation != to.generation {
                     return None;
                 }
                 let seconds = elapsed.as_secs_f64();
                 let generated = to.generated.checked_sub(from.generated)? as f64 / seconds;
-                let presents = f64::from(to.presents.wrapping_sub(from.presents)) / seconds;
-                Some((generated, presents))
-            })
-        };
+                let presented = f64::from(to.presents.wrapping_sub(from.presents)) / seconds;
+                Some(FramegenRates { rendered: fps, generated, presented })
+            });
+        }
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
@@ -10270,9 +10282,9 @@ impl Meter {
         let Some(caption) = &self.caption else { return };
         let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         #[cfg(feature = "diagnostics")]
-        let text = if let Some((generated, presents)) = framegen_rates {
+        let text = if let Some(FramegenRates { rendered, generated, presented }) = self.framegen_rates {
             let frame = crate::frame::current();
-            format!("{text} | FG3 {fps:.1} FPS reels / {generated:.1} generes / {presents:.1} presentes (DXGI) [{frame}]")
+            format!("{text} | FG3 {rendered:.1} FPS reels / {generated:.1} generes / {presented:.1} presentes (DXGI) [{frame}]")
         } else {
             text
         };
@@ -10647,8 +10659,9 @@ impl Host {
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
-                p.panel.frame(p.meter.line_due());
-                if p.meter.line_due() {
+                let line_due = p.meter.line_due();
+                p.panel.frame(line_due, p.meter.framegen_rates);
+                if line_due {
                     p.meter.framegen_counts = p.framegen.as_ref().and_then(|fg| {
                         let (generation, generated) = fg.output_count()?;
                         let presents = p.swap_chain.GetLastPresentCount().ok()?;

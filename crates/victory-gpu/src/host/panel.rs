@@ -1,7 +1,6 @@
 //! Diagnostics: the run's numbers on the picture (`VICTORY_PANEL=1`; off by
-//! default; F3 shows and hides it while our window has the focus): white
-//! text on a black box in the upper left corner of what is shown, so that a
-//! screenshot carries them, with what it costs itself on the submitting
+//! default; F3 shows and hides it while our window has the focus): a compact
+//! panel in the upper left, with what it costs itself on the submitting
 //! thread. Made again twice a second from the counters of
 //! the frame-rate line, memory and textures; a frame itself only copies the
 //! box out of a buffer in the card's memory. Copied onto the swap chain's
@@ -17,7 +16,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::{Host, HostList, transition};
+use super::{FramegenRates, Host, HostList, transition};
 
 /// How often the numbers change.
 const EVERY: Duration = Duration::from_millis(500);
@@ -27,8 +26,8 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
-const LINES: u32 = 9;
-const RIM: u32 = 3;
+const LINES: u32 = 10;
+const RIM: u32 = 5;
 
 /// The texts are put into one of these in turn: the card reads the others,
 /// at most half a second old.
@@ -132,29 +131,37 @@ fn lit(lines: &[String], x: u32, y: u32) -> bool {
     (glyph(c.to_ascii_uppercase())[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
 }
 
-/// The bytes of a black and a white pixel of a swap chain's format.
-fn colours(format: DXGI_FORMAT) -> Option<[&'static [u8]; 2]> {
+/// Background, text and accent pixels in the swap chain's format.
+fn colours(format: DXGI_FORMAT) -> Option<[&'static [u8]; 3]> {
+    const RGB10_ACCENT: [u8; 4] = 0xFFFE_4D66u32.to_le_bytes();
     Some(match format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM => [&[0, 0, 0, 0xFF], &[0xFF; 4]],
-        DXGI_FORMAT_R10G10B10A2_UNORM => [&[0, 0, 0, 0xC0], &[0xFF; 4]],
-        // Halves of 0 and 1.
+        DXGI_FORMAT_R8G8B8A8_UNORM => [&[14, 22, 34, 255], &[232, 242, 252, 255], &[94, 228, 255, 255]],
+        DXGI_FORMAT_B8G8R8A8_UNORM => [&[34, 22, 14, 255], &[252, 242, 232, 255], &[255, 228, 94, 255]],
+        DXGI_FORMAT_R10G10B10A2_UNORM => [&[0, 0, 0, 0xC0], &[0xFF; 4], &RGB10_ACCENT],
+        // Halves: dark background, white text and a cyan accent.
         DXGI_FORMAT_R16G16B16A16_FLOAT => [
-            &[0, 0, 0, 0, 0, 0, 0, 0x3C],
+            &[0, 0x28, 0, 0x2C, 0, 0x30, 0, 0x3C],
             &[0, 0x3C, 0, 0x3C, 0, 0x3C, 0, 0x3C],
+            &[0, 0x36, 0, 0x3B, 0, 0x3C, 0, 0x3C],
         ],
         _ => return None,
     })
 }
 
 /// The box as rows of `pitch` bytes.
-fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
+fn painted(lines: &[String], scale: u32, colours: [&[u8]; 3], pitch: usize) -> Vec<u8> {
     let (width, height) = size(scale);
     let bytes = colours[0].len();
     let mut out = vec![0; pitch * height as usize];
     for y in 0..height / scale {
         let top = pitch * (y * scale) as usize;
         for x in 0..width / scale {
-            let colour = colours[usize::from(lit(lines, x, y))];
+            let colour = match (x < 2, lit(lines, x, y)) {
+                (true, _) => colours[2],
+                (false, true) if y < RIM + CELL.1 => colours[2],
+                (false, true) => colours[1],
+                (false, false) => colours[0],
+            };
             for i in 0..scale {
                 let at = top + (x * scale + i) as usize * bytes;
                 out[at..at + bytes].copy_from_slice(colour);
@@ -207,13 +214,17 @@ impl Counters {
 
 /// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
 /// longest frame's, `cost` what this takes of a frame, in microseconds.
-fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
+fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host, fg: Option<FramegenRates>) -> Vec<String> {
     let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
     let (working, private) = crate::copystat::process_memory();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
-    vec![
-        format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
+    let fps = fg.map_or_else(|| 1e3 / ms.max(0.001), |rates| rates.rendered);
+    let mut lines = vec![format!("{fps:.1} FPS REAL   {ms:.1} MS   MAX {worst:.0} MS")];
+    if let Some(rates) = fg {
+        lines.push(format!("FG3  {:.1} GEN  /  {:.1} FPS PRESENTED", rates.generated, rates.presented));
+    }
+    lines.extend([
         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
         format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
@@ -222,7 +233,8 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
         format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
         format!("THIS PANEL {:.0} US A FRAME", cost),
-    ]
+    ]);
+    lines
 }
 
 /// The buffers of a box that size and format.
@@ -315,7 +327,7 @@ impl Panel {
 
     /// A frame was presented; `line`: the counters go back to 0 right behind
     /// this call. (Not shown it asks for the key's state and no more.)
-    pub(super) fn frame(&mut self, line: bool) {
+    pub(super) fn frame(&mut self, line: bool, fg: Option<FramegenRates>) {
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
@@ -342,7 +354,7 @@ impl Panel {
         let c = counters.since(self.before, frames);
         self.before = counters;
         let cost = self.cost.as_secs_f64() * 1e6 / frames;
-        self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
+        self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host, fg);
         self.changed = true;
         (self.since, self.frames, self.worst) = (now, 0, 0.0);
         self.cost = now.elapsed();
@@ -417,7 +429,10 @@ impl Panel {
                 bottom: h.min(height),
                 back: 1,
             };
-            list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
+            let margin = 4 * scale;
+            let x = margin.min(width.saturating_sub(w));
+            let y = margin.min(height.saturating_sub(h));
+            list.CopyTextureRegion(&to, x, y, 0, &from, Some(&part));
         }
         self.cost += began.elapsed();
     }
@@ -451,10 +466,10 @@ mod tests {
             let picture = painted(&lines, scale, colours, pitch);
             assert_eq!(picture.len(), pitch * height as usize);
             let at = |x: u32, y: u32| &picture[y as usize * pitch + x as usize * 4..][..4];
-            // The rim is black, the first letter's top row lit in its middle.
-            assert_eq!(at(0, 0), colours[0]);
-            assert_eq!(at((RIM + 2) * scale, RIM * scale), colours[1]);
-            assert_eq!(at((RIM + 2) * scale + scale - 1, RIM * scale + scale - 1), colours[1]);
+            // The strip and first line use the accent; the inset is the background.
+            assert_eq!(at(0, 0), colours[2]);
+            assert_eq!(at((RIM + 2) * scale, RIM * scale), colours[2]);
+            assert_eq!(at((RIM + 2) * scale + scale - 1, RIM * scale + scale - 1), colours[2]);
             assert_eq!(at(RIM * scale, RIM * scale), colours[0]);
             // Small letters are shown as capitals, a line and a cell on.
             assert_eq!(at((RIM + CELL.0 + 2) * scale, (RIM + CELL.1) * scale), colours[1]);
