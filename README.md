@@ -98,7 +98,13 @@ For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
 `scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
 the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
 and `performance` selects 1920×1080. All three output 3840×2160. With
-`victory run` directly, set `VICTORY_FSR_4K` to the preset name.
+`victory run` directly, set `VICTORY_FSR_4K` to the preset name; `native`
+(not in the launcher) renders at the output's own size, FidelityFX as
+anti-aliasing. With `VICTORY_OUTPUT=<width>x<height>` beside it (one of the
+title's modes, as without a profile) that size is put out instead and the
+preset's share of it rendered: `VICTORY_OUTPUT=1920x1080` with `quality`
+renders 1280×720. `VICTORY_FSR_VERSION=<version>` asks the library for
+another upscaler than 4.1.2 (`4.1.1`, `3.1.5`: what it or the driver offers).
 The log reports the provider at context creation and the actual input and
 output sizes at the first successful temporal dispatch. The title profile
 and PC FidelityFX bridge were ported from [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).

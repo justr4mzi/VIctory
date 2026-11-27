@@ -1,4 +1,13 @@
 //! Series X SDR 4K profiles for the title's PC FidelityFX dispatch.
+//!
+//! `VICTORY_FSR_4K=<preset>` (read in [`FsrPreset::requested`]): `quality`,
+//! `balanced` or `performance`, the picture made at 2/3, 1/1.7 or half of the
+//! output's width and height; `native`, at the output's own size (FidelityFX
+//! as anti-aliasing: the SDK's mode 0, the scale the title's method has on
+//! Series X). The output is 3840x2160, or the title's mode `VICTORY_OUTPUT`
+//! names (`victory_loader::resolution`; `run.rs` applies it with a profile
+//! too): 1920x1080 on a monitor of that size, where 3840x2160 makes four
+//! times the pixels shown.
 use anyhow::{Context, Result, ensure};
 use victory_loader::PreparedImage;
 
@@ -8,6 +17,7 @@ const STOCK_SDR_MODE: [u8; 16] = [0, 15, 0, 0, 112, 8, 0, 0, 60, 0, 0, 0, 1, 0, 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FsrPreset {
+    Native,
     Quality,
     Balanced,
     Performance,
@@ -21,7 +31,7 @@ impl FsrPreset {
             Ok(name) => Self::from_name(&name.trim().to_ascii_lowercase())
                 .map(Some)
                 .with_context(|| {
-                    format!("VICTORY_FSR_4K={name}: expected quality, balanced, performance or 0")
+                    format!("VICTORY_FSR_4K={name}: expected native, quality, balanced, performance or 0")
                 }),
             Err(error) => Err(error.into()),
         }
@@ -29,6 +39,7 @@ impl FsrPreset {
 
     pub(super) fn from_name(name: &str) -> Option<Self> {
         match name {
+            "native" => Some(Self::Native),
             "quality" => Some(Self::Quality),
             "balanced" => Some(Self::Balanced),
             "performance" => Some(Self::Performance),
@@ -38,6 +49,7 @@ impl FsrPreset {
 
     pub(super) fn name(self) -> &'static str {
         match self {
+            Self::Native => "native",
             Self::Quality => "quality",
             Self::Balanced => "balanced",
             Self::Performance => "performance",
@@ -47,6 +59,7 @@ impl FsrPreset {
     // AMD SDK FFX_UPSCALE_QUALITY_MODE values and ratios.
     pub(super) fn mode(self) -> u8 {
         match self {
+            Self::Native => 0,
             Self::Quality => 1,
             Self::Balanced => 2,
             Self::Performance => 3,
@@ -55,18 +68,24 @@ impl FsrPreset {
 
     pub(super) fn render_scale(self) -> f32 {
         match self {
+            Self::Native => 1.0,
             Self::Quality => 2.0 / 3.0,
             Self::Balanced => 1.0 / 1.7,
             Self::Performance => 0.5,
         }
     }
 
-    pub(super) fn render_size(self) -> [u32; 2] {
-        [3840.0, 2160.0].map(|size| (size * self.render_scale()) as u32)
+    /// The size the picture is made at for `output`, as the title's method
+    /// works it out (single precision, cut off).
+    pub(super) fn render_size(self, output: [u32; 2]) -> [u32; 2] {
+        output.map(|size| (size as f32 * self.render_scale()) as u32)
     }
 }
 
-pub(super) fn prepare_fsr_4k(image: &mut PreparedImage, preset: FsrPreset) -> Result<()> {
+/// `output`: the size the title puts out (3840x2160 unless `VICTORY_OUTPUT`
+/// names another of its modes); only said in the log here, the title's
+/// method scales whatever output it is given.
+pub(super) fn prepare_fsr_4k(image: &mut PreparedImage, preset: FsrPreset, output: [u32; 2]) -> Result<()> {
     ensure!(
         image.original_hash.to_hex().as_str() == RETAIL_BUILD,
         "FSR at 4K is unavailable for this retail game build"
@@ -134,8 +153,8 @@ pub(super) fn prepare_fsr_4k(image: &mut PreparedImage, preset: FsrPreset) -> Re
         renderer = 7,
         preset = preset.name(),
         quality = preset.mode(),
-        expected_render = ?preset.render_size(),
-        output = ?[3840, 2160],
+        expected_render = ?preset.render_size(output),
+        ?output,
         "Selected Series X FSR with the stock 4K frontend"
     );
     Ok(())
@@ -165,6 +184,7 @@ mod tests {
         };
         let bytes = std::fs::read(path).unwrap();
         for (preset, size) in [
+            (FsrPreset::Native, [3840, 2160]),
             (FsrPreset::Quality, [2560, 1440]),
             (FsrPreset::Balanced, [2258, 1270]),
             (FsrPreset::Performance, [1920, 1080]),
@@ -172,7 +192,7 @@ mod tests {
             let mut image = victory_loader::prepare(&bytes).unwrap();
             let scanout = *field::<5>(&mut image, 0x0247_ad4a).unwrap();
             let settings = *field::<8>(&mut image, 0x0580_48d4).unwrap();
-            prepare_fsr_4k(&mut image, preset).unwrap();
+            prepare_fsr_4k(&mut image, preset, [3840, 2160]).unwrap();
             assert_eq!(*field::<16>(&mut image, SDR_MODE).unwrap(), STOCK_SDR_MODE);
             assert_eq!(*field::<5>(&mut image, 0x0247_ad4a).unwrap(), scanout);
             assert_eq!(*field::<8>(&mut image, 0x0580_48d4).unwrap(), settings);
@@ -184,11 +204,26 @@ mod tests {
                 *field::<4>(&mut image, 0x028e_f69b).unwrap(),
                 u32::from(preset.mode()).to_le_bytes()
             );
-            assert_eq!(preset.render_size(), size);
+            assert_eq!(preset.render_size([3840, 2160]), size);
             let disp = i32::from_le_bytes(*field::<4>(&mut image, 0x028e_f6b6).unwrap());
             let reference = 0x028e_f6ba_u32.wrapping_add_signed(disp);
             let scale = f32::from_le_bytes(*field::<4>(&mut image, reference).unwrap());
             assert_eq!([3840.0, 2160.0].map(|w| (w * scale) as u32), size);
         }
+    }
+
+    #[test]
+    fn a_preset_scales_the_output_it_is_given() {
+        for (preset, size) in [
+            (FsrPreset::Native, [1920, 1080]),
+            (FsrPreset::Quality, [1280, 720]),
+            (FsrPreset::Balanced, [1129, 635]),
+            (FsrPreset::Performance, [960, 540]),
+        ] {
+            assert_eq!(preset.render_size([1920, 1080]), size);
+            assert_eq!(FsrPreset::from_name(preset.name()), Some(preset));
+        }
+        assert_eq!(FsrPreset::Quality.render_size([3840, 2160]), [2560, 1440]);
+        assert_eq!(FsrPreset::from_name("ultra"), None);
     }
 }

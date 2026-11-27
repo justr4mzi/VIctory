@@ -293,8 +293,18 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
     Ok((host, version))
 }
 
+/// The upscaler version asked of the PC library: 4.1.2, or what
+/// `VICTORY_FSR_VERSION` says (read here; `4.1.1`, `3.1.5`: a library or a
+/// driver that offers another one, as Proton's does on Linux, where the FSR 4
+/// it serves is the one in its `amdxcffx64.dll`: "4.1.1 *, 3.1.5, 2.3.4" on an
+/// RX 7900 GRE there, and the title ended at once for want of 4.1.2).
+fn wanted_version() -> &'static str {
+    static WANTED: OnceLock<String> = OnceLock::new();
+    WANTED.get_or_init(|| std::env::var("VICTORY_FSR_VERSION").ok().filter(|v| !v.trim().is_empty()).map_or_else(|| "4.1.2".to_owned(), |v| v.trim().to_owned()))
+}
+
 fn is_fsr_4_1_2(name: &str) -> bool {
-    name.strip_prefix("4.1.2")
+    name.strip_prefix(wanted_version())
         .is_some_and(|suffix| !suffix.starts_with(|c: char| c.is_ascii_digit()))
 }
 
@@ -344,7 +354,8 @@ fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String)
         }
     }
     Err(format!(
-        "no FSR 4.1.2 provider for this adapter (available: {})",
+        "no FSR {} provider for this adapter (available: {}; VICTORY_FSR_VERSION asks for another)",
+        wanted_version(),
         available.join(", ")
     ))
 }

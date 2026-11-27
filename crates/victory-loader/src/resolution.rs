@@ -300,6 +300,29 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 /// code yet.
 #[cfg(windows)]
 pub unsafe fn apply_asked(base: usize, size: usize) {
+    // SAFETY: the caller's promise.
+    unsafe { apply(base, size, true) }
+}
+
+/// Applies `VICTORY_OUTPUT` alone: for a run whose render scale and upscaler
+/// are a FidelityFX profile's (`VICTORY_FSR_4K`, which changes bytes inside
+/// [`FFX_SCALE`] and [`PICKER`] in the title's file before it is loaded).
+///
+/// # Safety
+/// As [`apply_asked`].
+#[cfg(windows)]
+pub unsafe fn apply_output(base: usize, size: usize) {
+    // SAFETY: the caller's promise.
+    unsafe { apply(base, size, false) }
+}
+
+/// `scale_and_upscaler`: whether `VICTORY_RENDER_SCALE`, `VICTORY_FFX_SCALE`
+/// and `VICTORY_UPSCALER` are applied too.
+///
+/// # Safety
+/// As [`apply_asked`].
+#[cfg(windows)]
+unsafe fn apply(base: usize, size: usize, scale_and_upscaler: bool) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
         asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
@@ -313,14 +336,16 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
             asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
         }
     }
-    if let Some(s) = asked_render_scale() {
-        asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
-    }
-    if let Some(s) = asked_ffx_scale() {
-        asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
-    }
-    if let Some(kind) = asked_upscaler() {
-        asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
+    if scale_and_upscaler {
+        if let Some(s) = asked_render_scale() {
+            asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
+        }
+        if let Some(s) = asked_ffx_scale() {
+            asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
+        }
+        if let Some(kind) = asked_upscaler() {
+            asked.push((&PICKER, picker_code(kind), format!("returns {kind}")));
+        }
     }
     for (site, code, value) in asked {
         // SAFETY: the caller's promise.
