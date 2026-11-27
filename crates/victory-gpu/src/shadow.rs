@@ -3382,6 +3382,12 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if crate::census::on() {
+            let owned = self.card_owned.get_mut().unwrap_or_else(|e| e.into_inner());
+            for (from, to) in owned.iter() {
+                crate::census::forget(from, to);
+            }
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -3889,6 +3895,12 @@ impl Shadow {
     /// every refresh then copies its whole range.
     pub(crate) fn unwatched(&self) -> bool {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
+    }
+
+    /// Whether the memory behind the copy is write-watched, by the kernel
+    /// or the guards, as of its last refresh (not before the first).
+    pub(crate) fn watched_known(&self) -> bool {
+        matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED)
     }
 
     /// Whether a submission asks the kernel about the copy's ranges ahead:
@@ -4773,13 +4785,29 @@ impl Shadow {
     pub(crate) fn card_owns(&self, address: usize, len: usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return;
+        }
         self.card_owned.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+        crate::census::note(from, to);
+        // Title memory there holds older bytes than the card: a refresh of a
+        // part the CPU wrote sends up only the dwords it changed, not the
+        // part whole over what shaders wrote beside them ([`send_changed`]:
+        // the CPU's side holds what title memory held, as nothing comes back).
+        if self.card.is_some() {
+            if crate::wc::keep_stores() {
+                self.keep_stores();
+            }
+        } else {
+            crate::wc::uncarded((to - from) as u64);
+        }
     }
 
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let _census = crate::census::tag();
         self.note_access();
         // In place: the card reads title memory itself.
         if self.place.is_some() {
@@ -4799,6 +4827,12 @@ impl Shadow {
             let owned = self.card_owned.lock().unwrap_or_else(|e| e.into_inner());
             if owned.is_empty() { Vec::new() } else { owned.overlapping(from, to).collect() }
         };
+        if !owned.is_empty() {
+            let left: usize = owned.iter().map(|&(a, e)| e.min(to) - a.max(from)).sum();
+            if left != 0 {
+                crate::wc::unwatched(left as u64);
+            }
+        }
         if self.has_pending.load(Ordering::Acquire) || !owned.is_empty() {
             let mut busy: Vec<(usize, usize)> = if self.has_pending.load(Ordering::Acquire) {
                 self.pending
@@ -5181,6 +5215,7 @@ impl Shadow {
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
+        let _census = crate::census::tag();
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).

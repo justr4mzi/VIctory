@@ -6281,7 +6281,7 @@ impl Host {
         // (`VICTORY_WC_NO_BACK`), as with `HostList::defer_gpu_write`.
         if crate::wc::no_back() {
             picked.written.retain(|(shadow, at, len)| {
-                let keep = !crate::wc::skip_back(*at, *len);
+                let keep = !crate::wc::skip_back(*at, *len, shadow.carded(), shadow.watched_known());
                 if !keep {
                     shadow.card_owns(*at, *len);
                 }
@@ -7663,7 +7663,7 @@ impl HostList {
     ) {
         // Into write-combined title memory: the card keeps it, nothing is
         // declared (`VICTORY_WC_NO_BACK`).
-        if crate::wc::skip_back(address, len) {
+        if crate::wc::skip_back(address, len, shadow.carded(), shadow.watched_known()) {
             shadow.card_owns(address, len);
             return;
         }
@@ -9395,6 +9395,7 @@ fn texture_threads() -> bool {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    let _census = crate::census::tag();
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -9526,6 +9527,7 @@ fn zero(to: *mut u8, n: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    let _census = crate::census::tag();
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
@@ -10026,6 +10028,7 @@ impl Meter {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
             });
             let wc_sample = crate::wc::take(frames);
+            crate::census::arm();
             let dropped = crate::draw::take_dropped() as f64 / frames;
             let indirect = crate::list::take_indirect() as f64 / frames;
             let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -10209,6 +10212,7 @@ impl Meter {
                     );
                 }
                 crate::wc::log(wc_sample);
+                crate::census::log();
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                      {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
