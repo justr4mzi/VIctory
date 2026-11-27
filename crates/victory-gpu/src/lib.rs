@@ -60,6 +60,7 @@ mod port;
 mod port_cbv;
 #[cfg(windows)]
 pub mod port_descriptors;
+pub mod port_waits;
 #[cfg(windows)]
 mod port_journal;
 #[cfg(windows)]

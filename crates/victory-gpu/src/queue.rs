@@ -864,6 +864,19 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        // Renderer port #8 (`VICTORY_PORT_WAITS=1`): a title thread may sleep
+        // on this word's address (`crate::port_waits`) until it is stored.
+        #[cfg(windows)]
+        if crate::port_waits::on() {
+            let word = at as usize & !7;
+            // SAFETY: wakes whoever waits on these addresses; no memory read.
+            unsafe {
+                windows_sys::Win32::System::Threading::WakeByAddressAll(word as *const _);
+                if word != at as usize {
+                    windows_sys::Win32::System::Threading::WakeByAddressAll(at as *const _);
+                }
+            }
+        }
     }
 }
 

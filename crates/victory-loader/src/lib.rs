@@ -27,6 +27,8 @@ mod crash;
 #[cfg(windows)]
 pub mod descriptor_sites;
 pub mod frame_rate;
+#[cfg(windows)]
+pub mod wait_sites;
 mod movies;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod patch;
