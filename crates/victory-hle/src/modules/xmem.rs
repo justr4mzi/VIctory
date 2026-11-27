@@ -323,6 +323,45 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 }
 
 /// The system allocator behind [`XMemAlloc`].
+/// The allocator id (bits 16-23) of graphics memory: what committed
+/// resources ask for (`victory_gpu::resource`).
+const D3D_ALLOCATOR: u64 = 128;
+/// Graphics blocks from this size up get a write-watched reservation of
+/// their own ([`graphics_block`]).
+const WATCHED_FROM: usize = 64 << 10;
+/// The blocks [`graphics_block`] reserved, for [`XMemFreeDefault`].
+static WATCHED: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether [`graphics_block`] is used (`VICTORY_GRAPHICS_WATCHED=1`; unset:
+/// every block from the host heap, as before).
+fn graphics_watched() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GRAPHICS_WATCHED").is_some_and(|v| v == "1"))
+}
+
+/// Graphics memory of 64 KiB or more (committed resources): a reservation of
+/// its own from [`XMemVirtualAlloc`], write-watched as the runtime's memory
+/// is, so that the GPU side copies only the pages the title wrote since its
+/// last copy. From the host heap it is memory the GPU side cannot watch,
+/// copied whole at every submission that uses it (port of Belobug PR #503 /
+/// Marvisak/VIctory#3053). `None` for other blocks, an alignment past what a
+/// reservation gives, or a refusal: they come from the host heap.
+fn graphics_block(size: usize, attributes: u64) -> Option<*mut c_void> {
+    if !graphics_watched() {
+        return None;
+    }
+    let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f).max(4);
+    if attributes >> 16 & 0xff != D3D_ALLOCATOR || size < WATCHED_FROM || align > WATCHED_FROM {
+        return None;
+    }
+    let at = XMemVirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE | MEM_COMMIT, GRAPHICS, PAGE_READWRITE);
+    if at.is_null() {
+        return None;
+    }
+    WATCHED.lock().unwrap_or_else(|e| e.into_inner()).insert(at as usize);
+    Some(at)
+}
+
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
         return XMemVirtualAlloc(
@@ -332,6 +371,9 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
         );
+    }
+    if let Some(block) = graphics_block(size, attributes) {
+        return block;
     }
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
@@ -362,10 +404,11 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
         return;
     }
+    let watched = graphics_watched() && WATCHED.lock().unwrap_or_else(|e| e.into_inner()).remove(&(address as usize));
     // SAFETY: the address came from `XMemAlloc` with these attributes: a
     // whole reservation, or a header-prefixed block.
     unsafe {
-        if attributes & ALLOC_32BIT != 0 {
+        if attributes & ALLOC_32BIT != 0 || watched {
             victory_gpu::title_memory_freed(address as usize, 0);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
