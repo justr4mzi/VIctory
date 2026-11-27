@@ -300,8 +300,8 @@ fn back_list(kind: u32) -> This {
 }
 
 fn start() {
-    let cpus = std::thread::available_parallelism().map_or(6, |n| n.get());
-    let default_threads = (cpus / 2).clamp(4, 8);
+    let cpus = std::thread::available_parallelism().map_or(8, |n| n.get());
+    let default_threads = (cpus / 4).clamp(2, 8);
     let threads = std::env::var("VICTORY_THIN_THREADS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
