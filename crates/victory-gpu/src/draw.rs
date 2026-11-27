@@ -303,6 +303,52 @@ const WINDOW_MOST: u64 = 64;
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
+fn port_constants_order() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_PORT_CONSTANTS_ORDER") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_CONSTANTS_ORDER").is_none_or(|v| v != "0"))
+}
+
+fn port_constants_order_alone() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_PORT_CONSTANTS_ORDER_ALONE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_CONSTANTS_ORDER_ALONE").is_some_and(|v| v == "1"))
+}
+
+/// Maximum run of ordered, single-record executions in the same clamp pass.
+fn port_constants_order_batch() -> Option<u32> {
+    let most = order_batch_limit();
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_PORT_CONSTANTS_ORDER_BATCH") {
+        return on.then(|| most.unwrap_or(u32::MAX));
+    }
+    most
+}
+
+fn order_batch_limit() -> Option<u32> {
+    static MOST: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| match std::env::var("VICTORY_PORT_CONSTANTS_ORDER_BATCH").as_deref() {
+        Ok("1") => Some(u32::MAX),
+        Ok(value) => value.parse::<u32>().ok().filter(|&n| n >= 2),
+        Err(_) => None,
+    })
+}
+
+/// A/B may reenable batching between commands on the same list.
+pub(crate) fn tracks_ordered_batches() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::bit("VICTORY_PORT_CONSTANTS_ORDER_BATCH").is_some() {
+        return true;
+    }
+    order_batch_limit().is_some()
+}
+
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
@@ -351,6 +397,7 @@ struct Batch {
     /// Dispatches since, which may have written arguments
     /// (`VICTORY_INDIRECT_BATCH=2`).
     wrote: bool,
+    ordered: Option<(u64, u32)>,
 }
 
 /// The host copies arguments were read from last: what a batch opens with,
@@ -425,7 +472,7 @@ pub(crate) struct State {
     host_heaps_set: bool,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    fresh_tables: std::collections::HashMap<(u64, u32, u64, bool), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -612,6 +659,7 @@ fn sweep_per_heap() -> bool {
 pub(crate) struct BufferSweep {
     passes: u64,
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
+    records: std::collections::HashMap<u32, [u32; 3]>,
     // Per-part (`slot % HEAP_ROUND`) cached spans and view counts, so each
     // frame does not rescan every slot in `ranges`.
     part_spans: [crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>; HEAP_ROUND as usize],
@@ -626,6 +674,7 @@ impl Default for BufferSweep {
         Self {
             passes: 0,
             ranges: HeapRanges(Vec::new()),
+            records: Default::default(),
             part_spans: std::array::from_fn(|_| Default::default()),
             part_views: [0; HEAP_ROUND as usize],
             dirty_parts: 0,
@@ -637,6 +686,7 @@ impl Default for BufferSweep {
 impl BufferSweep {
     fn clear_all(&mut self) {
         self.ranges.0.clear();
+        self.records.clear();
         for spans in &mut self.part_spans {
             spans.clear();
         }
@@ -646,6 +696,7 @@ impl BufferSweep {
 
     fn forget_part(&mut self, part: u32) {
         self.ranges.forget_part(part, HEAP_ROUND as u32);
+        self.records.retain(|slot, _| slot % HEAP_ROUND as u32 != part);
         let p = part as usize;
         self.part_spans[p].clear();
         self.part_views[p] = 0;
@@ -974,7 +1025,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
     let changed = host.buffer_changes();
     let all = kept.passes == 0 || (kept.passes % HEAP_ROUND == 0 && !heap_spread());
-    let slots = if all {
+    let mut slots = if all {
         kept.clear_all();
         host.buffer_slots()
     } else if heap_spread() {
@@ -992,6 +1043,18 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     } else {
         changed
     };
+    let fast = record_fast() && !crate::picked::on();
+    if fast {
+        slots.retain(|&index| {
+            let Some(&record) = kept.records.get(&index) else { return true };
+            host.copied_tabled(index, frame)
+                || heap.handle(index).and_then(crate::descriptor::record_at) != Some(record)
+                || !host.mirrors_record(index, record)
+                || !crate::descriptor::record_entry_alive(record)
+        });
+    } else {
+        kept.records.clear();
+    }
     kept.passes += 1;
     // Whether the device was there before the pass: a view that removes
     // it is named below.
@@ -1016,7 +1079,9 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         if host.copied_tabled(index, frame) {
             return None;
         }
-        let view = host.mirror(index, heap.handle(index)?, true)?;
+        let handle = heap.handle(index)?;
+        let before = if fast { crate::descriptor::record_at(handle) } else { None };
+        let view = host.mirror(index, handle, true)?;
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
         let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
@@ -1025,7 +1090,10 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
         }
         let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
-        Some(((shadow, address, address + len), written))
+        let record = before.filter(|record| {
+            crate::descriptor::record_at(handle) == Some(*record) && host.mirrors_record(index, *record)
+        });
+        Some(((shadow, address, address + len), written, record))
     };
     // Some slots at a time, on several threads.
     const AT_A_TIME: usize = 256;
@@ -1049,7 +1117,13 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         let _ = found[n].set(looked);
     });
     for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
-        let range = shows.map(|(range, written)| {
+        let record = shows.as_ref().and_then(|(_, _, record)| *record);
+        if let Some(record) = record {
+            kept.records.insert(index, record);
+        } else if fast {
+            kept.records.remove(&index);
+        }
+        let range = shows.map(|(range, written, _)| {
             if written {
                 unordered.push(range.clone());
             }
@@ -2912,6 +2986,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        self.other_work();
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -3391,6 +3466,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        self.other_work();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -3644,6 +3720,8 @@ impl State {
             );
             selected.sort_unstable();
             selected.dedup();
+            let named_only = table_named_only();
+            let named = |k| group.entry(k).is_some() || selected.binary_search(&k).is_ok();
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
@@ -3656,7 +3734,13 @@ impl State {
             let key = {
                 let mut h = RecordHash::default();
                 for k in 0..n {
+                    if named_only && !named(k) {
+                        continue;
+                    }
                     let at = table + u64::from(k) * 32;
+                    if named_only {
+                        h.add([u32::MAX, k, 0]);
+                    }
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
                     // (Another table than the same slots made for a shader
@@ -3665,7 +3749,7 @@ impl State {
                         h.add([u32::MAX, k, 0x4841_4c46]);
                     }
                 }
-                (table, n, h.0)
+                (table, n, h.0, named_only)
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
@@ -3736,7 +3820,7 @@ impl State {
             // which may lie over slots shaders pick by index, only the ones
             // the shader names.)
             if let Some(title) = title_first {
-                for k in (0..n).filter(|&k| n <= 64 || group.entry(k).is_some()) {
+                for k in (0..n).filter(|&k| if named_only { named(k) } else { n <= 64 || group.entry(k).is_some() }) {
                     host.slot_tabled(title + k);
                 }
             }
@@ -3750,6 +3834,10 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                if named_only && !named(k) {
+                    host.make_null(index);
+                    continue;
+                }
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
@@ -3964,6 +4052,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        self.other_work();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -4089,6 +4178,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        self.other_work();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -4147,8 +4237,16 @@ impl State {
         self.batch = None;
     }
 
+    /// A copy, clear or other command breaks a run of ordered indirect executions.
+    pub(crate) fn other_work(&mut self) {
+        if let Some(batch) = &mut self.batch {
+            batch.ordered = None;
+        }
+    }
+
     /// The title waits for earlier work (a barrier or a pipeline sync).
     pub(crate) fn synced(&mut self) {
+        self.other_work();
         if self.batch.as_ref().is_some_and(|b| b.wrote) {
             self.batch = None;
         }
@@ -4163,7 +4261,7 @@ impl State {
         args: &std::sync::Arc<crate::shadow::Shadow>,
         arguments: u64,
         kind: u32,
-    ) -> Option<(ID3D12Resource, u64)> {
+    ) -> Option<(ID3D12Resource, u64, u32)> {
         const BATCH_USE: usize = usize::MAX - 0x78;
         const DISPATCH: u32 = 2;
         // Another host list, or this one after its reset ([`windows`]).
@@ -4171,22 +4269,23 @@ impl State {
             self.batch = None;
         }
         // A draw after dispatches waits for them.
-        if kind != DISPATCH {
-            self.synced();
+        if kind != DISPATCH && self.batch.as_ref().is_some_and(|b| b.wrote) {
+            self.batch = None;
         }
         let (id, offset) = (args.id(), args.offset(arguments));
         if let Some(b) = &mut self.batch
             && let Some(at) = b.table.place(id, offset, kind)
         {
-            return Some((b.scratch.clone(), at));
+            let members = b.ordered.take().map_or(1, |(_, n)| n + 1);
+            return Some((b.scratch.clone(), at, members));
         }
         self.batch = None;
         let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let at = table.place(id, offset, kind)?;
-        self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
-        Some((scratch, at))
+        self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false, ordered: None });
+        Some((scratch, at, 1))
     }
 
     /// Indirect execution of a one-argument signature of `kind` (PC
@@ -4202,6 +4301,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        let previous = self.batch.as_mut().and_then(|batch| batch.ordered.take());
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -4280,14 +4380,28 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // In-place arguments can be written by an earlier dispatch in the same list.
+        // Never reuse a window or a batch that precedes a possible write.
+        let ordered = port_constants_order() && (args.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place()));
+        let order_batch = ordered.then(port_constants_order_batch).flatten();
+        let run = order_batch.is_some();
+        let alone = ordered && !run && port_constants_order_alone();
+        let same_run = previous.zip(order_batch).is_some_and(|((epoch, n), limit)| epoch == list.epoch() && n < limit);
+        if alone || run && !same_run || ordered && self.batch.as_ref().is_some_and(|batch| batch.wrote) {
+            self.batch = None;
+        } else if run && let Some(batch) = &mut self.batch {
+            batch.ordered = previous;
+        }
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
+            self.other_work();
             None
         };
-        if batch.is_some() {
+        let members = batch.as_ref().map(|(_, _, members)| *members);
+        if members.is_some() {
             self.window = None;
         }
         // A window of records clamped in one pass (`windows`): for single
@@ -4296,7 +4410,7 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
+        let windowed = !ordered && windows()
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -4313,7 +4427,7 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
-        let (bounded, at) = match batch.or(hit) {
+        let (bounded, at) = match batch.map(|(buffer, offset, _)| (buffer, offset)).or(hit) {
             Some(hit) => hit,
             None => {
                 // A record a short step after the last window's last one
@@ -4409,6 +4523,13 @@ impl State {
             self.buffers_written();
         } else {
             self.drew(list, Some(p));
+        }
+        if run && kind != DISPATCH
+            && let Some(members) = members
+            && let Some(batch) = &mut self.batch
+            && !p.stages.iter().any(|stage| stage.translated().stores || stage.shader.probe.is_some())
+        {
+            batch.ordered = Some((list.epoch(), members));
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
@@ -4596,7 +4717,34 @@ struct FreshTable {
 /// since, is left as it is (`VICTORY_READY_ONCE=0`: every entry is gone
 /// through again at every draw).
 fn ready_once() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TABLE_MEMO") {
+        return on;
+    }
+    static MEMO: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    if let Some(on) = *MEMO.get_or_init(|| std::env::var_os("VICTORY_TABLE_MEMO").map(|v| v == "1")) {
+        return on;
+    }
     crate::toggled!("VICTORY_READY_ONCE")
+}
+
+fn record_fast() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HEAP_RECORD_FAST") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECORD_FAST").is_some_and(|v| v == "1"))
+}
+
+/// Experiment: omit descriptors outside the declared and resolved shader entries.
+fn table_named_only() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TABLE_NAMED_ONLY") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_NAMED_ONLY").is_some_and(|v| v == "1"))
 }
 
 /// A hash of records' words: 64 bits, two multiplications a record. (The

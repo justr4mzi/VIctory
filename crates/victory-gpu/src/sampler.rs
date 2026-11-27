@@ -147,6 +147,20 @@ pub(crate) fn console(words: &[u32; 27], aniso_point_mip: bool) -> D3D12_SAMPLER
     .host(aniso_point_mip)
 }
 
+pub(crate) fn apply_low_graphics(desc: &mut D3D12_SAMPLER_DESC) {
+    if !crate::pipeline::low_graphics() || desc.Filter.0 >> 7 != 0 {
+        return;
+    }
+    let filter = desc.Filter.0;
+    if matches!(filter, 0x54 | 0x55) {
+        desc.Filter = D3D12_FILTER(filter & !0x40);
+        desc.MaxAnisotropy = 1;
+    }
+    if filter != 0 && desc.MaxLOD > desc.MinLOD {
+        desc.MipLODBias = (desc.MipLODBias + 1.5).clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

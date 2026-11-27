@@ -468,6 +468,7 @@ pub(crate) struct Presentation {
     next_id: u64,
     continuous: u64,
     last_frame: u64,
+    generation: u64,
     base_presents: u32,
     logged: bool,
     only_generated: bool,
@@ -546,6 +547,7 @@ impl Presentation {
                 next_id: 0,
                 continuous: 0,
                 last_frame: 0,
+                generation: 0,
                 base_presents: 0,
                 logged: false,
                 only_generated,
@@ -715,6 +717,7 @@ impl Presentation {
             return;
         }
         self.generator = None;
+        self.generation += 1;
         self.key = Some(key);
         self.next_id = 0;
         self.continuous = 0;
@@ -772,6 +775,12 @@ impl Presentation {
             );
             self.logged = true;
         }
+    }
+
+    /// The current generator and its successful output count.
+    pub(crate) fn output_count(&self) -> Option<(u64, u64)> {
+        let generator = self.generator.as_ref().filter(|_| self.armed)?;
+        Some((self.generation, generator.generated.load(Ordering::Relaxed)))
     }
 }
 

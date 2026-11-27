@@ -283,6 +283,36 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
+#[cfg(windows)]
+fn pool_on_create() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_LIST_CREATE_POOL") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_CREATE_POOL").is_none_or(|v| v != "0"))
+}
+
+#[cfg(windows)]
+#[track_caller]
+fn new_host_list() -> Option<crate::host::HostList> {
+    match crate::host::host()?.new_list() {
+        Ok(list) => Some(list),
+        Err(e) => {
+            tracing::warn!(error = %e, "no host command list");
+            None
+        }
+    }
+}
+
+/// Break an ordered indirect batch before another command can change its inputs.
+#[cfg(windows)]
+fn break_ordered_batch(this: This) {
+    if crate::draw::tracks_ordered_batches() {
+        with_state(this, |_, state| state.other_work());
+    }
+}
+
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
@@ -297,7 +327,7 @@ fn fresh_list() -> Option<crate::host::HostList> {
     };
     match idle {
         Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        None => new_host_list(),
     }
 }
 
@@ -699,13 +729,10 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        // Thin replay materialization also creates this box. Taking a list
+        // already reset after GPU completion preserves its private budget
+        // and allocators instead of bypassing the idle pool every replay.
+        host: if thin { None } else if pool_on_create() { fresh_list() } else { new_host_list() },
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
@@ -819,12 +846,17 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
             let (texture, before) = list.transition(b.first, wanted)?;
+            let before_legal = crate::host::legal_state(texture, before);
+            let after_legal = crate::host::legal_state(texture, wanted);
+            if before_legal == after_legal {
+                return None;
+            }
             Some(Barrier {
                 kind: 0,
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
-                second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                second: 0xffff_ffff | (u64::from(before_legal) << 32),
+                last: u64::from(after_legal),
             })
         }
         1 => Some(Barrier {
@@ -965,6 +997,8 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    break_ordered_batch(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
@@ -998,6 +1032,7 @@ pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic:
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
+        break_ordered_batch(this);
         let Some(list) = host_list(this) else {
             return;
         };
@@ -1088,6 +1123,8 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(windows)]
+    break_ordered_batch(this);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1377,6 +1414,8 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
+    break_ordered_batch(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let () = {
             crate::resource::ensure_unclamped(dst);
@@ -1457,6 +1496,8 @@ extern "system" fn clear_rtv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    break_ordered_batch(this);
+    #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
@@ -1507,6 +1548,8 @@ extern "system" fn clear_dsv(
     rects: *const Rect,
 ) {
     #[cfg(windows)]
+    break_ordered_batch(this);
+    #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
@@ -1555,6 +1598,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
             with_state(this, |_, state| state.copied());
             return;
         }
+        break_ordered_batch(this);
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
@@ -1624,6 +1668,8 @@ extern "system" fn resolve_queries(
     if end > size {
         return;
     }
+    #[cfg(windows)]
+    break_ordered_batch(this);
     for i in 0..u64::from(count) {
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
@@ -2194,6 +2240,8 @@ pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
 }
 
 fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
+    #[cfg(windows)]
+    break_ordered_batch(this);
     let wait = ValueWait {
         address,
         comparison,
@@ -2271,10 +2319,14 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+    #[cfg(windows)]
+    break_ordered_batch(this);
     defer_write(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
 }
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+    #[cfg(windows)]
+    break_ordered_batch(this);
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
@@ -2482,6 +2534,9 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 static THIN_FUNCTIONS: Table<160> = Table(thin::table(false));
 #[cfg(windows)]
 static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
+
+#[cfg(all(test, windows))]
+mod factory_pool_tests;
 
 #[cfg(test)]
 mod tests {

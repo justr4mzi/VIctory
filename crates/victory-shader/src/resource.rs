@@ -97,6 +97,15 @@ pub enum Source {
 }
 
 impl Source {
+    /// Whether different lanes can produce different descriptors.
+    fn varies_by_lane(&self) -> bool {
+        match self {
+            Self::Fetched { .. } | Self::Lanes { .. } | Self::LanePhi { .. } => true,
+            Self::Phi { args, .. } | Self::Select { args, .. } => args.iter().any(Self::varies_by_lane),
+            _ => false,
+        }
+    }
+
     /// The sources this one picks from (itself unless a phi).
     pub fn leaves(&self) -> Vec<&Source> {
         match self {
@@ -1113,12 +1122,13 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The words of the descriptor operand `op` of `inst` that tracing
+    /// follows.
+    fn words(&self, inst: &Inst, op: &Operand) -> Result<Vec<Term>, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
-        let mut words = (0..dwords)
+        let words = (0..dwords)
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
@@ -1127,11 +1137,35 @@ impl<'a> Tracer<'a> {
         if !inst.name().contains("format")
             && let Some(raw) = self.made_raw(&words)
         {
-            words = raw.to_vec();
+            return Ok(raw.to_vec());
         }
+        Ok(words)
+    }
+
+    /// The source of the descriptor operand `op` of `inst`, in block `at`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+        let words = self.words(inst, op)?;
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        if let Some(lanes) = self.first_lanes(&words) {
+            if let Some(source) = self.lane_copies(&words) {
+                return Ok(source);
+            }
+            // The caller proves that a waterfall selects this access's lanes.
+            return self.per_lane(&lanes, &mut Vec::new(), &mut known);
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
+    }
+
+    /// VGPR values read from the first active lane for all descriptor words.
+    fn first_lanes(&self, words: &[Term]) -> Option<Vec<Term>> {
+        words
+            .iter()
+            .map(|word| match *word {
+                Term::Value(v) => self.first_lane_source(v).map(Term::Value),
+                Term::Const(_) => None,
+            })
+            .collect()
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks
@@ -1152,15 +1186,28 @@ impl<'a> Tracer<'a> {
             Term::Value(v) => self.first_lane_source(v),
             Term::Const(_) => None,
         };
-        if let Some(sources) = words.iter().map(read).collect::<Option<Vec<_>>>() {
+        if let Some(lanes) = self.first_lanes(words) {
             // One descriptor the code keeps per lane: the lanes agree.
             if let Some(source) = self.lane_copies(words) {
                 return Ok(source);
             }
-            // Read from the first active lane, as a waterfall loop does: the
-            // dwords each lane holds.
-            let lanes: Vec<Term> = sources.into_iter().map(Term::Value).collect();
-            return self.per_lane(&lanes, joins, known);
+            // A first-lane read reached through a phi or select needs lanes
+            // that agree, since the access's waterfall does not prove it.
+            let block = |word: &Term| match *word {
+                Term::Value(v) => self.defs[v.0 as usize].map(|site| site.0),
+                Term::Const(_) => None,
+            };
+            let mut runs = match (self.lanes, block(&words[0])) {
+                (Some(lanes), Some(b)) if words.iter().all(|word| block(word) == Some(b)) => {
+                    vec![(lanes.reach[b], true)]
+                }
+                _ => Vec::new(),
+            };
+            let source = self.per_lane(&lanes, joins, &mut runs)?;
+            if source.varies_by_lane() {
+                return Err("a descriptor read from the first lane outside a waterfall loop");
+            }
+            return Ok(source);
         }
         if words.iter().any(|w| read(w).is_some()) {
             return Err("a descriptor partly read from the first lane");
@@ -1561,13 +1608,13 @@ impl<'a> Tracer<'a> {
     }
 
     /// The `v_readfirstlane_b32` results the descriptor operand `op` of
-    /// `inst` is, when every dword is one.
+    /// `inst` is traced to ([`Self::words`]: those a buffer descriptor made
+    /// raw is made from), when every dword is one.
     fn first_lane_words(&self, inst: &Inst, op: &Operand) -> Option<Vec<Value>> {
-        let Operand::Scalar { code, dwords } = *op else {
-            return None;
-        };
-        (0..dwords)
-            .map(|k| match self.origin(inst.read(Reg::S(code + k))?) {
+        let words = self.words(inst, op).ok()?;
+        words
+            .into_iter()
+            .map(|w| match w {
                 Term::Value(v) => self.first_lane_source(v).map(|_| v),
                 Term::Const(_) => None,
             })
@@ -3651,6 +3698,59 @@ pub(crate) mod tests {
     /// The index of `word` in `words`.
     fn word_at(words: &[u32], word: u32) -> usize {
         words.iter().position(|&w| w == word).unwrap()
+    }
+
+    #[test]
+    fn a_buffer_descriptor_made_raw_after_its_first_lane_read_needs_a_waterfall() {
+        // A waterfall loop over the buffer descriptor each lane loads from
+        // entry v0 of the table at s0, which makes it raw (as the FidelityFX
+        // upscaler's compiler does) before a byte access.
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x3402_0084, // v_lshlrev_b32 v1, 4, v0
+            0xDC38_8000,
+            0x0404_0001, // global_load_dwordx4 v[4:7], v1, s[4:5]
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xBE94_037E, // s_mov_b32 s20, exec_lo
+            0x7E18_0504, // 0x1c: v_readfirstlane_b32 s12, v4
+            0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+            0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+            0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+            0xD4E2_0015,
+            0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
+            0xD4E2_0016,
+            0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+            0x8715_1615, // s_and_b32 s21, s21, s22
+            0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+            0x9390_FF0D,
+            0x000E_0010, // s_bfe_u32 s16, s13, 0x000e0010
+            0x8490_8110, // s_max_u32 s16, s16, 1
+            0x870D_FF0D,
+            0xC000_FFFF, // s_and_b32 s13, s13, 0xc000ffff
+            0x870F_FF0F,
+            0xCFFF_FFFF, // s_and_b32 s15, s15, 0xcfffffff
+            0x930E_100E, // s_mul_i32 s14, s14, s16
+            0x880F_FF0F,
+            0x3000_0000, // s_or_b32 s15, s15, 0x30000000
+            0xE030_1000,
+            0x8003_0800, // buffer_load_dword v8, v0, s[12:15], 0 offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+            0xBF89_FFE7, // s_cbranch_execnz -> 0x1c
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+            0xD834_0000,
+            0x0000_0800, // ds_write_b32 v0, v8
+            S_ENDPGM,
+        ];
+        let r = waterfall(&words, false).unwrap();
+        assert!(matches!(r.descriptors[0].source, Source::Fetched { .. }));
+        assert_eq!(r.waterfall.compares.len(), 2);
+        assert_eq!(r.waterfall.reads.len(), 4);
+        // Without the back edge every lane reads lane 0's buffer, not its own.
+        let back = word_at(&words, 0xBF89_FFE7);
+        words[back] = 0xBF80_0000;
+        assert_eq!(refusal(&words, false), NO_LOOP);
     }
 
     #[test]

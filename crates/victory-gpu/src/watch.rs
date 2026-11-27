@@ -475,6 +475,18 @@ pub(crate) fn port_journal() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_JOURNAL").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// Whether an individual write-watch answer is published under shard locks.
+/// Leave queue marks and the rest of renderer port #7 independently configured.
+fn watch_unlocked_ask() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_WATCH_UNLOCKED_ASK") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_UNLOCKED_ASK").map(|value| value == "1"))
+        .unwrap_or_else(port_journal)
+}
+
 #[cfg(test)]
 thread_local! {
     /// [`port_journal`], for what this thread does.
@@ -1430,7 +1442,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         // Nothing to note: the others may go on reading.
         return Some(fresh());
     }
-    let answer = if port_journal() {
+    let answer = if watch_unlocked_ask() {
         // Renderer port #7: shared, the range's parts held for writing (the
         // range is held too: no other asking notes any of it meanwhile).
         let j = journal();

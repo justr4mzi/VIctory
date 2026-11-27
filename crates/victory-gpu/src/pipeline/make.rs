@@ -67,6 +67,10 @@ impl Pending {
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         let made = OnceLock::new();
+        if let Some(hash) = super::low_graphics_pass(&shaders) {
+            tracing::info!(hash, "VICTORY_LOW_GRAPHICS: host pipeline not made");
+            let _ = made.set(None);
+        }
         // A listed shader's pipeline is never handed to the driver (one the
         // RDNA 4 compiler crashes on): it is done, with no host pipeline.
         #[cfg(all(windows, feature = "diagnostics"))]
@@ -229,6 +233,22 @@ fn screen_budget() -> Duration {
 /// Passes over the screen are allowed their own budget ([`screen_budget`]),
 /// once in all instead of in every frame.
 fn each_budget(screen: bool) -> Option<Duration> {
+    static CAP: OnceLock<Option<Duration>> = OnceLock::new();
+    let cap = *CAP.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_WAIT_CAP_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_millis)
+    });
+    #[cfg(feature = "diagnostics")]
+    let cap = match crate::ab::pick("VICTORY_PIPELINE_WAIT_CAP_MS") {
+        Some(true) => Some(cap.unwrap_or(Duration::from_secs(5))),
+        Some(false) => None,
+        None => cap,
+    };
+    if let Some(cap) = cap {
+        return (!cap.is_zero()).then_some(cap);
+    }
     static EACH: OnceLock<Option<Duration>> = OnceLock::new();
     let each = *EACH.get_or_init(|| {
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_EACH_MS")

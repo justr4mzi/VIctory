@@ -406,6 +406,16 @@ struct Library {
     /// Stores share it and a save takes it alone: the size the library
     /// asks for must still be its size when it is written out.
     saving: RwLock<()>,
+    pending: Mutex<Vec<(String, ID3D12PipelineState)>>,
+}
+
+fn store_later() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_LIBRARY_STORE_LATER") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_STORE_LATER").is_some_and(|v| v == "1"))
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the library synchronises
@@ -477,12 +487,16 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     VIEW[1].store(file.len, Ordering::Relaxed);
                     VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
                     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+                    if std::env::var_os("VICTORY_LIBRARY_PREFETCH").is_some_and(|v| v == "1") {
+                        prefetch(file.at.Value as usize, file.len);
+                    }
                 }
                 return Some(Library {
                     library,
                     _blob: blob,
                     added: AtomicU64::new(0),
                     saving: RwLock::new(()),
+                    pending: Mutex::default(),
                 });
             }
             Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
@@ -499,7 +513,38 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         _blob: Blob::None,
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
+        pending: Mutex::default(),
     })
+}
+
+fn prefetch(base: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+    };
+
+    let worker = std::thread::Builder::new().name("victory-library-prefetch".into()).spawn(move || {
+        // SAFETY: this thread changes only its own priority.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
+        const CHUNK: usize = 64 << 20;
+        let mut bytes = 0;
+        for offset in (0..len).step_by(CHUNK) {
+            if crate::host::available_physical_ram().is_some_and(|free| free < 6 << 30) {
+                break;
+            }
+            let part = CHUNK.min(len - offset);
+            let range = WIN32_MEMORY_RANGE_ENTRY { VirtualAddress: (base + offset) as *mut _, NumberOfBytes: part };
+            // SAFETY: the successful library and its mapped blob live in a process-wide OnceLock.
+            if unsafe { PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0) } == 0 {
+                break;
+            }
+            bytes += part;
+        }
+        tracing::info!(bytes, len, "host pipeline library read ahead (VICTORY_LIBRARY_PREFETCH)");
+    });
+    if let Err(error) = worker {
+        tracing::warn!(%error, "no thread to read the host pipeline library ahead");
+    }
 }
 
 /// A pipeline's name in the library: the hash of what its host
@@ -648,6 +693,18 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
+    if store_later() {
+        let mut pending = library.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.len() < 256 {
+            pending.push((name.to_owned(), pso.clone()));
+            return Ok(pso);
+        }
+    }
+    store(library, name, &wide, &pso);
+    Ok(pso)
+}
+
+fn store(library: &Library, name: &str, wide: &HSTRING, pso: &ID3D12PipelineState) {
     let mut storing = crate::timeline::span("pipeline: acquire library store guards");
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
@@ -655,10 +712,9 @@ pub(crate) fn pipeline(
     storing.next("pipeline: store a PSO in the driver library");
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
-    Ok(pso)
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -675,6 +731,10 @@ pub(crate) fn save(now: bool) {
         *last = Some(std::time::Instant::now());
     }
     let _saving = crate::timeline::span("pipeline: save the library and early list");
+    let pending = std::mem::take(&mut *library.pending.lock().unwrap_or_else(|e| e.into_inner()));
+    for (name, pso) in pending {
+        store(library, &name, &HSTRING::from(name.as_str()), &pso);
+    }
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;

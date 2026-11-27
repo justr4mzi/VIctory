@@ -25,7 +25,9 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
-pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+pub const VIEW_STRIDE_BITS: u32 = (1 << 29) - 1;
+/// A texture UAV whose sRGB format is backed by a linear host view.
+pub const VIEW_SRGB: u32 = 1 << 29;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
 /// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
 /// (After VIctory 4243a96a.)

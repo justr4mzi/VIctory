@@ -103,6 +103,17 @@ fn build() -> [u8; 32] {
         };
         bytes.extend_from_slice(&FORMAT.to_le_bytes());
         bytes.extend_from_slice(&limit.to_le_bytes());
+        let compute_limit = victory_shader::emit::compute_loop_limit();
+        if compute_limit != limit {
+            bytes.extend_from_slice(b"compute loop limit");
+            bytes.extend_from_slice(&compute_limit.to_le_bytes());
+        }
+        if std::env::var_os("VICTORY_NAN_GUARD").is_some_and(|v| v == "0") {
+            bytes.extend_from_slice(b"VICTORY_NAN_GUARD=0");
+        }
+        if !victory_shader::emit::srgb_uav() {
+            bytes.extend_from_slice(b"VICTORY_SHADER_SRGB_UAV=0");
+        }
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
         // So are the switches that pick the form of a wave64 program:

@@ -219,6 +219,8 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
             crate::cores::keep_on_fast_cores("victory-heap-sync");
+            // (The submitting thread waits for its rounds.)
+            let mut priority = crate::cores::Priority::new();
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
             /// A round is over, however it ends.
             struct Over;
@@ -247,6 +249,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     }
                 }
                 drop(r);
+                priority.keep();
                 let _over = asked.then(|| {
                     last = std::time::Instant::now();
                     Over
@@ -1650,6 +1653,12 @@ pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
     // SAFETY: the handle is a descriptor slot the title passes back.
     let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     (words[0] == VIEW_TAG).then_some(words)
+}
+
+/// Whether a record still names the same view-table entry without cloning it.
+pub(crate) fn record_entry_alive([_, index, generation]: [u32; 3]) -> bool {
+    generation >> KIND_SHIFT == 0
+        && views_read().list.get(index as usize).is_some_and(|(_, current)| *current == generation)
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).

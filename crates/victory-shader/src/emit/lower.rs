@@ -29,6 +29,8 @@ pub(super) mod intersect;
 /// module so it shares the emitter's state.
 #[path = "halves.rs"]
 mod halves;
+mod lighting_mul;
+mod srgb;
 
 type Why = &'static str;
 
@@ -5696,6 +5698,30 @@ impl<'a> Lower<'a> {
         (self.s.m.select(c, any, at, first), any)
     }
 
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead.
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop (read the first lane's value, run the lanes with that
+    /// value, take them out of EXEC) serves helper lanes too. On the host,
+    /// wave operations leave helper lanes out (DXIL before
+    /// `WaveOpsIncludeHelperLanes`): once only helper lanes are left in such
+    /// a loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the
+    /// loop runs to [`LOOP_LIMIT`] in every such lane: draws of 0.3 to 1.3 s
+    /// each, then DEVICE_HUNG. With its own value a helper lane matches in
+    /// the first pass and leaves; what a helper lane computes only feeds
+    /// derivatives, and its stores are dropped.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
+    }
+
     fn read_lane(&mut self, x: V, lane: V) -> V {
         self.s.op(
             self.cur,
@@ -9147,6 +9173,7 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            "v_mullit_f32" => self.lighting_mul(inst, guard),
             "v_fma_f32" | "v_fmaak_f32" | "v_fmamk_f32" => {
                 // shortcut: DXIL has no fused f32 multiply-add; FMad lets the driver fuse.
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
@@ -9839,6 +9866,9 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
+                // A helper lane in a pixel shader reads its own value (Marvisak 06019553):
+                // wave reads leave helpers out, so a waterfall loop would never let them go.
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {
@@ -11240,6 +11270,13 @@ impl<'a> Lower<'a> {
                 self.s.m.cmp(c, pred::NE, bit, zero)
             }
             "f32" | "f16" => {
+                // Always false or true, NaNs included: constants, as for the
+                // integer compares. As `fcmp false`/`fcmp true`, which DXC
+                // never emits, WARP removes its device at the first dispatch.
+                if op == "f" || op == "tru" {
+                    self.lane(inst, Some(op == "tru"));
+                    return Ok(());
+                }
                 let (a, b) = if ty == "f16" {
                     (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?)
                 } else {
@@ -11255,7 +11292,6 @@ impl<'a> Lower<'a> {
                     self.s.m.bin(c, Bin::Or, lt, gt)
                 } else {
                     let p = match op {
-                        "f" => pred::FALSE,
                         "lt" => pred::OLT,
                         "eq" => pred::OEQ,
                         "le" => pred::OLE,
@@ -11269,7 +11305,6 @@ impl<'a> Lower<'a> {
                         "nle" => pred::UGT,
                         "neq" => pred::UNE,
                         "nlt" => pred::UGE,
-                        "tru" => pred::TRUE,
                         _ => return Err(inst.name()),
                     };
                     self.s.m.cmp(c, p, a, b)
@@ -11943,6 +11978,7 @@ impl<'a> Lower<'a> {
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
+            self.convert_srgb_uav_rgb(src, &mut vals[..3], Self::linear_to_srgb)?;
             let mut args = vec![h];
             args.extend(cs);
             args.extend(vals);
@@ -12000,7 +12036,10 @@ impl<'a> Lower<'a> {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
+                let x = if kind == 5 && ch == 2 {
+                    // The console reports the number of faces for a cubemap.
+                    self.s.m.i32(6)
+                } else if ch == 3 && uav || !present[ch as usize] {
                     one
                 } else {
                     self.s.m.extract(c, d, ch)
@@ -12466,12 +12505,19 @@ impl<'a> Lower<'a> {
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
         };
-        let mut xs = Vec::new();
-        for ch in channels {
-            let x = match gathered {
+        let mut vals: Vec<_> = channels.iter().map(|&ch| {
+            match gathered {
                 Some(g) => g[ch as usize],
                 None => self.s.m.extract(c, r, ch),
-            };
+            }
+        }).collect();
+        if op == 66 && uav {
+            let rgb = channels.iter().take_while(|&&ch| ch < 3).count();
+            self.convert_srgb_uav_rgb(src, &mut vals[..rgb], Self::srgb_to_linear)?;
+        }
+        let c = self.cur;
+        let mut xs = Vec::with_capacity(vals.len());
+        for x in vals {
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
@@ -13335,8 +13381,10 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
+            let pixel = self.s.pixel;
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
+            let color = !mesh && pixel && el.kind == 16 && el.comp == 9;
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
@@ -13348,6 +13396,7 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            let x = if color { self.finite_color(x) } else { x };
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),
@@ -13369,6 +13418,29 @@ impl<'a> Lower<'a> {
         }
         self.end_guarded(at, &[]);
         Ok(())
+    }
+
+    /// Guard float color exports so a non-finite pixel cannot pollute temporal history.
+    fn finite_color(&mut self, value: V) -> V {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD").is_none_or(|v| v != "0")) {
+            return value;
+        }
+        let c = self.cur;
+        let bits = self.as_int(value);
+        let magnitude_mask = self.s.m.i32(0x7fff_ffff);
+        let magnitude = self.s.m.bin(c, Bin::And, bits, magnitude_mask);
+        let infinity = self.s.m.i32(f32::INFINITY.to_bits());
+        let is_nan = self.s.m.cmp(c, pred::IUGT, magnitude, infinity);
+        let is_infinite = self.s.m.cmp(c, pred::EQ, magnitude, infinity);
+        let sign_mask = self.s.m.i32(0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_mask);
+        let max_half = self.s.m.i32(65504f32.to_bits());
+        let clamped = self.s.m.bin(c, Bin::Or, sign, max_half);
+        let finite = self.s.m.select(c, is_infinite, clamped, bits);
+        let zero = self.s.m.i32(0);
+        let finite = self.s.m.select(c, is_nan, zero, finite);
+        self.as_float(finite)
     }
 
     /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
@@ -13569,7 +13641,8 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
+        let compute = !self.s.pixel && self.s.mesh.is_none() && self.s.threads.is_some();
+        let limit = match if compute { super::compute_loop_limit() } else { super::loop_limit() } {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT => 1 << 12,

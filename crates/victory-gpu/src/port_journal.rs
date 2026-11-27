@@ -34,9 +34,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-/// Whether the switch is on (`crate::watch::port_journal`).
+/// Whether submissions carry heap-sync marks independently of write-watch locking.
 pub(crate) fn on() -> bool {
-    crate::watch::port_journal()
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_QUEUE_MARKS") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_MARKS").map(|value| value == "1"))
+        .unwrap_or_else(crate::watch::port_journal)
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +134,7 @@ pub(crate) fn heaps_waited(ns: u64, on: bool) {
 /// Whether the switch is on, or changes in this run (`VICTORY_AB`).
 fn named() -> bool {
     #[cfg(feature = "diagnostics")]
-    if crate::ab::bit("VICTORY_PORT_JOURNAL").is_some() {
+    if crate::ab::bit("VICTORY_PORT_JOURNAL").is_some() || crate::ab::bit("VICTORY_QUEUE_MARKS").is_some() {
         return true;
     }
     on()

@@ -80,6 +80,38 @@ impl std::fmt::Debug for Shader {
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
 
+#[cfg(windows)]
+pub(crate) fn low_graphics() -> bool {
+    static LOW: OnceLock<bool> = OnceLock::new();
+    *LOW.get_or_init(|| std::env::var_os("VICTORY_LOW_GRAPHICS").is_some_and(|v| v == "1"))
+}
+
+/// Geometry and auxiliary passes omitted by the ruff-lab low preset.
+#[cfg(windows)]
+pub(crate) fn low_graphics_pass(shaders: &[Arc<Shader>]) -> Option<&str> {
+    const PASSES: &[&[u8]] = &[
+        b"CascadeShadows", b"MS_VS_Cascade_Transform", b"VS_PNTri_Cascade",
+        b"PS_shadow", b"VS_shadow", b"PS_CableShadow", b"VS_Cable_LocalShadow",
+        b"PS_ImposterShadow", b"VS_TransformShadowModel", b"PS_CopyToShadowMapVS",
+        b"ParaboloidShadows", b"CS_RTDistantShadow", b"CS_TraceShadowRays",
+        b"MirrorReflection", b"PS_MirrorPedTextured", b"ReflectionGBuffer",
+        b"WaterReflection", b"PS_TexturedLit_ReflectionMap", b"PS_ResolvePortalReflection",
+        b"BatchCullReflect", b"CS_CombinedReflections", b"_SSR", b"GBufferSSR",
+        b"PS_VoxelizeVisiblity", b"VS_VoxelizeGeneric", b"GS_VoxelizeGeneric",
+        b"CS_EntityCoarseVoxelization", b"CS_ScreenProbes_TraceRays_",
+        b"CS_ScreenProbes_ResolveRays_", b"CS_ScreenProbes_GenerateRayBins",
+        b"CS_ScreenProbes_GenerateShaderBins", b"PS_PuddleDetect", b"PS_HeatHaze",
+        b"GlareBlurPass", b"GrassFlatten",
+    ];
+    if !low_graphics() {
+        return None;
+    }
+    shaders.iter().find_map(|shader| {
+        PASSES.iter().any(|pattern| shader.container.windows(pattern.len()).any(|bytes| bytes == *pattern))
+            .then_some(shader.hash.as_str())
+    })
+}
+
 /// For the memory lines: containers kept and their bytes, translations
 /// kept and the bytes of their host code. None of them is ever let go.
 static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];

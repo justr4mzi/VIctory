@@ -54,6 +54,11 @@ type Out = *mut *mut c_void;
 static FACTORY_OBJECT: Object = Object::new("dstorage factory", &FACTORY_VTABLE);
 
 pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: checked non-null; the title passes room for a pointer.
+    unsafe { out.write(std::ptr::null_mut()) };
     // SAFETY: the title passes a GUID (null tolerated).
     match unsafe { iid.as_ref() } {
         Some(&iid) if iid == FACTORY => {
@@ -630,7 +635,11 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = std::env::var("VICTORY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| (1..=64).contains(n))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -775,6 +784,8 @@ pub(crate) mod stream_log {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    #[cfg(windows)]
+    let mut applied_priority = 0;
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -782,6 +793,15 @@ fn work(scheduler: &'static Scheduler) {
             continue;
         };
         drop(lanes);
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+            let priority = worker_priority();
+            // SAFETY: changes the priority of this worker only.
+            if priority != applied_priority && unsafe { SetThreadPriority(GetCurrentThread(), priority) } != 0 {
+                applied_priority = priority;
+            }
+        }
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
         let reading = victory_gpu::timeline::span("streaming: a request");
@@ -800,6 +820,20 @@ fn work(scheduler: &'static Scheduler) {
         }
         scheduler.finished.notify_all();
     }
+}
+
+/// Normal by default. A/B enables the configured priority (below normal if omitted).
+#[cfg(windows)]
+fn worker_priority() -> i32 {
+    static PRIORITY: OnceLock<Option<i32>> = OnceLock::new();
+    let priority = PRIORITY.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_PRIORITY").ok()?.trim().parse::<i32>().ok().map(|n| n.clamp(-2, 2))
+    });
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = victory_gpu::switched("VICTORY_DSTORAGE_PRIORITY") {
+        return if on { priority.unwrap_or(-1) } else { 0 };
+    }
+    priority.unwrap_or(0)
 }
 
 impl Lanes {
@@ -1780,6 +1814,27 @@ mod tests {
         let mut factory = std::ptr::null_mut();
         assert_eq!(DStorageGetFactory(&FACTORY, &mut factory), S_OK);
         factory
+    }
+
+    #[test]
+    fn a_refused_factory_interface_clears_the_out_pointer() {
+        // `_COM_Outptr_`: *ppv is null on failure, not the caller's stale value.
+        let unknown = Guid::new(0, 0, 0, [0; 8]);
+        let mut out = 0x1234 as *mut c_void;
+        assert_eq!(DStorageGetFactory(&unknown, &mut out), E_NOINTERFACE);
+        assert!(out.is_null());
+
+        let mut out = 0x1234 as *mut c_void;
+        assert_eq!(
+            DStorageGetFactory(std::ptr::null(), &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+
+        assert_eq!(
+            DStorageGetFactory(&FACTORY, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
     }
 
     fn open(path: &std::path::Path) -> *mut c_void {

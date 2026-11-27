@@ -289,6 +289,44 @@ fn ask(what: &str, from: u32) {
     tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
 }
 
+/// Priority of a worker that the submitting or landing thread waits for.
+/// Changes to the A/B switch are applied on the worker's next job.
+#[derive(Default)]
+pub(crate) struct Priority {
+    raised: bool,
+}
+
+impl Priority {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn keep(&mut self) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+        };
+
+        let raised = helper_priority();
+        if self.raised == raised {
+            return;
+        }
+        let priority = if raised { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+        // SAFETY: only the current worker's priority is changed.
+        if unsafe { SetThreadPriority(GetCurrentThread(), priority) } != 0 {
+            self.raised = raised;
+        }
+    }
+}
+
+fn helper_priority() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HELPER_PRIORITY") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_PRIORITY").is_some_and(|v| v == "1"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

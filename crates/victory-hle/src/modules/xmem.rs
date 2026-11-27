@@ -792,9 +792,62 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n == 0 || n.checked_mul(PAGE).is_none() {
         return 0;
-    };
+    }
+    let per_section = section_pages();
+    let mut sections = Vec::new();
+    for first in (0..n).step_by(per_section) {
+        let pages = (n - first).min(per_section);
+        let Some(section) = make_section(pages) else {
+            tracing::warn!(n, error = %std::io::Error::last_os_error(), "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        };
+        sections.push(section);
+    }
+    tracing::debug!(n, sections = sections.len(), flags = format_args!("{flags:#x}"), "XMemAllocatePhysicalPages");
+    for section in &sections {
+        let size = section.pages * PAGE;
+        // The GPU can only open a committed section as a host heap.
+        victory_gpu::title_memory_section(section.handle as usize, size as u64, on_wine());
+        keep_section(section, size);
+    }
+    let mut table = page_table_mut();
+    let first = table.next_page;
+    table.next_page += n * FRAMES;
+    let mut number = first;
+    for section in sections {
+        for index in 0..section.pages {
+            table.pages.insert(number, Slice { section: section.clone(), index });
+            number += FRAMES;
+        }
+    }
+    // A fault writing the output may wait for a mapping call that takes this lock.
+    drop(table);
+    for index in 0..n {
+        // SAFETY: the title passes room for `n` page numbers.
+        unsafe { pages.add(index).write(first + index * FRAMES) };
+    }
+    1
+}
+
+/// Maximum physical section size. Existing sections cannot be resized safely
+/// during an A/B phase, so compare this setting across fresh processes.
+fn section_pages() -> usize {
+    static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGES.get_or_init(|| {
+        std::env::var("VICTORY_SECTION_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+            .map_or(usize::MAX, |mb| mb.saturating_mul(MIB / PAGE))
+    })
+}
+
+fn make_section(n: usize) -> Option<Arc<Section>> {
+    let size = n * PAGE;
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
@@ -814,45 +867,14 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         )
     };
     if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+        return None;
     }
-    tracing::debug!(
-        n,
-        flags = format_args!("{flags:#x}"),
-        "XMemAllocatePhysicalPages"
-    );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section {
+    Some(Arc::new(Section {
         handle,
         pages: n,
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
-    });
-    keep_section(&section, size);
-    let mut table = page_table_mut();
-    let first = table.next_page;
-    table.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        table.pages.insert(first + index * FRAMES, slice);
-    }
-    // Title memory is touched without our locks: a fault there may wait for
-    // a mapping call, which takes them.
-    drop(table);
-    for index in 0..n {
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(first + index * FRAMES) };
-    }
-    1
+    }))
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of

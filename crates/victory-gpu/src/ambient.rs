@@ -496,6 +496,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // Magenta garbage the probes' memory held (seen on AMD cards) is no
     // light (beloooo, avatarmanz/VIctory-7900XTX e942896).
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+    if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
     float left = dot(was, LUMA);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.

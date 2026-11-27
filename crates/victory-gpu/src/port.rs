@@ -109,6 +109,16 @@ pub(crate) fn buffers_on() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_BUFFERS").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// Reuse a larger committed stretch for neighboring high-address buffers.
+fn expand() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_PORT_EXPAND") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_EXPAND").is_some_and(|v| v == "1" || v == "2"))
+}
+
 /// Whether `[at, at + len)` may be ported: below 4 GiB with `VICTORY_PORT_CONSTANTS=1`,
 /// or contiguous-section title buffers above 4 GiB with `VICTORY_PORT_BUFFERS=1`.
 pub(crate) fn wanted(at: u64, len: u64, window: bool) -> bool {
@@ -194,6 +204,11 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     // in it finds the region made). Above 4 GiB, open only the requested buffer's
     // 64 KiB-aligned range so unused pages of a multi-GB section are not locked.
     let (mut first, mut bytes, mut offset) = (first as u64, bytes as u64, offset);
+    if at >= LOW && expand() && first >= LOW && bytes <= (256 << 20) && bytes.is_multiple_of(K64) && offset.is_multiple_of(K64) {
+        if let Ok(region) = open_stretch(device, first, bytes, section, offset) {
+            return Ok(region);
+        }
+    }
     if at >= LOW {
         offset += at - first;
         (first, bytes) = (at, end - at);
@@ -213,6 +228,10 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     if first > at || first + bytes < end || offset % K64 != 0 {
         return Err((3, format!("the stretch {first:#x}+{bytes:#x} does not hold it")));
     }
+    open_stretch(device, first, bytes, section, offset)
+}
+
+fn open_stretch(device: &ID3D12Device, first: u64, bytes: u64, section: usize, offset: u64) -> Result<Region, (usize, String)> {
     // SAFETY: the section of a view the title has; the runtime keeps its
     // handle open while a view of it is there, and the range is inside it.
     let view = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes as usize) }.Value as usize;

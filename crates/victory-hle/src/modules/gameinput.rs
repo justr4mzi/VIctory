@@ -1060,14 +1060,16 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
-    match &reading(this).value {
-        Value::Pad(state) if !out.is_null() => {
-            // SAFETY: checked non-null.
-            unsafe { out.write(*state) };
-            true
-        }
-        _ => false,
+    if out.is_null() {
+        return false;
     }
+    let (state, is_gamepad) = match &reading(this).value {
+        Value::Pad(state) => (*state, true),
+        Value::Keys(_) => (PadState::default(), false),
+    };
+    // SAFETY: the title passes writable storage for the state.
+    unsafe { out.write(state) };
+    is_gamepad
 }
 /// Kinds our devices do not have: no count, no state.
 extern "system" fn nothing(_: *const c_void) -> usize {
@@ -1191,15 +1193,13 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
+            // Injected keys also press the first pad's buttons using the
+            // stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                let down = scripted();
+                let down = injected();
                 let axis = |neg: u8, pos: u8| -> f32 {
                     match (down.contains(&neg), down.contains(&pos)) {
                         (true, false) => -1.0,
@@ -1221,6 +1221,12 @@ mod host {
                 if ry != 0.0 {
                     pad.right_y = ry;
                 }
+                if down.contains(&b'Z') {
+                    pad.left_trigger = 1.0;
+                }
+                if down.contains(&b'C') {
+                    pad.right_trigger = 1.0;
+                }
                 for vk in down {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
@@ -1231,10 +1237,7 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
-            let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
+            let mut down = injected();
             if focused() || anywhere() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1268,7 +1271,6 @@ mod host {
     }
 
     /// Parses a virtual-key name for `VICTORY_KEYS` and `VICTORY_KEYS_FILE`.
-    #[cfg(any(test, feature = "diagnostics"))]
     pub(super) fn parse_key_name(key: &str) -> Option<u8> {
         match key.trim() {
             "Enter" => Some(0x0D),
@@ -1287,13 +1289,11 @@ mod host {
         }
     }
 
-    #[cfg(any(test, feature = "diagnostics"))]
     pub(super) struct FileKeys {
         last_poll: Instant,
         active: Vec<(Instant, u8)>,
     }
 
-    #[cfg(any(test, feature = "diagnostics"))]
     impl FileKeys {
         pub(super) fn new(now: Instant) -> Self {
             Self {
@@ -1338,8 +1338,7 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` (or `<from>-<to>:<key>`),
-    /// plus dynamic `VICTORY_KEYS_FILE=<path>` polled every 200 ms.
+    /// Diagnostics schedule: `VICTORY_KEYS=<seconds>:<key>,...` (or `<from>-<to>:<key>`).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static HOLD: LazyLock<Duration> = LazyLock::new(|| {
@@ -1361,21 +1360,27 @@ mod host {
             });
             (Instant::now(), keys.collect())
         });
-        static FILE: LazyLock<Option<(std::path::PathBuf, std::sync::Mutex<FileKeys>)>> =
-            LazyLock::new(|| {
-                let path = std::env::var_os("VICTORY_KEYS_FILE")?;
-                if path.is_empty() {
-                    return None;
-                }
-                Some((path.into(), std::sync::Mutex::new(FileKeys::new(Instant::now()))))
-            });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        let mut out: Vec<u8> = keys
+        keys
             .iter()
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)
-            .collect();
+            .collect()
+    }
+
+    /// Explicit opt-in via `VICTORY_KEYS_FILE`, including on ship builds so
+    /// the same input can be used in unattended validation.
+    fn injected() -> Vec<u8> {
+        static FILE: LazyLock<Option<(std::path::PathBuf, std::sync::Mutex<FileKeys>)>> =
+            LazyLock::new(|| {
+                let path = std::env::var_os("VICTORY_KEYS_FILE").filter(|path| !path.is_empty())?;
+                Some((path.into(), std::sync::Mutex::new(FileKeys::new(Instant::now()))))
+            });
+        #[cfg(feature = "diagnostics")]
+        let mut out = scripted();
+        #[cfg(not(feature = "diagnostics"))]
+        let mut out = Vec::new();
         if let Some((path, state)) = &*FILE {
             let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
             for vk in guard.poll(path, Instant::now()) {
@@ -1672,8 +1677,9 @@ mod tests {
         release(r);
 
         let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let mut state = pad(r);
         assert_eq!(
-            pad(r),
+            state,
             PadState {
                 buttons: A,
                 left_y: 1.0,
@@ -1685,6 +1691,11 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let get = slot::<extern "system" fn(*const Reading, *mut PadState) -> bool, _>(r, 0xb0);
+        assert!(!get(r, &mut state));
+        assert_eq!(state, PadState::default());
+        release(r);
     }
 
     #[test]

@@ -170,21 +170,27 @@ impl Port {
 /// new one starts whenever more tasks wait than workers idle, so a callback
 /// that blocks on another never starves it. Workers stay for reuse.
 struct Pool {
-    /// Queued tasks and the number of idle workers.
-    state: Mutex<(VecDeque<Task>, usize)>,
+    state: Mutex<PoolState>,
     ready: Condvar,
 }
 
+struct PoolState {
+    tasks: VecDeque<Task>,
+    idle: usize,
+    starting: usize,
+}
+
 static POOL: Pool = Pool {
-    state: Mutex::new((VecDeque::new(), 0)),
+    state: Mutex::new(PoolState { tasks: VecDeque::new(), idle: 0, starting: 0 }),
     ready: Condvar::new(),
 };
 
 impl Pool {
     fn submit(&'static self, task: Task) {
         let mut state = lock(&self.state);
-        state.0.push_back(task);
-        if state.0.len() > state.1 {
+        state.tasks.push_back(task);
+        if state.tasks.len() > state.idle + state.starting {
+            state.starting += 1;
             std::thread::spawn(move || self.work());
         } else {
             self.ready.notify_one();
@@ -193,13 +199,14 @@ impl Pool {
 
     fn work(&self) {
         let mut state = lock(&self.state);
+        state.starting -= 1;
         loop {
-            while state.0.is_empty() {
-                state.1 += 1;
+            while state.tasks.is_empty() {
+                state.idle += 1;
                 state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
-                state.1 -= 1;
+                state.idle -= 1;
             }
-            let task = state.0.pop_front();
+            let task = state.tasks.pop_front();
             drop(state);
             if let Some(task) = task {
                 task.run(false);
@@ -496,7 +503,7 @@ pub fn XTaskQueueTerminate(
         port.ready.notify_all();
     }
     // A thread-pool port's tasks wait in the shared pool.
-    pending.extend(take_tasks(&mut lock(&POOL.state).0, &queue));
+    pending.extend(take_tasks(&mut lock(&POOL.state).tasks, &queue));
     pending.extend(std::mem::take(&mut *lock(&queue.delayed)).into_values());
     for task in pending {
         task.run(true);

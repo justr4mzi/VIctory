@@ -123,7 +123,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
     SLOT_STRIDES, SLOT_STRIDE_CONSTANT, SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE,
-    VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS,
+    VIEW_INTEGER, VIEW_SIGNED, VIEW_SRGB, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS,
     USER_VIEW_ADDRESS, USER_VIEW_BIAS, constant_marks, constants_raw, raw_views, set_raw_views, set_view_heap_limit,
     view_heap_limit,
 };
@@ -318,19 +318,38 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
     parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
 }
 
+/// An optional compute-only loop limit; otherwise use the general limit.
+pub fn compute_loop_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        #[cfg(feature = "diagnostics")]
+        if let Some(limit) = parse_loop_count(std::env::var("VICTORY_SHADER_LOOP_LIMIT_CS").ok().as_deref()) {
+            return limit;
+        }
+        loop_limit()
+    })
+}
+
+/// Whether translated heap-indexed texture UAVs convert marked sRGB channels.
+pub fn srgb_uav() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_SHADER_SRGB_UAV").is_none_or(|v| v != "0"))
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
-    let parsed = value
+    parse_loop_count(value).unwrap_or(lower::LOOP_LIMIT)
+}
+
+fn parse_loop_count(value: Option<&str>) -> Option<u32> {
+    value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
-        });
-    match parsed {
-        Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
-    }
+        })
+        .filter(|&n| n > 0)
 }
 
 /// A translated shader and what the host binds for it.

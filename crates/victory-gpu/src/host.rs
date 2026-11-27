@@ -3310,6 +3310,16 @@ fn copy_blocked(written: &[(usize, usize)], dst: usize, src: usize, len: usize) 
     (read || touches(written, dst, dst + len)).then_some(read)
 }
 
+/// Wait for overlapping shader writes even when `VICTORY_FILL_TITLE` allows reading ahead.
+fn fill_wait() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_FILL_WAIT") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "0"))
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -3337,7 +3347,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len, _) => {
-                    if read_blocked(written, src, len) {
+                    let blocked = if fill_wait() { touches(written, src, src.saturating_add(len)) } else { read_blocked(written, src, len) };
+                    if blocked {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
@@ -9061,9 +9072,16 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+        let parallel_textures = texture_threads();
+        if !parallel_textures {
+            for staging in &due {
+                staging.refresh();
+            }
+        }
+        let texture_jobs = if parallel_textures { due.len() } else { 0 };
+        crate::shadow::wide_each(spans.len() + texture_jobs, move |i| {
             // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
+            let Some(i) = i.checked_sub(texture_jobs) else {
                 due[i].refresh();
                 return;
             };
@@ -9165,7 +9183,7 @@ impl Batch {
 
     /// The textures due are brought up to date.
     fn refresh_textures(&mut self) {
-        if self.due.len() < 2 || !wide_textures() {
+        if self.due.len() < 2 || !wide_textures() || !texture_threads() {
             self.due.drain(..).for_each(|staging| staging.refresh());
             return;
         }
@@ -9281,6 +9299,15 @@ impl Batch {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+fn texture_threads() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TEXTURE_THREADS") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_THREADS").is_none_or(|v| v != "0"))
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -9791,10 +9818,22 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy)]
+struct FramegenCounts {
+    generation: u64,
+    generated: u64,
+    presents: u32,
+}
+
 struct Meter {
     last_present: windows::core::HRESULT,
     since: std::time::Instant,
     frames: u32,
+    #[cfg(feature = "diagnostics")]
+    framegen_counts: Option<FramegenCounts>,
+    #[cfg(feature = "diagnostics")]
+    framegen_at_last_line: Option<FramegenCounts>,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -9810,6 +9849,10 @@ impl Meter {
             last_present: windows::Win32::Foundation::S_OK,
             since: now,
             frames: 0,
+            #[cfg(feature = "diagnostics")]
+            framegen_counts: None,
+            #[cfg(feature = "diagnostics")]
+            framegen_at_last_line: None,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -9868,6 +9911,19 @@ impl Meter {
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
+        #[cfg(feature = "diagnostics")]
+        let framegen_rates = {
+            let previous = std::mem::replace(&mut self.framegen_at_last_line, self.framegen_counts);
+            previous.zip(self.framegen_counts).and_then(|(from, to)| {
+                if from.generation != to.generation {
+                    return None;
+                }
+                let seconds = elapsed.as_secs_f64();
+                let generated = to.generated.checked_sub(from.generated)? as f64 / seconds;
+                let presents = f64::from(to.presents.wrapping_sub(from.presents)) / seconds;
+                Some((generated, presents))
+            })
+        };
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
@@ -10135,6 +10191,13 @@ impl Meter {
         }
         let Some(caption) = &self.caption else { return };
         let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        #[cfg(feature = "diagnostics")]
+        let text = if let Some((generated, presents)) = framegen_rates {
+            let frame = crate::frame::current();
+            format!("{text} | FG3 {fps:.1} FPS reels / {generated:.1} generes / {presents:.1} presentes (DXGI) [{frame}]")
+        } else {
+            text
+        };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -10502,6 +10565,13 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
+                if p.meter.line_due() {
+                    p.meter.framegen_counts = p.framegen.as_ref().and_then(|fg| {
+                        let (generation, generated) = fg.output_count()?;
+                        let presents = p.swap_chain.GetLastPresentCount().ok()?;
+                        Some(FramegenCounts { generation, generated, presents })
+                    });
+                }
             }
             let presented = p.meter.record_present(p.hwnd, status);
             showing.end();

@@ -1437,7 +1437,13 @@ fn view_stride(view: &View) -> Option<u32> {
 /// What else the table of strides says of a typed buffer view of an integer
 /// format (`victory_shader::emit::VIEW_INTEGER`); 0 for any other view.
 fn view_kind(view: &View) -> u32 {
-    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED, VIEW_SRGB};
+    if let View::Unordered(_, _, Some(desc)) = view
+        && desc[1] != 1
+        && crate::resource::SRGB.iter().any(|&(srgb, _)| srgb == desc[0])
+    {
+        return VIEW_SRGB;
+    }
     match view_elements(view) {
         Some((0, false, 3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62)) => VIEW_INTEGER,
         Some((0, false, 4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64)) => VIEW_INTEGER | VIEW_SIGNED,
@@ -3451,8 +3457,14 @@ impl HostHeap {
         // A program that reads it as raw bytes reads its twin.
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
         if let Some(twin) = twin {
-            // SAFETY: a live buffer that holds the range.
-            let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
+            // SAFETY: a live buffer.
+            let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+            let offset = gpu - base;
+            let first = offset / 4;
+            // The constant buffer's size, rounded up to 256 bytes, may reach past the
+            // buffer's end: the view stops there, as `constant_raw_at`'s does (a raw
+            // view past the end removed the device on an RTX 4070: mgrein 877d5b4, 9849f04).
+            let elements = ((u64::from(desc.SizeInBytes).min(width.saturating_sub(offset)) / 4) as u32).max(1);
             let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
                 ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -3460,7 +3472,7 @@ impl HostHeap {
                 Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                     Buffer: D3D12_BUFFER_SRV {
                         FirstElement: first,
-                        NumElements: desc.SizeInBytes / 4,
+                        NumElements: elements,
                         StructureByteStride: 0,
                         Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                     },
@@ -3636,6 +3648,11 @@ impl HostHeap {
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    pub(crate) fn mirrors_record(&self, index: u32, [_, entry, generation]: [u32; 3]) -> bool {
+        let key = u64::from(generation) << 32 | u64::from(entry);
+        self.quick.get(index as usize).is_some_and(|stored| stored.load(std::sync::atomic::Ordering::Acquire) == key)
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -4992,17 +5009,19 @@ fn make_twinned(
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
-            let desc = unsafe {
+            let mut desc = unsafe {
                 std::ptr::from_ref(words)
                     .cast::<D3D12_SAMPLER_DESC>()
                     .read_unaligned()
             };
+            crate::sampler::apply_low_graphics(&mut desc);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
         }
         View::ConsoleSampler(words) => {
-            let desc = crate::sampler::console(words, crate::sampler::aniso_point_mip(device));
+            let mut desc = crate::sampler::console(words, crate::sampler::aniso_point_mip(device));
+            crate::sampler::apply_low_graphics(&mut desc);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
